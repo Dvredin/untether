@@ -69,6 +69,7 @@ from .run_options import (
     claude_cli_permission_mode,
     get_run_options,
     is_claude_plan_auto,
+    is_claude_prompting_mode,
 )
 from .tool_actions import tool_input_path, tool_kind_and_title
 
@@ -488,6 +489,12 @@ class ClaudeStreamState:
     # Auto-approve ExitPlanMode when permission_mode is `plan-auto` (#741;
     # spelled `auto` before 0.35.5rc8)
     auto_approve_exit_plan_mode: bool = False
+    # #749 the run's permission mode promises the user a prompt, so every
+    # stage-6 `can_use_tool` request routes to Telegram instead of being
+    # blanket-approved.  Armed in `new_state()` from
+    # `is_claude_prompting_mode`.  Default False keeps the legacy `-p` path
+    # (no control channel, no requests) and every autonomous mode unchanged.
+    prompting_mode: bool = False
     # Whether this run is a resume (for error diagnostics)
     resumed: bool = False
     # Track max text block length seen (for cooldown bypass — survives overwrites)
@@ -981,6 +988,12 @@ def _normalize_tool_result(content: Any) -> str:
         if isinstance(text, str):
             return text
     return str(content)
+
+
+# #749 permission modes already warned about an explicit `allowed_tools`
+# override.  Process-scoped so a long-lived bot logs the interaction once per
+# mode instead of once per run.
+_PROMPTING_MODE_ALLOWLIST_LOGGED: set[str] = set()
 
 
 def _coerce_comma_list(value: Any) -> str | None:
@@ -2322,10 +2335,27 @@ def translate_claude_event(
 
             # Auto-approve tool requests that don't need user interaction.
             # _DIFF_PREVIEW_TOOLS is module-scoped — see top of file.
+            #
+            # #749: in a prompting mode (`default`/`manual`/`acceptEdits`) the
+            # user was promised an approval prompt, so NOTHING is auto-approved
+            # here — a stage-6 request is unresolved permission work by
+            # definition (decisions.md D-1).  Autonomous modes retain the
+            # historical two-tool set: `DEFAULT_ALLOWED_TOOLS` only pre-approves
+            # Bash/Read/Edit/Write, so Glob/Grep/WebFetch/Task already arrive
+            # here in plan mode, and gating them would raise a button per tool
+            # in the fleet's most-used mode for no safety gain (probes G/H/I).
+            #
+            # Known gap, carried to v0.35.6: an explicit `ask` rule reaches
+            # stage 6 even under `bypassPermissions`, and this branch still
+            # approves it.  Closing that needs a stage-5 change (the allowlist),
+            # not a wider handler gate.
             _TOOLS_REQUIRING_APPROVAL = {"ExitPlanMode", "AskUserQuestion"}
             if isinstance(request, claude_schema.ControlCanUseToolRequest):
                 tool_name = getattr(request, "tool_name", "unknown")
-                if tool_name not in _TOOLS_REQUIRING_APPROVAL:
+                if (
+                    not state.prompting_mode
+                    and tool_name not in _TOOLS_REQUIRING_APPROVAL
+                ):
                     # When diff_preview is enabled, route previewable tools
                     # through interactive approval so users see the diff.
                     # Bypass after ExitPlanMode approval — the user already
@@ -3001,6 +3031,12 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     model: str | None = None
     permission_mode: str | None = None
     allowed_tools: list[str] | None = None
+    # #749 True when `allowed_tools` came from an explicit
+    # `[engines.claude] allowed_tools` key rather than DEFAULT_ALLOWED_TOOLS.
+    # `build_runner` collapses both into `allowed_tools`, so without this flag
+    # a prompting-mode run cannot tell a deliberate user choice (which must be
+    # honoured) from inherited plumbing (which must be dropped).
+    allowed_tools_explicit: bool = False
     extra_args: list[str] = field(default_factory=list)
     dangerously_skip_permissions: bool = False
     use_api_billing: bool = False
@@ -3220,7 +3256,29 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             reasoning = run_options.reasoning
         if reasoning is not None:
             args.extend(["--effort", reasoning])
+        # #749 stage 5 sits BEFORE the stage-6 prompt, so an allowlist covering
+        # Bash/Read/Edit/Write pre-approves exactly the tools a prompting mode
+        # exists to ask about — phase 01's gate would never see them.  Drop it
+        # for those modes unless the user asked for it by name.
         allowed_tools = _coerce_comma_list(self.allowed_tools)
+        if allowed_tools is not None and is_claude_prompting_mode(effective_mode):
+            if self.allowed_tools_explicit:
+                # An explicit choice is honoured, but the interaction is
+                # surprising enough to deserve one line in the log.
+                if effective_mode not in _PROMPTING_MODE_ALLOWLIST_LOGGED:
+                    _PROMPTING_MODE_ALLOWLIST_LOGGED.add(effective_mode)
+                    logger.info(
+                        "claude.allowed_tools.prompting_mode_override",
+                        permission_mode=effective_mode,
+                        allowed_tools=allowed_tools,
+                        detail=(
+                            "explicit [engines.claude] allowed_tools pre-approves "
+                            "these tools at stage 5, so they will not raise a "
+                            "Telegram approval in this mode (#749)"
+                        ),
+                    )
+            else:
+                allowed_tools = None
         if allowed_tools is not None:
             args.extend(["--allowedTools", allowed_tools])
         if self.dangerously_skip_permissions is True:
@@ -3336,6 +3394,14 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     def new_state(self, prompt: str, resume: ResumeToken | None) -> ClaudeStreamState:
         state = ClaudeStreamState()
         state.auto_approve_exit_plan_mode = is_claude_plan_auto(
+            self._effective_permission_mode()
+        )
+        # #749 arm the stage-6 gate from the same resolved mode.  This must
+        # read `_effective_permission_mode()` (per-chat override → engine
+        # config), not `self.permission_mode`: `translate_claude_event` is a
+        # module-level function with no access to the runner, so the decision
+        # has to be made here and carried on the state.
+        state.prompting_mode = is_claude_prompting_mode(
             self._effective_permission_mode()
         )
         state.resumed = resume is not None
@@ -5061,7 +5127,10 @@ def build_runner(config: EngineConfig, config_path: Path) -> Runner:
     claude_cmd = shutil.which("claude") or "claude"
 
     model = config.get("model")
-    if "allowed_tools" in config:
+    # #749 remember which branch this came from: an explicit user choice
+    # survives into prompting modes, the inherited default does not.
+    allowed_tools_explicit = "allowed_tools" in config
+    if allowed_tools_explicit:
         allowed_tools = config.get("allowed_tools")
     else:
         allowed_tools = DEFAULT_ALLOWED_TOOLS
@@ -5106,6 +5175,7 @@ def build_runner(config: EngineConfig, config_path: Path) -> Runner:
         model=model,
         permission_mode=permission_mode,
         allowed_tools=allowed_tools,
+        allowed_tools_explicit=allowed_tools_explicit,
         extra_args=extra_args,
         dangerously_skip_permissions=dangerously_skip_permissions,
         use_api_billing=use_api_billing,

@@ -5,7 +5,7 @@ import os
 import signal as _signal
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,7 +16,14 @@ from .context import RunContext
 from .error_hints import get_error_hint as _get_error_hint
 from .logging import bind_run_context, get_logger
 from .markdown import _short_model_name, format_meta_line, render_event_cli
-from .model import ActionEvent, CompletedEvent, ResumeToken, StartedEvent, UntetherEvent
+from .model import (
+    ActionEvent,
+    CompletedEvent,
+    ResumeToken,
+    StartedEvent,
+    TurnEvent,
+    UntetherEvent,
+)
 from .presenter import Presenter
 from .progress import ProgressTracker
 from .runner import _APPROVAL_PENDING_REFIRE_S, Runner
@@ -814,6 +821,54 @@ async def _maybe_append_usage_footer(
         return msg
 
 
+def _apply_cost_delta(
+    engine: str,
+    session_id: str | None,
+    usage: dict[str, Any] | None,
+    *,
+    resumed: bool,
+) -> dict[str, Any] | None:
+    """Return ``usage`` with ``total_cost_usd`` replaced by the spend since
+    the previous result of the same session (#778).
+
+    Claude only: its ``total_cost_usd`` is session-cumulative (probe F12).
+    Other engines' values are per-run as far as we know and pass through.
+    The cumulative value is kept as ``session_total_cost_usd``.
+    """
+    if engine != "claude" or not usage or not session_id:
+        return usage
+    raw = usage.get("total_cost_usd")
+    if not isinstance(raw, (int, float)):
+        return usage
+    from .session_costs import get_session_cost_ledger
+
+    baseline = usage.get("session_cost_baseline")
+    try:
+        result = get_session_cost_ledger().record(
+            engine,
+            session_id,
+            float(raw),
+            resumed=resumed,
+            baseline=float(baseline) if isinstance(baseline, (int, float)) else None,
+        )
+    except Exception:  # noqa: BLE001 — accounting must never break delivery
+        logger.warning("cost.delta_failed", exc_info=True)
+        return usage
+    logger.info(
+        "cost.turn_delta",
+        engine=engine,
+        session_id=session_id,
+        delta_usd=round(result.delta, 6),
+        cumulative_usd=round(result.cumulative, 6),
+        source=result.source,
+    )
+    return {
+        **usage,
+        "total_cost_usd": result.delta,
+        "session_total_cost_usd": result.cumulative,
+    }
+
+
 def _format_run_cost(usage: dict[str, Any] | None) -> str | None:
     """Format run cost/usage from CompletedEvent into a footer line."""
     if not usage:
@@ -1306,6 +1361,8 @@ class ProgressEdits:
         # repaints and the #470 post-result closing message so neither can
         # overwrite or trail the already-delivered answer.
         self._finalizing: bool = False
+        # #776: True for the run's own ProgressEdits (not a follow-up turn's).
+        self.run_level: bool = False
         self._min_render_interval = min_render_interval
         self._sleep = sleep
         self._last_render_at: float = 0.0
@@ -1733,6 +1790,7 @@ class ProgressEdits:
             _post_result_age = self._post_result_idle_age_seconds()
             _post_result_limbo = (
                 _post_result_idle
+                and not self._is_live_session_idle()
                 and _post_result_age is not None
                 and _post_result_age > self._POST_RESULT_LIMBO_THRESHOLD_S
             )
@@ -1978,7 +2036,9 @@ class ProgressEdits:
             # rather than merely skipping the escalation: otherwise the moment
             # the user finally clicks Approve, a counter of 85 would trip an
             # immediate false escalation on the very next tick.
-            if _expected_wait_reason:
+            if _expected_wait_reason or self._is_live_session_idle():
+                # #776: a live session between turns is silent by design —
+                # its runner lifecycle, not the stall detector, ends it.
                 self._frozen_ring_count = 0
 
             # Suppress Telegram notification when process is CPU-active
@@ -2350,12 +2410,34 @@ class ProgressEdits:
         stream = self.stream
         if stream is None:
             return False
+        engine_state = getattr(stream, "engine_state", None)
+        if self._is_live_session_idle():
+            # #776: a live Claude session between turns emits task /
+            # command_lifecycle lines while idle, so last_event_type is not a
+            # reliable "past the result" signal — the turn state is.
+            return True
         if getattr(stream, "last_event_type", None) != "result":
             return False
-        engine_state = getattr(stream, "engine_state", None)
         if engine_state is None:
             return False
         return getattr(engine_state, "result_received_at", None) is not None
+
+    def _is_live_session_idle(self) -> bool:
+        """#776: a live Claude session sitting between turns (the runner's
+        live-session lifecycle owns its teardown, so it is never limbo)."""
+        stream = self.stream
+        engine_state = getattr(stream, "engine_state", None) if stream else None
+        if engine_state is None or not getattr(engine_state, "live_mode", False):
+            return False
+        if not getattr(engine_state, "completed_turns", 0):
+            return False
+        if self.run_level:
+            # The run's own progress monitor stands down after the run's
+            # result: each follow-up turn has its own ProgressEdits watching
+            # it, and this one no longer receives the turn's events (review
+            # finding — it would warn/auto-cancel a healthy wake turn).
+            return True
+        return not getattr(engine_state, "turn_open", True)
 
     def _post_result_idle_age_seconds(self) -> float | None:
         """#333 Tier 2: seconds since ``result_received_at`` was armed.
@@ -3325,9 +3407,11 @@ async def run_runner_with_cancel(
     on_thread_known: Callable[[ResumeToken, anyio.Event], Awaitable[None]] | None,
     channel_id: ChannelId = 0,
     on_completed: Callable[[CompletedEvent, RunOutcome], Awaitable[None]] | None = None,
+    turn_router: FollowupTurnRouter | None = None,
 ) -> RunOutcome:
     outcome = RunOutcome()
     start_time = time.monotonic()
+    runner_finished = anyio.Event()
     try:
         async with anyio.create_task_group() as tg:
 
@@ -3336,6 +3420,15 @@ async def run_runner_with_cancel(
                 try:
                     async for evt in events:
                         _log_runner_event(evt)
+                        # #776: follow-up turns of a live session get their
+                        # own messages; the run's progress/final stay put.
+                        if isinstance(evt, TurnEvent):
+                            if turn_router is not None:
+                                await turn_router.on_turn(evt)
+                            continue
+                        if turn_router is not None and turn_router.active:
+                            await turn_router.on_event(evt)
+                            continue
                         if isinstance(evt, StartedEvent):
                             outcome.resume = evt.resume
                             bind_run_context(
@@ -3425,11 +3518,24 @@ async def run_runner_with_cancel(
                     if aclose is not None:
                         with anyio.move_on_after(30, shield=True):
                             await aclose()
+                    runner_finished.set()
                     tg.cancel_scope.cancel()
 
             async def wait_cancel(task: RunningTask) -> None:
                 await task.cancel_requested.wait()
                 outcome.cancelled = True
+                # #776: /cancel (or /new) on a live session that is only
+                # holding between turns closes its stdin — the CLI stops its
+                # background tasks and exits cleanly (no SIGTERM, nothing
+                # quarantined). An active turn is still killed as before.
+                if running_task_is_live_idle(task) and task.resume is not None:
+                    from .runners.claude import close_live_session
+
+                    if await close_live_session(
+                        task.resume.value, "cancel", notice=True
+                    ):
+                        with anyio.move_on_after(20):
+                            await runner_finished.wait()
                 tg.cancel_scope.cancel()
 
             async def thread_pid() -> None:
@@ -3493,6 +3599,8 @@ async def run_runner_with_cancel(
         else False,
         cancelled=outcome.cancelled,
         ok=outcome.completed.ok if outcome.completed else None,
+        # #776: turns delivered after the run's own result (live session).
+        followup_turns=turn_router.turns_delivered if turn_router else 0,
         stall_suppressions=suppression_summary,
         # #695: both events carry the model so a single grep over either
         # answers "which model ran this session?".
@@ -3554,6 +3662,351 @@ async def send_result_message(
             tag=delete_tag,
         )
         await cfg.transport.delete(ref=progress_ref)
+
+
+def unique_running_tasks(
+    running_tasks: Mapping[MessageRef, RunningTask],
+) -> list[tuple[MessageRef, RunningTask]]:
+    """One entry per run (#776): a live run is registered under its progress
+    message *and* each follow-up turn's message, so counting keys over-counts."""
+    seen: set[int] = set()
+    out: list[tuple[MessageRef, RunningTask]] = []
+    for ref, task in running_tasks.items():
+        if id(task) in seen:
+            continue
+        seen.add(id(task))
+        out.append((ref, task))
+    return out
+
+
+def running_task_is_live_idle(task: Any) -> bool:
+    """True when the run is a live Claude session sitting between turns — it
+    is holding for background work or a follow-up, not doing work (#776)."""
+    stream = getattr(getattr(task, "edits", None), "stream", None)
+    engine_state = getattr(stream, "engine_state", None)
+    if engine_state is None or not getattr(engine_state, "live_mode", False):
+        return False
+    return bool(getattr(engine_state, "completed_turns", 0)) and not getattr(
+        engine_state, "turn_open", True
+    )
+
+
+async def close_idle_live_sessions(
+    running_tasks: Mapping[MessageRef, RunningTask], reason: str
+) -> int:
+    """Gracefully close every idle live session (drain / restart, #776 D-7)."""
+    closed = 0
+    for _ref, task in unique_running_tasks(running_tasks):
+        if not running_task_is_live_idle(task) or task.resume is None:
+            continue
+        if task.resume.engine != "claude":
+            continue
+        from .runners.claude import close_live_session
+
+        if await close_live_session(task.resume.value, reason, notice=True):
+            closed += 1
+    return closed
+
+
+# ── #776 live-session follow-up turns ──────────────────────────────────────
+
+# command_uuid -> (session_id, reply_to, queued placeholder) for follow-ups
+# written into a live session (phase 06). The router consumes the anchor when
+# the matching turn opens; leftovers are resolved when the run ends.
+_FOLLOWUP_ANCHORS: dict[str, tuple[str, MessageRef, MessageRef | None]] = {}
+
+
+def register_followup_anchor(
+    command_uuid: str,
+    *,
+    session_id: str,
+    reply_to: MessageRef,
+    placeholder: MessageRef | None,
+) -> None:
+    _FOLLOWUP_ANCHORS[command_uuid] = (session_id, reply_to, placeholder)
+
+
+def pop_followup_anchor(
+    command_uuid: str | None,
+) -> tuple[MessageRef, MessageRef | None] | None:
+    if not command_uuid:
+        return None
+    entry = _FOLLOWUP_ANCHORS.pop(command_uuid, None)
+    return None if entry is None else (entry[1], entry[2])
+
+
+def drain_followup_anchors(
+    session_id: str,
+) -> list[tuple[MessageRef, MessageRef | None]]:
+    """Anchors whose follow-up never got a turn (the session ended first)."""
+    leftovers = [
+        (uuid, entry)
+        for uuid, entry in _FOLLOWUP_ANCHORS.items()
+        if entry[0] == session_id
+    ]
+    for uuid, _ in leftovers:
+        _FOLLOWUP_ANCHORS.pop(uuid, None)
+    return [(entry[1], entry[2]) for _, entry in leftovers]
+
+
+_TURN_HEADERS: dict[str, str] = {
+    "task_finished": "\N{BELL} Background task finished",
+    "scheduled_wakeup": "\N{ALARM CLOCK} Scheduled wake-up",
+    "monitor_event": "\N{SATELLITE ANTENNA} Monitor",
+    "unknown": "\N{BELL} Claude continued",
+}
+# Reasons whose final is pushed (the user is waiting for it); Monitor ticks
+# can be many per minute, so they arrive silently (#776 D-6).
+_TURN_PUSH_REASONS = frozenset({"task_finished", "scheduled_wakeup", "unknown"})
+# A wake turn gets a progress message only if it outlives this, uses a tool
+# or raises an approval (#776 D-10) — short turns send just their final.
+_TURN_LAZY_PROGRESS_S = 5.0
+
+
+def _live_closing_notice(reason: str, tasks: list[str]) -> str:
+    """User-facing text for a live session closing over running background
+    tasks (#776)."""
+    n = len(tasks)
+    names = ", ".join(t[:60] for t in tasks[:3])
+    if n > 3:
+        names += f" (+{n - 3} more)"
+    noun = f"{n} background task{'s' if n != 1 else ''}"
+    if reason == "cancel":
+        return f"\N{BLACK SQUARE FOR STOP} Stopped {noun}: {names}. Reply to continue."
+    if reason == "options_changed":
+        return (
+            f"\N{GEAR}\N{VARIATION SELECTOR-16} Settings changed — stopping {noun}: "
+            f"{names}. Your message starts with the new settings."
+        )
+    if reason == "drain":
+        return (
+            f"\N{HOURGLASS WITH FLOWING SAND} Untether is restarting — stopping "
+            f"{noun}: {names}. Reply to continue."
+        )
+    it = "it" if n == 1 else "they"
+    why = {
+        "max_hold": "the background hold limit",
+        "abs_cap": "the session time limit",
+    }.get(reason, "the session limit")
+    return (
+        f"\N{HOURGLASS WITH FLOWING SAND} Closing session — {noun} still running "
+        f"at {why}: {names}. Stopping {it}; reply to continue."
+    )
+
+
+def _turn_header(evt: TurnEvent) -> str | None:
+    if evt.reason == "followup":
+        return None
+    base = _TURN_HEADERS.get(evt.reason, _TURN_HEADERS["unknown"])
+    tasks = [t for t in (evt.detail or {}).get("tasks", []) if isinstance(t, str)]
+    if evt.reason == "monitor_event" and len(tasks) == 1:
+        return f"{base} — {tasks[0][:80]}"
+    if evt.reason == "task_finished" and tasks:
+        if len(tasks) == 1:
+            return f"{base} — {tasks[0][:80]}"
+        return f"\N{BELL} {len(tasks)} background tasks finished"
+    return base
+
+
+@dataclass(slots=True)
+class _TurnCtx:
+    """Per-turn delivery state for one follow-up turn of a live session."""
+
+    turn: int
+    reason: str
+    tracker: ProgressTracker
+    reply_to: MessageRef
+    started_at: float
+    notify: bool
+    header: str | None
+    command_uuid: str | None = None
+    edits: ProgressEdits | None = None
+    progress_ref: MessageRef | None = None
+    edits_scope: anyio.CancelScope | None = None
+    lazy_scope: anyio.CancelScope | None = None
+    delivery: dict[str, bool] = field(default_factory=lambda: {"sent": False})
+    # Serialises progress creation: the lazy timer and the first action can
+    # both ask for it (review finding, #776).
+    progress_lock: anyio.Lock = field(default_factory=anyio.Lock)
+
+
+class FollowupTurnRouter:
+    """Routes a live run's TurnEvent segments to per-turn Telegram messages.
+
+    Owned by ``handle_message``; ``run_runner_with_cancel`` hands it every
+    ``TurnEvent`` plus the events that arrive while a follow-up turn is open.
+    Everything Telegram-specific is injected, so the router is testable with
+    plain callables.
+    """
+
+    def __init__(
+        self,
+        *,
+        new_tracker: Callable[[], ProgressTracker],
+        create_progress: Callable[[_TurnCtx], Awaitable[None]],
+        close_progress: Callable[[_TurnCtx], Awaitable[None]],
+        deliver: Callable[[CompletedEvent, _TurnCtx], Awaitable[None]],
+        default_reply_to: MessageRef,
+        followup_notify: bool,
+        clock: Callable[[], float] = time.monotonic,
+        anchor_for: Callable[[str | None], tuple[MessageRef, MessageRef | None] | None]
+        | None = pop_followup_anchor,
+    ) -> None:
+        self._new_tracker = new_tracker
+        self._create_progress = create_progress
+        self._close_progress = close_progress
+        self._deliver = deliver
+        self._default_reply_to = default_reply_to
+        self._followup_notify = followup_notify
+        self._clock = clock
+        self._anchor_for = anchor_for
+        self._tg: Any = None
+        self.current: _TurnCtx | None = None
+        self.turns_delivered = 0
+        # The message the live session's latest turn answered — where
+        # session-level notices (closing, restart) belong.
+        self.last_reply_to: MessageRef = default_reply_to
+
+    def bind_task_group(self, tg: Any) -> None:
+        self._tg = tg
+
+    @property
+    def active(self) -> bool:
+        return self.current is not None
+
+    def _open(self, evt: TurnEvent) -> _TurnCtx:
+        anchor: MessageRef | None = None
+        placeholder: MessageRef | None = None
+        if self._anchor_for is not None and evt.command_uuid:
+            found = self._anchor_for(evt.command_uuid)
+            if found is not None:
+                anchor, placeholder = found
+        notify = (
+            self._followup_notify
+            if evt.reason == "followup"
+            else evt.reason in _TURN_PUSH_REASONS
+        )
+        ctx = _TurnCtx(
+            turn=evt.turn,
+            reason=evt.reason,
+            tracker=self._new_tracker(),
+            reply_to=anchor or self._default_reply_to,
+            started_at=self._clock(),
+            notify=notify,
+            header=_turn_header(evt),
+            command_uuid=evt.command_uuid,
+            # A follow-up's "⏳ queued" placeholder becomes its progress
+            # message (edited in place) and is replaced by its final.
+            progress_ref=placeholder,
+        )
+        self.current = ctx
+        self.last_reply_to = ctx.reply_to
+        if self._tg is not None:
+            self._tg.start_soon(self._lazy_progress, ctx)
+        return ctx
+
+    async def _lazy_progress(self, ctx: _TurnCtx) -> None:
+        scope = anyio.CancelScope()
+        ctx.lazy_scope = scope
+        # Only the wait is cancellable: cancelling a create mid-send would
+        # orphan the message it just sent.
+        with scope:
+            await anyio.sleep(_TURN_LAZY_PROGRESS_S)
+        if scope.cancelled_caught:
+            return
+        if self.current is ctx:
+            await self._ensure_progress(ctx)
+
+    async def _ensure_progress(self, ctx: _TurnCtx) -> None:
+        async with ctx.progress_lock:
+            if ctx.edits is not None or ctx.delivery["sent"]:
+                return
+            try:
+                await self._create_progress(ctx)
+            except Exception:  # noqa: BLE001 — a progress message is best-effort
+                logger.warning(
+                    "live_turn.progress_failed", turn=ctx.turn, exc_info=True
+                )
+
+    async def on_turn(self, evt: TurnEvent) -> None:
+        if evt.phase == "started":
+            if self.current is not None:
+                await self._finish(self.current)
+            ctx = self._open(evt)
+            logger.info(
+                "live_turn.started",
+                turn=ctx.turn,
+                reason=ctx.reason,
+                command_uuid=ctx.command_uuid,
+            )
+            return
+        ctx = self.current
+        if ctx is None or ctx.turn != evt.turn:
+            ctx = self._open(evt)
+        completed = CompletedEvent(
+            engine=evt.engine,
+            ok=bool(evt.ok),
+            answer=evt.answer or "",
+            resume=evt.resume,
+            error=evt.error,
+            usage=evt.usage,
+        )
+        if ctx.lazy_scope is not None:
+            ctx.lazy_scope.cancel()
+        # Wait out a progress send already in flight so the final replaces it
+        # rather than leaving it orphaned.
+        async with ctx.progress_lock:
+            try:
+                await self._deliver(completed, ctx)
+                self.turns_delivered += 1
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "live_turn.delivery_failed", turn=ctx.turn, exc_info=True
+                )
+        await self._finish(ctx)
+
+    async def on_event(self, evt: UntetherEvent) -> None:
+        ctx = self.current
+        if ctx is None:
+            return
+        if isinstance(evt, ActionEvent) and ctx.edits is None:
+            await self._ensure_progress(ctx)
+        if ctx.edits is not None:
+            await ctx.edits.on_event(evt)
+        else:
+            ctx.tracker.note_event(evt)
+
+    async def _finish(self, ctx: _TurnCtx) -> None:
+        if ctx.lazy_scope is not None:
+            ctx.lazy_scope.cancel()
+        if self.current is ctx:
+            self.current = None
+        try:
+            await self._close_progress(ctx)
+        except Exception:  # noqa: BLE001
+            logger.debug("live_turn.close_failed", turn=ctx.turn, exc_info=True)
+
+    async def aclose(self) -> None:
+        """Run end: a turn still open lost its process (closed / killed
+        mid-turn) — tell the user rather than leave it silent or orphaned."""
+        ctx = self.current
+        if ctx is None:
+            return
+        if not ctx.delivery["sent"]:
+            logger.info("live_turn.interrupted", turn=ctx.turn, reason=ctx.reason)
+            try:
+                await self._deliver(
+                    CompletedEvent(
+                        engine=ctx.tracker.engine,
+                        ok=False,
+                        answer="",
+                        error="the session ended before this turn finished",
+                    ),
+                    ctx,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("live_turn.interrupt_delivery_failed", exc_info=True)
+        await self._finish(ctx)
 
 
 async def handle_message(
@@ -3894,7 +4347,31 @@ async def handle_message(
     )
 
     # Apply watchdog settings to runner and edits
+    edits.run_level = True
     watchdog = _load_watchdog_settings()
+
+    def _configure_edits(target: ProgressEdits) -> None:
+        # #776: shared by the run's edits and each follow-up turn's edits.
+        if watchdog is None:
+            return
+        target._stall_repeat_seconds = watchdog.stall_repeat_seconds
+        target._STALL_THRESHOLD_TOOL = watchdog.tool_timeout
+        target._STALL_THRESHOLD_MCP_TOOL = watchdog.mcp_tool_timeout
+        target._STALL_THRESHOLD_SUBAGENT = watchdog.subagent_timeout
+        target._stuck_after_tool_result_enabled = (
+            watchdog.detect_stuck_after_tool_result
+        )
+        target._stuck_after_tool_result_timeout = (
+            watchdog.stuck_after_tool_result_timeout
+        )
+        target._stuck_after_tool_result_recovery_enabled = (
+            watchdog.stuck_after_tool_result_recovery_enabled
+        )
+        target._stuck_after_tool_result_recovery_delay = (
+            watchdog.stuck_after_tool_result_recovery_delay
+        )
+        target._bash_grace_seconds = watchdog.bash_grace_seconds
+
     if watchdog is not None:
         edits._stall_repeat_seconds = watchdog.stall_repeat_seconds
         edits._STALL_THRESHOLD_TOOL = watchdog.tool_timeout
@@ -3944,15 +4421,27 @@ async def handle_message(
     empty_resume = {"pending": False}
 
     async def _deliver_final(
-        completed: CompletedEvent, run_outcome: RunOutcome
+        completed: CompletedEvent,
+        run_outcome: RunOutcome,
+        *,
+        turn: _TurnCtx | None = None,
     ) -> None:
+        # #776: ``turn`` is a follow-up turn of a live session (its own
+        # tracker / progress message / anchor / header); None is the run
+        # itself and behaves exactly as before.
+        delivery = turn.delivery if turn is not None else final_delivery
+        t_tracker = turn.tracker if turn is not None else progress_tracker
+        t_edits = turn.edits if turn is not None else edits
+        t_progress_ref = turn.progress_ref if turn is not None else progress_ref
+        t_reply_to = turn.reply_to if turn is not None else user_ref
+        t_notify = turn.notify if turn is not None else cfg.final_notify
         # Idempotence: the early path and the post-return path can both
         # reach here; only the first delivery wins.
-        if final_delivery["sent"]:
+        if delivery["sent"]:
             return
         run_ok = completed.ok
         run_error = completed.error
-        elapsed_final = clock() - started_at
+        elapsed_final = clock() - (turn.started_at if turn is not None else started_at)
 
         # #510: ``completed.answer`` already has the #508 ExitPlanMode
         # plan-body prepend applied at the runner level (claude.py, on the
@@ -3965,7 +4454,8 @@ async def handle_message(
         # Auto-clear broken session: if a resumed run failed with 0 turns,
         # clear the saved session so the next message starts fresh.
         if (
-            run_ok is False
+            turn is None
+            and run_ok is False
             and resume_token is not None
             and on_resume_failed is not None
         ):
@@ -4028,7 +4518,8 @@ async def handle_message(
         # engines without usage reporting never trip this.
         empty_result_anomaly = False
         if (
-            run_ok is True
+            turn is None
+            and run_ok is True
             and not run_outcome.cancelled
             and not final_answer.strip()
             and completed.usage
@@ -4164,7 +4655,18 @@ async def handle_message(
         final_resume = completed.resume or run_outcome.resume
         if final_resume is not None:
             resume_value = final_resume.value
+        # #778: Claude's total_cost_usd is cumulative per session (across
+        # --resume and across a live session's turns) — cost consumers below
+        # read the per-run / per-turn delta instead.
+        run_usage = _apply_cost_delta(
+            runner.engine,
+            resume_value,
+            completed.usage,
+            resumed=turn is not None or resume_token is not None,
+        )
         usage_log: dict[str, object] = {}
+        if run_usage and run_usage is not completed.usage:
+            usage_log["turn_cost_usd"] = run_usage.get("total_cost_usd")
         if completed.usage:
             for key in ("num_turns", "total_cost_usd", "duration_api_ms"):
                 val = completed.usage.get(key)
@@ -4176,24 +4678,24 @@ async def handle_message(
             error=run_error,
             answer_len=len(final_answer or ""),
             elapsed_s=round(elapsed_final, 2),
-            action_count=progress_tracker.action_count,
+            action_count=t_tracker.action_count,
             resume=resume_value,
             **usage_log,
             # #695: per-run model attribution. Also gives the cost fields
             # above something to attribute to — `total_cost_usd` was
             # previously logged with no record of which model produced it.
-            **_model_log_fields(progress_tracker.meta),
+            **_model_log_fields(t_tracker.meta),
         )
         # Record session stats for /stats command
         from .session_stats import record_run as _record_stats_run
 
         _record_stats_run(
             engine=runner.engine,
-            actions=progress_tracker.action_count,
+            actions=t_tracker.action_count,
             duration_ms=int(elapsed_final * 1000),
             triggered=bool(context and context.trigger_source),
         )
-        sync_resume_token(progress_tracker, final_resume)
+        sync_resume_token(t_tracker, final_resume)
 
         # Post-outline guidance: if the session was outline-pending (user
         # clicked "Pause & Outline Plan" but Claude Code ended the run
@@ -4213,7 +4715,14 @@ async def handle_message(
                     '"approved" to proceed, or send feedback to revise.'
                 )
 
-        state = progress_tracker.snapshot(
+        if turn is not None and turn.header:
+            final_answer = (
+                f"{turn.header}\n\n{final_answer}"
+                if final_answer.strip()
+                else turn.header
+            )
+
+        state = t_tracker.snapshot(
             resume_formatter=runner.format_resume,
             context_line=context_line,
             meta_formatter=format_meta_line,
@@ -4235,9 +4744,9 @@ async def handle_message(
         _show_cost = footer_cfg.show_api_cost
         if _footer_run_opts and _footer_run_opts.show_api_cost is not None:
             _show_cost = _footer_run_opts.show_api_cost
-        _cost_alert_text, _cost_alert_obj = _check_cost_budget(completed.usage)
+        _cost_alert_text, _cost_alert_obj = _check_cost_budget(run_usage)
         if _show_cost and run_ok is not False:
-            cost_line = _format_run_cost(completed.usage)
+            cost_line = _format_run_cost(run_usage)
             if cost_line:
                 budget_suffix = (
                     _format_budget_suffix(_cost_alert_obj)
@@ -4264,7 +4773,7 @@ async def handle_message(
         # the operator with the most need to know is the one who turned the
         # footer off. Suppressed only when a budget alert already surfaced this
         # run's spend, so a configured budget doesn't produce two lines.
-        _outlier_text = _check_run_cost_outlier(completed.usage)
+        _outlier_text = _check_run_cost_outlier(run_usage)
         if _outlier_text and _cost_alert_obj is None:
             final_rendered = RenderedMessage(
                 text=_insert_before_resume(final_rendered.text, f"\n{_outlier_text}"),
@@ -4289,41 +4798,233 @@ async def handle_message(
             status=status,
         )
 
-        can_edit_final = progress_ref is not None
-        edit_ref = None if cfg.final_notify or not can_edit_final else progress_ref
+        can_edit_final = t_progress_ref is not None
+        edit_ref = None if t_notify or not can_edit_final else t_progress_ref
 
         # #591: stop progress repaints BEFORE the send so a queued render
         # can't overwrite the final message. (The early path already set
         # this via note_final; this covers the post-return path.)
-        edits._finalizing = True
+        if t_edits is not None:
+            t_edits._finalizing = True
 
         await send_result_message(
             cfg,
             channel_id=incoming.channel_id,
-            reply_to=user_ref,
-            progress_ref=progress_ref,
+            reply_to=t_reply_to,
+            progress_ref=t_progress_ref,
             message=final_rendered,
-            notify=cfg.final_notify,
+            notify=t_notify,
             edit_ref=edit_ref,
-            replace_ref=progress_ref,
+            replace_ref=t_progress_ref,
             delete_tag="final",
             thread_id=incoming.thread_id,
         )
-        final_delivery["sent"] = True
+        delivery["sent"] = True
 
         # Unregister progress persistence after the final message is sent.
         # Must happen AFTER send_result_message() so a crash between
         # delete_ephemeral() and here still has an orphan cleanup pointer.
-        if progress_ref is not None and _PROGRESS_PERSISTENCE_PATH is not None:
+        if t_progress_ref is not None and _PROGRESS_PERSISTENCE_PATH is not None:
             from .telegram.progress_persistence import unregister_progress
 
-            session_key = f"{incoming.channel_id}:{progress_ref.message_id}"
+            session_key = f"{incoming.channel_id}:{t_progress_ref.message_id}"
             unregister_progress(_PROGRESS_PERSISTENCE_PATH, session_key)
 
     running_task: RunningTask | None = None
     if running_tasks is not None and progress_ref is not None:
         running_task = RunningTask(context=context, edits=edits)
         running_tasks[progress_ref] = running_task
+
+    # ── #776 live-session follow-up turns ─────────────────────────────────
+    outbox_early = {"delivered": False}
+
+    def _is_live_run() -> bool:
+        engine_state = getattr(edits.stream, "engine_state", None)
+        return bool(getattr(engine_state, "live_mode", False))
+
+    async def _deliver_outbox_now(reply_to_msg_id: MessageId) -> None:
+        """Deliver ``.untether-outbox/`` right after a live turn's final —
+        a live run's generator only returns when the session closes, which
+        would hold turn files back until then."""
+        if cfg.send_file is None or cfg.outbox_config is None:
+            return
+        from .telegram.outbox_delivery import deliver_outbox_files
+        from .utils.paths import get_run_base_dir
+
+        run_root = get_run_base_dir()
+        if run_root is None:
+            return
+        oc = cfg.outbox_config
+        outbox_early["delivered"] = True
+        try:
+            result = await deliver_outbox_files(
+                send_file=cfg.send_file,
+                channel_id=incoming.channel_id,
+                thread_id=incoming.thread_id,
+                reply_to_msg_id=reply_to_msg_id,
+                run_root=run_root,
+                outbox_dir=oc.outbox_dir,
+                deny_globs=oc.deny_globs,
+                max_download_bytes=oc.max_download_bytes,
+                max_files=oc.outbox_max_files,
+                cleanup=oc.outbox_cleanup,
+                deliver_directories=getattr(oc, "outbox_deliver_directories", "off"),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("outbox.delivery_failed", exc_info=True)
+            return
+        await _surface_outbox_skipped(cfg, incoming, user_ref, result.skipped, oc)
+
+    async def _on_live_notice(kind: str, payload: dict[str, Any]) -> None:
+        if kind != "closing":
+            return
+        tasks = [t for t in payload.get("tasks", []) if isinstance(t, str)]
+        if not tasks:
+            return
+        text = _live_closing_notice(str(payload.get("reason")), tasks)
+        try:
+            await cfg.transport.send(
+                channel_id=incoming.channel_id,
+                message=RenderedMessage(text=text),
+                options=SendOptions(
+                    reply_to=turn_router.last_reply_to,
+                    notify=True,
+                    thread_id=incoming.thread_id,
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("live_session.notice_failed", exc_info=True)
+
+    async def _on_run_completed(
+        completed: CompletedEvent, run_outcome: RunOutcome
+    ) -> None:
+        await _deliver_final(completed, run_outcome)
+        if not _is_live_run():
+            return
+        await _deliver_outbox_now(user_ref.message_id)
+        sid = completed.resume or run_outcome.resume
+        if sid is not None and runner.engine == "claude":
+            from .runners.claude import add_live_session_listener
+
+            add_live_session_listener(sid.value, _on_live_notice)
+
+    def _new_turn_tracker() -> ProgressTracker:
+        tracker = ProgressTracker(engine=runner.engine, clock=clock)
+        if progress_tracker.meta:
+            tracker.meta = {
+                k: v for k, v in progress_tracker.meta.items() if k != "complete"
+            }
+        tracker.resume = progress_tracker.resume
+        return tracker
+
+    async def _create_turn_progress(ctx: _TurnCtx) -> None:
+        st = await send_initial_progress(
+            cfg,
+            channel_id=incoming.channel_id,
+            reply_to=ctx.reply_to,
+            label="working",
+            tracker=ctx.tracker,
+            progress_ref=ctx.progress_ref,
+            resume_formatter=runner.format_resume,
+            context_line=context_line,
+            thread_id=incoming.thread_id,
+        )
+        if st.ref is None:
+            return
+        turn_edits = ProgressEdits(
+            transport=cfg.transport,
+            presenter=effective_presenter,
+            channel_id=incoming.channel_id,
+            progress_ref=st.ref,
+            tracker=ctx.tracker,
+            started_at=ctx.started_at,
+            clock=clock,
+            last_rendered=st.last_rendered,
+            resume_formatter=runner.format_resume,
+            context_line=context_line,
+            thread_id=incoming.thread_id,
+            min_render_interval=progress_cfg.min_render_interval,
+        )
+        _configure_edits(turn_edits)
+        turn_edits._heartbeat_interval = progress_cfg.heartbeat_interval
+        turn_edits.stream = edits.stream
+        turn_edits.pid = edits.pid
+        if running_task is not None:
+            turn_edits.cancel_event = running_task.cancel_requested
+        ctx.edits = turn_edits
+        ctx.progress_ref = st.ref
+        scope = anyio.CancelScope()
+        ctx.edits_scope = scope
+
+        async def _run_turn_edits() -> None:
+            try:
+                with scope:
+                    await turn_edits.run()
+            except cancel_exc_type:
+                return
+
+        if turn_task_group["tg"] is not None:
+            turn_task_group["tg"].start_soon(_run_turn_edits)
+        if running_task is not None and running_tasks is not None:
+            # Replies / /cancel on this turn's messages reach the live run.
+            running_tasks[st.ref] = running_task
+
+    async def _close_turn_progress(ctx: _TurnCtx) -> None:
+        if ctx.edits is not None:
+            await ctx.edits.delete_ephemeral()
+        if ctx.edits_scope is not None:
+            ctx.edits_scope.cancel()
+        if ctx.progress_ref is not None and running_tasks is not None:
+            running_tasks.pop(ctx.progress_ref, None)
+
+    async def _deliver_turn(completed: CompletedEvent, ctx: _TurnCtx) -> None:
+        await _deliver_final(completed, RunOutcome(resume=completed.resume), turn=ctx)
+        await _deliver_outbox_now(ctx.reply_to.message_id)
+
+    async def _resolve_unrun_followups() -> None:
+        """Follow-ups written into the live session whose turn never started
+        (the session ended first) must not sit on "⏳ queued" forever."""
+        sid = progress_tracker.resume or getattr(
+            getattr(edits, "stream", None), "found_session", None
+        )
+        if sid is None:
+            return
+        for reply_to, placeholder in drain_followup_anchors(sid.value):
+            text = (
+                "\N{WARNING SIGN} The session ended before this message ran "
+                "— please send it again."
+            )
+            try:
+                if placeholder is not None:
+                    await cfg.transport.edit(
+                        ref=placeholder, message=RenderedMessage(text=text)
+                    )
+                else:
+                    await cfg.transport.send(
+                        channel_id=reply_to.channel_id,
+                        message=RenderedMessage(text=text),
+                        options=SendOptions(
+                            reply_to=reply_to, thread_id=reply_to.thread_id
+                        ),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.debug("live_followup.unrun_notice_failed", exc_info=True)
+            logger.warning(
+                "claude.live_session.followup_not_run",
+                session_id=sid.value,
+                user_msg_id=reply_to.message_id,
+            )
+
+    turn_task_group: dict[str, Any] = {"tg": None}
+    turn_router = FollowupTurnRouter(
+        new_tracker=_new_turn_tracker,
+        create_progress=_create_turn_progress,
+        close_progress=_close_turn_progress,
+        deliver=_deliver_turn,
+        default_reply_to=user_ref,
+        followup_notify=cfg.final_notify,
+        clock=clock,
+    )
 
     cancel_exc_type = anyio.get_cancelled_exc_class()
     edits_scope = anyio.CancelScope()
@@ -4342,6 +5043,8 @@ async def handle_message(
     async with anyio.create_task_group() as tg:
         if progress_ref is not None:
             tg.start_soon(run_edits)
+        turn_task_group["tg"] = tg
+        turn_router.bind_task_group(tg)
 
         try:
             outcome = await run_runner_with_cancel(
@@ -4352,7 +5055,8 @@ async def handle_message(
                 running_task=running_task,
                 on_thread_known=on_thread_known,
                 channel_id=incoming.channel_id,
-                on_completed=_deliver_final,
+                on_completed=_on_run_completed,
+                turn_router=turn_router,
             )
         except Exception as exc:
             error = exc
@@ -4362,6 +5066,11 @@ async def handle_message(
                 error_type=exc.__class__.__name__,
             )
         finally:
+            # #776: an unfinished follow-up turn (session closed mid-turn)
+            # still gets a final so its progress message isn't orphaned.
+            with anyio.move_on_after(60, shield=True):
+                await turn_router.aclose()
+                await _resolve_unrun_followups()
             if running_task is not None and running_tasks is not None:
                 running_task.done.set()
                 if progress_ref is not None:
@@ -4821,7 +5530,11 @@ async def handle_message(
     # Delivery of *sent* files still requires a successful run (failures
     # may leave the outbox in a partially-written state), but the user
     # should always learn what the agent intended to send.
-    if cfg.send_file is not None and cfg.outbox_config is not None:
+    if (
+        cfg.send_file is not None
+        and cfg.outbox_config is not None
+        and not outbox_early["delivered"]
+    ):
         from .telegram.outbox_delivery import (
             OutboxResult,
             deliver_outbox_files,

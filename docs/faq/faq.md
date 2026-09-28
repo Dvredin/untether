@@ -80,9 +80,9 @@ If you click "Pause & Outline Plan", Claude writes a plain-language summary of w
 Per-chat permission mode (`/planmode on/plan-auto/auto/off`, or `/config → Permission mode`) controls when the buttons appear:
 
 - **on** — every plan transition prompts for approval.
-- **plan-auto** — plan transitions auto-approve, but tool approvals still appear.
+- **plan-auto** — plan mode, with the plan transition approved for you, so no buttons appear.
 - **auto** — Claude Code's own auto mode: a classifier approves routine work and blocks risky actions such as sending sensitive data to external endpoints. Questions the agent asks you still come through as buttons.
-- **off** — no plan phase; tools auto-execute (subject to engine policy).
+- **off** — no plan phase; file edits run freely, and other actions (most shell commands, web fetches, MCP tools) ask for approval unless your Claude Code settings allow them.
 
 The **plan-auto** mode was called `auto` before v0.35.5. It was renamed because Claude Code introduced its own `auto` mode, and the two names collided. If you set `permission_mode = "auto"` in `untether.toml` and want the old behaviour, change it to `"plan-auto"` — Untether logs a warning at startup if it spots the ambiguous value. Per-chat settings you made through the buttons are migrated for you.
 
@@ -93,7 +93,7 @@ For non-Claude engines, approval is enforced per-engine pre-run (Codex `--ask-fo
 Untether is built around the assumption that your phone is unreliable but your computer isn't. Two things matter here:
 
 1. **Your agent keeps running.** It's a subprocess on your machine. It doesn't care whether your phone is connected, whether Telegram is open, or whether you've gone to sleep. Progress messages buffer locally; reconnection rendering is automatic.
-2. **Untether catches the common failure modes.** If a Claude Code session exits prematurely after a tool result without processing it (a known upstream bug), Untether auto-resumes it. If a resume comes back empty — 0 turns and no answer, another upstream turn-state bug — Untether quarantines that session and automatically retries your message on a fresh one, telling you it did so. If the bot is restarted while a run is in progress, ephemeral approval messages are cleaned up and orphaned progress messages get a `⚠️ interrupted by restart` marker. Stalls that look "alive but silent" trigger progressive warnings, and the watchdog auto-cancels truly dead processes.
+2. **Untether catches the common failure modes.** If a Claude Code session exits prematurely after a tool result without processing it (a known upstream bug), Untether auto-resumes it. If a resume comes back empty — 0 turns and no answer, another upstream turn-state bug — Untether quarantines that session and automatically retries your message on a fresh one, telling you it did so. When Claude hands work to a background task or subagent and ends its turn, Untether keeps the session open: the task's result comes back as a new `🔔 Background task finished` message, and anything you send meanwhile goes into that same session rather than a new one. If you `/cancel` or Untether restarts while background tasks are running, it stops them cleanly and tells you which ones. If the bot is restarted while a run is in progress, ephemeral approval messages are cleaned up and orphaned progress messages get a `⚠️ interrupted by restart` marker. Stalls that look "alive but silent" trigger progressive warnings, and the watchdog auto-cancels truly dead processes.
 
 Everything important — Telegram update offsets, active progress message references, trigger fire history — is persisted to disk so a restart picks up where you left off without dropping or duplicating messages.
 
@@ -115,11 +115,11 @@ If you set no budget at all, Untether still flags a single run that costs more t
 
 `/usage` shows the current run's cost; `/usage debug` shows OAuth token expiry, schema-mismatch counters, and cache freshness — useful when the subscription footer goes silent. `/stats` reports per-engine totals across today, this week, and all time.
 
-Cost tracking is most accurate for Claude (full USD reporting via API metadata) and OpenCode. Codex, Pi, Gemini, and Amp report tokens-only. Subscription users (Claude Pro/Max, ChatGPT, Gemini, Amp) see a `5h: N% / 7d: N%` indicator instead of dollars. See the [cost-budgets guide](https://untether.littlebearapps.com/how-to/cost-budgets/) for tuning.
+Cost tracking is most accurate for Claude (full USD reporting via API metadata) and OpenCode. For Claude, the figure on each reply is what that reply cost — Claude reports a running total for the whole session, so Untether records the difference since the previous reply (resumed sessions are no longer counted twice). Codex, Pi, Gemini, and Amp report tokens-only. Subscription users (Claude Pro/Max, ChatGPT, Gemini, Amp) see a `5h: N% / 7d: N%` indicator instead of dollars. See the [cost-budgets guide](https://untether.littlebearapps.com/how-to/cost-budgets/) for tuning.
 
 ## Does /loop work via Untether?
 
-By default, no — Claude Code's `/loop` and `ScheduleWakeup` are session-scoped, and the Untether subprocess exits when each turn finishes. Schedules registered by Claude don't fire afterwards.
+Partly, by default. Claude Code's `/loop` and `ScheduleWakeup` are session-scoped. Since v0.35.5 Untether keeps a Claude session open after its reply while a wake-up is pending (up to 30 minutes), so short waits fire on their own and arrive as a `⏰ Scheduled wake-up` message. Longer schedules still end with the session.
 
 To enable end-to-end /loop support, turn on **Loop mode** in `/config → 🔁 Loop mode`. When on, Untether observes Claude's schedule registrations and re-fires each iteration when due, spawning a fresh `claude --resume` subprocess per fire.
 

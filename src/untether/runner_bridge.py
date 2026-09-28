@@ -26,7 +26,13 @@ from .model import (
 )
 from .presenter import Presenter
 from .progress import ProgressTracker
-from .runner import _APPROVAL_PENDING_REFIRE_S, Runner
+from .runner import (
+    _APPROVAL_PENDING_REFIRE_S,
+    Runner,
+    RunStreamHandle,
+    reset_run_stream_handle,
+    set_run_stream_handle,
+)
 from .session_quarantine import QuarantineStore, get_quarantine_store
 from .transport import (
     ChannelId,
@@ -1373,6 +1379,11 @@ class ProgressEdits:
         self._total_stall_warn_count: int = 0
         self._last_stall_warn_at: float = 0.0
         self._peak_idle: float = 0.0
+        # #787: the longest event gap seen while a live Claude session sat
+        # between turns. Kept apart from ``_peak_idle`` so that metric keeps
+        # meaning "longest stall"; a live-idle hold is silent by design.
+        self._peak_live_idle: float = 0.0
+        self._live_idle_logged: bool = False
         self._prev_diag: Any = None
         # #650/#593: clock() timestamp of the last stall tick that observed
         # the subprocess alive. Once the process is gone every /proc-derived
@@ -1648,7 +1659,15 @@ class ProgressEdits:
             # periodic tick.  Cheap when idle (empty dicts → early return).
             sweep_stale_registries()
             elapsed = self.clock() - self._last_event_at
-            self._peak_idle = max(self._peak_idle, elapsed)
+            # #787: a live session between turns is silent by design (its
+            # runner lifecycle owns teardown). Its hold must not read as a
+            # stall in ``session.summary peak_idle_seconds``.
+            live_idle = self._is_live_session_idle()
+            if live_idle:
+                self._peak_live_idle = max(self._peak_live_idle, elapsed)
+            else:
+                self._peak_idle = max(self._peak_idle, elapsed)
+                self._live_idle_logged = False
 
             # Collect diagnostics on every cycle so we always have a CPU
             # baseline for the next check (fixes cpu_active=None on first
@@ -1688,6 +1707,12 @@ class ProgressEdits:
                 # thresholds; this is an expected wait, not a stall.
                 threshold = self._STALL_THRESHOLD_APPROVAL
                 threshold_reason = "rate_limit_waiting"
+            elif self._is_api_retry_waiting():
+                # #792: the CLI is backing off before retrying a failed API
+                # call (``system/api_retry``) — same expected-wait handling
+                # as a rate-limit window.
+                threshold = self._STALL_THRESHOLD_APPROVAL
+                threshold_reason = "api_retry_waiting"
             elif mcp_server is not None:
                 threshold = self._STALL_THRESHOLD_MCP_TOOL
                 threshold_reason = "running_mcp_tool"
@@ -1702,13 +1727,6 @@ class ProgressEdits:
                 threshold_reason = "normal"
             if elapsed < threshold:
                 continue
-            logger.info(
-                "progress_edits.stall_threshold_selected",
-                channel_id=self.channel_id,
-                threshold=threshold,
-                reason=threshold_reason,
-                elapsed=round(elapsed, 1),
-            )
 
             # #650: a dead subprocess whose run already emitted its final
             # CompletedEvent is a normally-completed run being reaped late,
@@ -1745,6 +1763,36 @@ class ProgressEdits:
                 await self._enforce_cancel_teardown()
                 self.signal_send.close()
                 return
+
+            if live_idle and not (diag is not None and diag.alive is False):
+                # #787: no stall WARN, no stall_warnings count, no chat
+                # warning while live-idle — whatever the child-process or
+                # wake-up state. Before #510 the run-level monitor could read
+                # another chat's stream here; now it reads its own, and a
+                # live hold (pending ScheduleWakeup, background tasks) is by
+                # definition not a hang. A dead process still falls through
+                # to the process_dead arm below.
+                self._frozen_ring_count = 0
+                if not self._live_idle_logged:
+                    self._live_idle_logged = True
+                    self._bump_stall_suppression("live_idle")
+                    logger.info(
+                        "progress_edits.stall_live_idle_suppressed",
+                        channel_id=self.channel_id,
+                        seconds_since_last_event=round(elapsed, 1),
+                        threshold_reason=threshold_reason,
+                        run_level=self.run_level,
+                        pid=self.pid,
+                    )
+                continue
+
+            logger.info(
+                "progress_edits.stall_threshold_selected",
+                channel_id=self.channel_id,
+                threshold=threshold,
+                reason=threshold_reason,
+                elapsed=round(elapsed, 1),
+            )
 
             now = self.clock()
             if (
@@ -1807,6 +1855,7 @@ class ProgressEdits:
             _expected_wait_reason = threshold_reason in (
                 "pending_approval",
                 "rate_limit_waiting",
+                "api_retry_waiting",
             )
             _expected_wait = (
                 (_post_result_idle and not _post_result_limbo)
@@ -1853,7 +1902,11 @@ class ProgressEdits:
             # #495/#499/#500: ``rate_limit_waiting`` joins ``pending_approval``
             # as a demoted reason — an upstream throttle resumes by itself, so
             # it is by definition not a hang either.
-            if threshold_reason in ("pending_approval", "rate_limit_waiting"):
+            if threshold_reason in (
+                "pending_approval",
+                "rate_limit_waiting",
+                "api_retry_waiting",
+            ):
                 if (
                     self._last_approval_pending_emit_at == 0.0
                     or now - self._last_approval_pending_emit_at
@@ -2646,6 +2699,20 @@ class ProgressEdits:
                 return False
         return False
 
+    def _is_api_retry_waiting(self) -> bool:
+        """#792: True while the engine is backing off before retrying a
+        failed API call (Claude's ``system/api_retry``). Duck-typed like
+        :meth:`_is_rate_limit_waiting`; engines without the probe → False."""
+        es = getattr(self.stream, "engine_state", None) if self.stream else None
+        probe = getattr(es, "awaiting_api_retry", None)
+        if callable(probe):
+            try:
+                return bool(probe())
+            except Exception as exc:  # noqa: BLE001 - monitor loop must not die
+                logger.debug("progress_edits.api_retry_probe_failed", error=str(exc))
+                return False
+        return False
+
     def _has_running_tool(self) -> bool:
         """Check if any action is still running (e.g. Bash command, TaskOutput)."""
         for action_state in reversed(list(self.tracker._actions.values())):
@@ -3412,6 +3479,23 @@ async def run_runner_with_cancel(
     outcome = RunOutcome()
     start_time = time.monotonic()
     runner_finished = anyio.Event()
+    # #510: this run's own stream + pid. The runner instance is shared
+    # across chats, so ``runner.current_stream`` / ``runner.last_pid`` are
+    # "latest spawn in ANY chat" and must never be read here. The handle is
+    # bound to the context BEFORE the task group starts so ``run_runner``
+    # (which iterates the generator, i.e. executes ``run_impl``) inherits it.
+    stream_handle = RunStreamHandle()
+    stream_token = set_run_stream_handle(stream_handle)
+
+    def bind_run_stream() -> None:
+        """Bind edits to this run's published stream/pid. Idempotent, so a
+        supplementary ``StartedEvent`` (e.g. Claude's per-result
+        ``meta={"complete": ...}``) can never rebind to another chat."""
+        if stream_handle.stream is not None:
+            edits.stream = stream_handle.stream
+        if isinstance(stream_handle.pid, int):
+            edits.pid = stream_handle.pid
+
     try:
         async with anyio.create_task_group() as tg:
 
@@ -3440,9 +3524,7 @@ async def run_runner_with_cancel(
                                 pid = evt.meta.get("pid")
                                 if isinstance(pid, int):
                                     edits.pid = pid
-                            _cs = getattr(runner, "current_stream", None)
-                            if _cs is not None:
-                                edits.stream = _cs
+                            bind_run_stream()
                             if running_task is not None and running_task.resume is None:
                                 running_task.resume = evt.resume
                                 try:
@@ -3539,16 +3621,13 @@ async def run_runner_with_cancel(
                 tg.cancel_scope.cancel()
 
             async def thread_pid() -> None:
-                """Poll for early PID from subprocess spawn before StartedEvent."""
-                for _ in range(50):  # poll up to 5s
-                    pid = getattr(runner, "last_pid", None)
-                    if isinstance(pid, int):
-                        edits.pid = pid
-                        cs = getattr(runner, "current_stream", None)
-                        if cs is not None:
-                            edits.stream = cs
-                        return
-                    await anyio.sleep(0.1)
+                """Bind this run's PID + stream as soon as the runner publishes
+                them at spawn — before any StartedEvent, so stall diagnostics
+                aren't blind when a run never gets that far (#593). Bounded:
+                runners that never publish leave edits unbound (#510)."""
+                with anyio.move_on_after(5):
+                    await stream_handle.ready.wait()
+                    bind_run_stream()
 
             tg.start_soon(run_runner)
             tg.start_soon(thread_pid)
@@ -3567,6 +3646,8 @@ async def run_runner_with_cancel(
         ]
         if non_cancelled:
             raise non_cancelled[0] from eg
+    finally:
+        reset_run_stream_handle(stream_token)
 
     # Session completion summary
     duration = time.monotonic() - start_time
@@ -3588,6 +3669,9 @@ async def run_runner_with_cancel(
         # #494: subprocess-health canary, separate from user-facing stall_warnings
         liveness_stalls=edits.stream.liveness_stalls if edits.stream else 0,
         peak_idle_seconds=round(edits._peak_idle, 1),
+        # #787: live-session holds between turns, reported apart from
+        # peak_idle so the stall metric isn't inflated by by-design waits.
+        peak_live_idle_seconds=round(edits._peak_live_idle, 1),
         last_event_type=edits.stream.last_event_type if edits.stream else None,
         # #716: `last_event_type` alone cannot answer "did this run reach its
         # result?" — a trailing frame overwrites it. Logging the latch makes
@@ -3885,6 +3969,9 @@ class FollowupTurnRouter:
             self._followup_notify
             if evt.reason == "followup"
             else evt.reason in _TURN_PUSH_REASONS
+            # #785: the second wake turn for one background-task finish
+            # (the first already reported it) arrives without a push.
+            and not (evt.detail or {}).get("already_announced")
         )
         ctx = _TurnCtx(
             turn=evt.turn,
@@ -3938,11 +4025,23 @@ class FollowupTurnRouter:
                 turn=ctx.turn,
                 reason=ctx.reason,
                 command_uuid=ctx.command_uuid,
+                push=ctx.notify,
             )
             return
         ctx = self.current
         if ctx is None or ctx.turn != evt.turn:
             ctx = self._open(evt)
+        elif ctx.reason == "unknown" and evt.reason not in ("unknown", "followup"):
+            # #785: the runner attributed the turn at its completion (the
+            # task it answered ended during it) — deliver the real header.
+            ctx.reason = evt.reason
+            ctx.header = _turn_header(evt)
+            logger.info(
+                "live_turn.retro_attributed",
+                turn=ctx.turn,
+                reason=ctx.reason,
+                header=ctx.header,
+            )
         completed = CompletedEvent(
             engine=evt.engine,
             ok=bool(evt.ok),

@@ -235,3 +235,207 @@ def test_render_markdown_keeps_valid_link() -> None:
     link_entities = [e for e in entities if e.get("type") == "text_link"]
     assert len(link_entities) == 1
     assert link_entities[0]["url"] == "https://docs.example.com"
+
+
+# ---------------------------------------------------------------------------
+# #786 — model-emitted <br> renders as a line break, not literally
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tag", ["<br>", "<br/>", "<br />", "<BR>", "<Br />"])
+def test_render_markdown_inline_br_becomes_newline(tag: str) -> None:
+    text, entities = render_markdown(f"line one{tag}line two")
+
+    assert text == "line one\nline two"
+    assert entities == []
+
+
+def test_render_markdown_br_inside_bold_keeps_entity() -> None:
+    text, entities = render_markdown("**a<br>b**")
+
+    assert text == "a\nb"
+    assert entities == [{"type": "bold", "offset": 0, "length": 3}]
+
+
+def test_render_markdown_br_only_paragraph_is_dropped() -> None:
+    """The observed #786 shape: a `<br>` spacer paragraph between the
+    answer and the footer."""
+    text, _ = render_markdown("The agents are still running.\n\n<br>\n\n🏷 footer")
+
+    assert "<br>" not in text
+    assert text == "The agents are still running.\n\n🏷 footer"
+
+
+def test_render_markdown_trailing_br_only_paragraph_dropped() -> None:
+    text, _ = render_markdown("answer\n\n<br>")
+
+    assert text == "answer"
+
+
+def test_render_markdown_br_in_pipe_table_row_becomes_space() -> None:
+    """commonmark renders no tables, so a pipe row stays one line of text —
+    a space keeps the row readable where a newline would split the cell."""
+    text, _ = render_markdown("| a<br>b | c |\n|---|---|\n| d | e |")
+
+    assert "<br>" not in text
+    assert "| a b | c |" in text
+
+
+def test_render_markdown_br_in_code_span_preserved() -> None:
+    text, entities = render_markdown("use `a<br>b` here")
+
+    assert text == "use a<br>b here"
+    assert {"type": "code", "offset": 4, "length": 6} in entities
+
+
+def test_render_markdown_br_in_fenced_block_preserved() -> None:
+    text, _ = render_markdown("```html\n<p>a<br>b</p>\n```")
+
+    assert text == "<p>a<br>b</p>"
+
+
+def test_render_markdown_br_in_indented_code_block_preserved() -> None:
+    text, _ = render_markdown("para\n\n    a<br>b\n")
+
+    assert text.endswith("a<br>b")
+
+
+def test_render_markdown_other_html_still_literal() -> None:
+    """#713 posture: only a bare <br> is normalised; every other tag —
+    including <br> look-alikes and <br> with attributes — stays text."""
+    text, _ = render_markdown('x <b>bold</b> <svg onload=1> <brx> <br class="c"> <br>y')
+
+    assert "<b>bold</b>" in text
+    assert "<svg onload=1>" in text
+    assert "<brx>" in text
+    assert '<br class="c">' in text
+    assert text.endswith("\ny")
+
+
+# ---------------------------------------------------------------------------
+# #788 — bare filenames whose extension is a TLD (.md/.sh/.py) are rendered
+# as inline code, so neither our linkify nor Telegram turns them into links
+# ---------------------------------------------------------------------------
+
+
+def _code_spans(text: str, entities: list[dict]) -> list[str]:
+    """Return the text covered by each `code` entity (UTF-16 offsets are
+    safe here because the test strings are ASCII)."""
+    return [
+        text[e["offset"] : e["offset"] + e["length"]]
+        for e in entities
+        if e.get("type") == "code"
+    ]
+
+
+def _link_urls(entities: list[dict]) -> list[str]:
+    return [e["url"] for e in entities if e.get("type") == "text_link"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CLAUDE.md",
+        "AGENTS.md",
+        "README.md",
+        "setup.sh",
+        "main.py",
+        "src/untether/telegram/render.py",
+        "~/.claude/CLAUDE.md",
+        "docs/how-to/troubleshooting.md",
+        "NOTES.MD",
+    ],
+)
+def test_render_markdown_bare_filename_becomes_code(name: str) -> None:
+    text, entities = render_markdown(f"Update {name} now")
+
+    assert text == f"Update {name} now"
+    assert _code_spans(text, entities) == [name]
+    assert _link_urls(entities) == []
+
+
+def test_render_markdown_filename_at_sentence_end_excludes_period() -> None:
+    text, entities = render_markdown("Read CLAUDE.md. Then AGENTS.md, then run.sh!")
+
+    assert _code_spans(text, entities) == ["CLAUDE.md", "AGENTS.md", "run.sh"]
+    assert _link_urls(entities) == []
+
+
+@pytest.mark.parametrize(
+    ("md", "expected"),
+    [
+        ("see render.py:86 for it", ["render.py:86"]),
+        ("see src/a.py:12:4 now", ["src/a.py:12:4"]),
+        ("Edit CLAUDE.md: add a rule", ["CLAUDE.md"]),
+        ("run ./scripts/staging.sh install", ["./scripts/staging.sh"]),
+        ("(CLAUDE.md) and 'setup.sh'", ["CLAUDE.md", "setup.sh"]),
+    ],
+)
+def test_render_markdown_filename_edge_shapes(md: str, expected: list[str]) -> None:
+    text, entities = render_markdown(md)
+
+    assert text == md
+    assert _code_spans(text, entities) == expected
+    assert _link_urls(entities) == []
+
+
+def test_render_markdown_filename_in_bold_is_code_not_link() -> None:
+    text, entities = render_markdown("**CLAUDE.md** changed")
+
+    assert text == "CLAUDE.md changed"
+    assert _code_spans(text, entities) == ["CLAUDE.md"]
+    assert _link_urls(entities) == []
+
+
+def test_render_markdown_filename_already_in_code_span_not_double_wrapped() -> None:
+    text, entities = render_markdown("see `CLAUDE.md` here")
+
+    assert text == "see CLAUDE.md here"
+    assert entities == [{"type": "code", "offset": 4, "length": 9}]
+
+
+def test_render_markdown_filename_in_fenced_block_untouched() -> None:
+    text, entities = render_markdown("```\ncat CLAUDE.md\n```")
+
+    assert text == "cat CLAUDE.md"
+    assert [e["type"] for e in entities] == ["code", "pre"]
+
+
+def test_render_markdown_raw_url_ending_in_md_stays_link() -> None:
+    text, entities = render_markdown("see https://example.com/docs/a.md for more")
+
+    assert text == "see https://example.com/docs/a.md for more"
+    assert _link_urls(entities) == ["https://example.com/docs/a.md"]
+    assert _code_spans(text, entities) == []
+
+
+def test_render_markdown_markdown_link_to_md_file_left_alone() -> None:
+    text, entities = render_markdown(
+        "[CLAUDE.md](https://github.com/o/r/blob/main/CLAUDE.md)"
+    )
+
+    assert text == "CLAUDE.md"
+    assert _link_urls(entities) == ["https://github.com/o/r/blob/main/CLAUDE.md"]
+    assert _code_spans(text, entities) == []
+
+
+def test_render_markdown_www_host_with_md_tld_stays_link() -> None:
+    """An explicit `www.` host is a deliberate web address, not a file."""
+    _, entities = render_markdown("visit www.example.md today")
+
+    assert _link_urls(entities) == ["http://www.example.md"]
+
+
+@pytest.mark.parametrize(
+    "md",
+    [
+        "example.com is a domain",
+        "docs.rs hosts crate docs",
+        "foo.mdx and a.md5 and archive.md.bak",
+    ],
+)
+def test_render_markdown_non_target_names_unchanged(md: str) -> None:
+    text, entities = render_markdown(md)
+
+    assert text == md
+    assert _code_spans(text, entities) == []

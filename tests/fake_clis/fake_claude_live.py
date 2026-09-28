@@ -11,7 +11,8 @@ live background tasks (``task_updated{killed}`` + ``task_notification
 ``docs/findings/2026-09-27-claude-live-session-probes.md``).
 
 Scenario via ``FAKE_CLAUDE_SCENARIO``; timing via ``FAKE_CLAUDE_WAKE_S``
-(default 0.3 s). Test-only.
+(default 0.3 s) and ``FAKE_CLAUDE_RESULT_DELAY_S`` (``followup`` only: delay
+before the first result, default 0). Test-only.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -26,6 +28,8 @@ import time
 
 SESSION_ID = os.environ.get("FAKE_CLAUDE_SESSION_ID", "fake-live-session")
 WAKE_S = float(os.environ.get("FAKE_CLAUDE_WAKE_S", "0.3"))
+# #510: hold the first turn's result so a concurrent spawn lands in between.
+RESULT_DELAY_S = float(os.environ.get("FAKE_CLAUDE_RESULT_DELAY_S", "0"))
 
 _cost = 0.0
 _lines: queue.Queue[dict | None] = queue.Queue()
@@ -319,6 +323,81 @@ def scenario_bg_agent_wake(first: dict) -> None:
     serve_followups()
 
 
+def _end_quietly(task_id: str) -> None:
+    # The task ends (snapshot + task_updated) without its notification yet.
+    _live_tasks.pop(task_id)
+    snapshot()
+    emit(
+        {
+            "type": "system",
+            "subtype": "task_updated",
+            "task_id": task_id,
+            "patch": {"status": "completed", "end_time": int(time.time() * 1000)},
+        }
+    )
+
+
+def scenario_agent_wake_unknown_first(first: dict) -> None:
+    """#785: the CLI opens a wake turn on a background agent's result BEFORE
+    any task event names it, then a second turn once its task_notification
+    lands. ``FAKE_CLAUDE_TASK_END=mid`` ends the task inside the first turn;
+    ``after`` (default) just after it. A subagent-owned foreground task's
+    notification arrives while the parent idles (it must not label a turn)."""
+    mode = os.environ.get("FAKE_CLAUDE_TASK_END", "after")
+    init()
+    tool_use("Agent", "toolu_ag", {"description": "sweep", "prompt": "go"})
+    start_bg("a1", "toolu_ag", task_type="local_agent")
+    tool_result("toolu_ag", "Async agent launched successfully.")
+    result("agent started", turns=2)
+    emit(
+        {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "n1",
+            "tool_use_id": "toolu_nested",
+            "description": "Inspect nested agents",
+            "owned_by_subagent": True,
+            "is_backgrounded": False,
+            "task_type": "local_agent",
+        }
+    )
+    emit(
+        {
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "n1",
+            "tool_use_id": "toolu_nested",
+            "status": "completed",
+            "output_file": "",
+            "summary": "Inspect nested agents",
+        }
+    )
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    init()
+    text("The sweep is back")
+    if mode == "mid":
+        _end_quietly("a1")
+    result("The sweep is back")
+    if mode != "mid":
+        _end_quietly("a1")
+    emit(
+        {
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "a1",
+            "tool_use_id": "toolu_ag",
+            "status": "completed",
+            "output_file": "",
+            "summary": "sweep finished",
+        }
+    )
+    init()
+    text("The sweep has finished")
+    result("The sweep has finished")
+    serve_followups()
+
+
 def scenario_monitor_ticks(first: dict) -> None:
     init()
     tool_use("Monitor", "toolu_mon", {"command": "tick", "timeout_ms": 30000})
@@ -357,6 +436,8 @@ def scenario_scheduled_wakeup(first: dict) -> None:
 def scenario_followup(first: dict) -> None:
     init()
     text("FIRST")
+    if RESULT_DELAY_S > 0:
+        time.sleep(RESULT_DELAY_S)
     result("FIRST")
     serve_followups()
 
@@ -396,11 +477,33 @@ def scenario_inherited_fd_after_exit(first: dict) -> None:
     os._exit(0)
 
 
+def _maybe_ignore_sigint() -> None:
+    # #791: FAKE_CLAUDE_IGNORE_SIGINT=1 models a CLI that is also deaf to
+    # the Ctrl-C path, so the close escalates on to SIGTERM.
+    if os.environ.get("FAKE_CLAUDE_IGNORE_SIGINT") == "1":
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 def scenario_ignore_eof(first: dict) -> None:
-    # A wedged CLI: answers, then ignores stdin EOF (forces the SIGTERM path).
+    # A wedged CLI: answers, then ignores stdin EOF (forces the signal path).
+    _maybe_ignore_sigint()
     init()
     text("stuck")
     result("stuck")
+    while next_user(None) is not None:
+        pass
+    time.sleep(60)
+
+
+def scenario_ignore_eof_with_task(first: dict) -> None:
+    # #791: wedged with a background task still live — the transcript has a
+    # dangling background tool_use, so a forced teardown must quarantine.
+    _maybe_ignore_sigint()
+    init()
+    tool_use("Bash", "toolu_bg", {"command": "sleep 60", "run_in_background": True})
+    start_bg("b1", "toolu_bg")
+    tool_result("toolu_bg", "Command running in background with ID: b1.")
+    result("waiting", turns=2)
     while next_user(None) is not None:
         pass
     time.sleep(60)
@@ -428,8 +531,10 @@ def scenario_error_first(first: dict) -> None:
 _SCENARIOS = {
     "error_first": scenario_error_first,
     "ignore_eof": scenario_ignore_eof,
+    "ignore_eof_with_task": scenario_ignore_eof_with_task,
     "bg_bash_wake": scenario_bg_bash_wake,
     "bg_agent_wake": scenario_bg_agent_wake,
+    "agent_wake_unknown_first": scenario_agent_wake_unknown_first,
     "monitor_ticks": scenario_monitor_ticks,
     "scheduled_wakeup": scenario_scheduled_wakeup,
     "followup": scenario_followup,

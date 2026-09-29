@@ -91,30 +91,85 @@ by Untether's `StreamResultMessage` schema):
 
 ### `rate_limit_event`
 
-Informational event emitted when Claude Code hits or approaches a rate limit (CLI v2.1.45+).
-Purely informational — the run continues, it does not terminate the session.
+A **quota-status snapshot**, not a throttle notice ([#790](https://github.com/littlebearapps/untether/issues/790)).
+The CLI emits one whenever an API response moves the rounded utilization or a reset
+time of the account's subscription windows — so a healthy session sees a steady trickle
+of `status: "allowed"` events. The event never terminates the session.
 
-Fields:
-- `type`: `"rate_limit_event"`
-- `rate_limit_info` (optional): object with rate limit details
-
-`rate_limit_info` fields (all optional):
-- `requests_limit`, `requests_remaining`, `requests_reset` (ISO 8601)
-- `tokens_limit`, `tokens_remaining`, `tokens_reset` (ISO 8601)
-- `retry_after_ms`
-
-Example (full):
+Real payload (captured on CLI 2.1.283, one-turn Haiku probe):
 ```json
-{"type":"rate_limit_event","rate_limit_info":{"requests_limit":1000,"requests_remaining":0,"requests_reset":"2026-01-01T00:01:00Z","tokens_limit":50000,"tokens_remaining":0,"tokens_reset":"2026-01-01T00:01:00Z","retry_after_ms":60000}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1790578200,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.09,"resetsAt":1790578200},"seven_day":{"utilization":0.15,"resetsAt":1791036000}}},"uuid":"…","session_id":"…"}
 ```
 
-Example (bare):
+`rate_limit_info` fields (upstream zod, CLI 2.1.283):
+
+| Field | Type | Notes |
+|---|---|---|
+| `status` | `"allowed"` \| `"allowed_warning"` \| `"rejected"` | always present |
+| `resetsAt` | int (epoch s) | reset time of the window named by `rateLimitType` |
+| `rateLimitType` | `five_hour` \| `seven_day` \| `seven_day_opus` \| `seven_day_sonnet` \| `seven_day_overage_included` \| `overage` | optional |
+| `utilization` | number (0–1) | optional; the warning window's utilization |
+| `unifiedWindows` | `{five_hour?, seven_day?, seven_day_overage_included?}: {utilization, resetsAt}` | absent for API-key / Bedrock / Vertex sessions |
+| `overageStatus` | same 3 values as `status` | paid extra-usage state |
+| `overageResetsAt` | int | optional |
+| `overageDisabledReason` | enum (13 values, e.g. `out_of_credits`, `org_level_disabled`) | optional |
+| `isUsingOverage` | bool | `rejected` + `isUsingOverage` is **not** a throttle — extra usage covers it |
+| `errorCode` | `"credits_required"` | optional |
+| `limitScope`, `surpassedThreshold`, `overageInUse`, … | | ignored by Untether |
+
+The enum lists are mirrored as `CLAUDE_RATE_LIMIT_STATUSES` / `CLAUDE_RATE_LIMIT_TYPES` /
+`CLAUDE_OVERAGE_STATUSES` in `schemas/claude.py` and pinned by the zero-token drift test
+`tests/test_claude_cli_schema_drift.py`, which reads them out of the installed CLI.
+
+**Legacy shape.** Earlier docs described `requests_limit` / `requests_remaining` /
+`requests_reset` / `tokens_limit` / `tokens_remaining` / `tokens_reset` / `retry_after_ms`.
+No real CLI has been observed sending these; the schema keeps them optional so such an
+emitter still gets a precise countdown ([#518](https://github.com/littlebearapps/untether/issues/518)).
+
+**Untether handling** (`_translate_rate_limit_event` in `runners/claude.py`):
+
+| Snapshot | Untether |
+|---|---|
+| `allowed` | Snapshot only — `unifiedWindows` stashed on `ClaudeStreamState.rate_limit_windows`, DEBUG `claude.rate_limit_snapshot`. No note, no latch, no `cumulative_s`. |
+| `allowed_warning` | One `⚠️ 5h limit 85% used — resets 17:30 AEST` note per (window, reset) when utilization ≥ 0.7 (or absent) and extra usage isn't covering it. No latch. |
+| `rejected`, not `isUsingOverage`, `resetsAt` in the future | Throttle: note `⏳ Rate limited until 17:30 AEST (~30 min)`, `rate_limit_wait_until` latched to `resetsAt` (clamped to 24 h), extension-only accounting so repeats don't double-count, and repeats update the same note. Beats the [#692](https://github.com/littlebearapps/untether/issues/692) result-text parse. |
+| `rejected` without `resetsAt` | Legacy timing if present → `errorCode: credits_required` / overage → [#701](https://github.com/littlebearapps/untether/issues/701) remedy title (`⛔ Model limit reached — …`) → #692 harvested reset → #701 latch → `⏳ Rate limited — waiting to retry (~60s)`. |
+| `rejected` with `isUsingOverage`, or `resetsAt` already past | Not a throttle (INFO log `retry_after_source=covered_by_overage` / `stale`). |
+| unknown `status` | WARN `claude.rate_limit_event.unknown_status` once per value; no latch. |
+| no `status`, legacy timing | #518 path: `⏳ Rate limited — retrying in Ns`. |
+| truly bare (`{"type":"rate_limit_event"}`) | Nothing — INFO `retry_after_source=bare`. The [#657](https://github.com/littlebearapps/untether/issues/657) "bare = 60 s throttle" guess is retired: bare was an artefact of the old schema decoding every real snapshot to all-`None`. |
+
+### `system` / `api_retry` (#792)
+
+Emitted when an API request fails with a retryable error and the CLI will retry after a
+delay — the wire twin of the REPL's retry banner (`SDKAPIRetryMessage`, CLI 2.1.283).
+This, not `rate_limit_event`, is the real "backing off, retrying in N s" signal.
+
 ```json
-{"type":"rate_limit_event"}
+{"type":"system","subtype":"api_retry","attempt":2,"max_retries":10,"retry_delay_ms":8000,"error_status":529,"error":"overloaded","uuid":"…","session_id":"…"}
 ```
 
-**Untether handling**: Decoded by `StreamRateLimitMessage` schema, silently skipped in
-`translate_claude_event` (no Untether events emitted).
+| Field | Type | Notes |
+|---|---|---|
+| `attempt` / `max_retries` | int | retry counters |
+| `retry_delay_ms` | int | back-off before the next attempt |
+| `error_status` | int \| null | HTTP status; `null` for connection errors (timeouts) with no response |
+| `error` | string | category: `rate_limit`, `overloaded`, `server_error`, `authentication_failed`, `billing_error`, `invalid_request`, `unknown`, … |
+| `no_response` | `{waited_ms, retry_wait_ms}` (optional) | only when no response headers arrived within `CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS`; `max_retries` is then this cause's own cap (normally 1) |
+
+A sibling `system/control_request_progress` with `status: "api_retry"` carries the same
+counters for client-originated control requests (side questions only) — not handled.
+
+**Untether handling** (`_translate_api_retry` in `runners/claude.py`): decoded into the
+flat `StreamSystemMessage` (all fields optional, `error` typed `Any`). Renders one note per
+retry sequence, updated in place as attempts climb — `🔁 API error 529 (overloaded) —
+retrying in 8s (attempt 2/10)`, `🔁 API unreachable — retrying in 5s (attempt 1/10)`
+(no status), or `🔁 No response from API after 45s — retrying in 2s (attempt 1/1)`
+(`no_response`). Latches `ClaudeStreamState.api_retry_wait_until` = now + delay (+ the
+retry's `retry_wait_ms` header window); the bridge's `awaiting_api_retry()` probe treats that
+window as an expected wait (`reason=api_retry_waiting`), like a rate-limit window. Logs
+`claude.api_retry` at INFO (WARN, and a `warning`-level note, on the final attempt). Retry
+time accrues in `api_retry_total_s`, kept separate from rate-limit time.
 
 ### `tool_progress`
 
@@ -141,6 +196,45 @@ Example:
 tail on long-running actions from its own clock (#481), so the upstream heartbeat is
 redundant for progress rendering — the schema entry exists so the line decodes instead of
 being dropped with a `jsonl.msgspec.invalid` warning ([#637](https://github.com/littlebearapps/untether/issues/637)).
+
+### Background-task lifecycle (`system` subtypes, CLI ≥ 2.1.28x) — #776
+
+Verified on 2.1.283 (see `docs/findings/2026-09-27-claude-live-session-probes.md`).
+
+```json
+{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","task_type":"local_bash","description":"…"}]}
+{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_…","description":"…","is_backgrounded":true,"task_type":"local_bash"}
+{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_…","subagent_type":"general-purpose","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent","prompt":"…"}
+{"type":"system","subtype":"task_started","task_id":"f1","owned_by_subagent":true,"is_backgrounded":false,"task_type":"local_bash"}
+{"type":"system","subtype":"task_progress","task_id":"a1","usage":{"total_tokens":52470,"tool_uses":2,"duration_ms":4314},"last_tool_name":"Bash"}
+{"type":"system","subtype":"task_updated","task_id":"b1","patch":{"status":"completed","end_time":1790500249636}}
+{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"toolu_…","status":"completed","output_file":"…","summary":"…"}
+```
+
+- `background_tasks_changed` is a full snapshot of live background tasks (`[]` when none) and arrives just *before* `task_started` / `task_updated`.
+- `owned_by_subagent: true` with `is_backgrounded: false` is a subagent's own foreground tool — not background work.
+- `task_updated.patch.status`: `completed` | `killed`; `task_notification.status`: `completed` | `stopped`.
+- `Monitor` is `task_type: local_bash`; each streamed line starts a new turn with **no** per-line task event; the stream end emits `task_updated` + `task_notification`.
+- `ScheduleWakeup` / `RemoteTrigger` emit **no** task events.
+- Resuming a finished background agent (e.g. `SendMessage` to it) **reuses its `task_id`**: a fresh snapshot lists it again and a new `task_started` follows. Untether revives the ended task instead of leaving it terminal ([#801](https://github.com/littlebearapps/untether/issues/801)).
+- Closing stdin stops live background tasks (`killed` / `stopped`) and the CLI exits rc=0 a few seconds later.
+- On `--resume` after such a stop, the CLI first emits `task_notification{status:"stopped", output_file:""}`, then `system/init`, then a **0-turn result**, then the real turn.
+
+### `command_lifecycle` (#776)
+
+One line per input command (user line or scheduled wake-up):
+
+```json
+{"type":"command_lifecycle","command_uuid":"<uuid>","state":"queued"}
+{"type":"command_lifecycle","command_uuid":"<uuid>","state":"started"}
+{"type":"command_lifecycle","command_uuid":"<uuid>","state":"completed"}
+```
+
+`command_uuid` echoes the `uuid` field of the stream-json `user` line that was written to stdin, so a turn can be attributed to the message that caused it. A ScheduleWakeup firing appears as `started` with a uuid Untether never wrote. `completed` for command N can arrive lazily (when command N+1 is queued).
+
+### Multi-result streams (#776)
+
+In control-channel mode the process does not exit after `result`: background-task completions, Monitor lines, ScheduleWakeup firings and user lines written while idle each produce another `system/init` → … → `result`. `total_cost_usd` is cumulative per session (including across `--resume`); `num_turns` is per result.
 
 ## Message object (`message` field)
 

@@ -26,12 +26,14 @@ Resume line: on
 Engine: claude (global)
 Model: default
 Listen: all
+Follow-up: queue  · wait for the run
 
 [📋 Plan mode]     [❓ Ask mode]
 [📝 Diff preview]  [🔍 Verbose]
 [💰 Cost & usage]  [↩️ Resume line]
-[📡 Listen]        [⚙️ Engine & model]
-[🧠 Reasoning]     [ℹ️ About]
+[📡 Listen]        [🔁 Loop mode]
+[🧠 Reasoning]     [⚙️ Engine & model]
+[↪️ Follow-up]     [ℹ️ About]
 
 📖 Help guides · 🐛 Report a bug
 ```
@@ -64,7 +66,7 @@ When you tap a setting button:
 
 Some settings have more than two states and use a different layout:
 
-- **Plan mode** — three options (off / on / auto) shown as separate buttons in a 2+1 split: `[Off] [On]` on the first row, `[Auto] [Clear override]` on the second
+- **Permission mode** (Claude Code) — four options shown in a 2+2+1 split: `[Off] [On]` on the first row, `[Plan-auto] [Auto]` on the second, `[Clear override]` on the third
 - **Approval mode** (Gemini) — three options (read-only / edit files / full access)
 - **Effort** (Claude Code) — low / medium / high / xhigh / max
 - **Reasoning** (Codex) — minimal / low / medium / high / xhigh
@@ -79,6 +81,7 @@ Settings are engine-specific and only appear when relevant:
 - **Approval policy** — Codex CLI only. Toggle between "full auto" (default, all tools approved) and "safe" (untrusted tools blocked via `--ask-for-approval untrusted`). This is a pre-run policy — not interactive mid-run approval.
 - **Approval mode** — Gemini CLI only. Toggle between "read-only" (default, write tools blocked), "edit files" (file reads/writes OK, shell commands blocked via `--approval-mode auto_edit`), and "full access" (all tools approved via `--approval-mode yolo`). This is a pre-run policy.
 - **Ask mode** and **Diff preview** — Claude Code only. Hidden for other engines.
+- **Follow-up** — Claude Code only ([#775](https://github.com/littlebearapps/untether/issues/775)). `queue` (default) or `steer` for messages sent while a run is working; see [steer follow-ups](steer-follow-ups.md). Hidden on the home page for other engines; if you reach the page anyway it says that other engines always queue.
 - **Reasoning** — Claude Code and Codex only. Hidden for OpenCode, Pi, Gemini, and Amp.
 - **Engine & model** — always visible. Engine and model are merged into a single page. Shows the current engine and model override; to set a model, use `/model set <name>`.
 
@@ -88,7 +91,7 @@ When you switch engines via the Engine & model page, the home page automatically
 
 | Setting | Options | Persisted |
 |---------|---------|-----------|
-| Plan mode | off, on, auto | Yes (chat prefs) |
+| Permission mode | off, on, plan-auto, auto | Yes (chat prefs) |
 | Approval policy | full auto, safe | Yes (chat prefs) |
 | Approval mode | read-only, edit files, full access | Yes (chat prefs) |
 | Ask mode | off, on | Yes (chat prefs) |
@@ -99,6 +102,7 @@ When you switch engines via the Engine & model page, the home page automatically
 | Cost & usage | API cost, subscription usage, budget, auto-cancel | Yes (chat prefs) |
 | Resume line | off, on | Yes (chat prefs) |
 | Listen | all, mentions | Yes (chat prefs) |
+| Follow-up | queue, steer | Yes (chat prefs) |
 | Budget enabled | off, on | Yes (chat prefs) |
 | Budget auto-cancel | off, on | Yes (chat prefs) |
 

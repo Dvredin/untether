@@ -196,6 +196,123 @@ def read_cmdline_argv(pid: int) -> list[str] | None:
     ]
 
 
+def read_wchan(pid: int) -> str | None:
+    """Return the kernel wait channel (``/proc/<pid>/wchan``) or None.
+
+    #791: names what a sleeping process is blocked on (``ep_poll``,
+    ``do_wait``, ``futex_wait_queue``…) for the live-session close-grace
+    diagnostic. None on non-Linux platforms, missing PIDs, or when the
+    kernel hides it ("0").
+    """
+    try:
+        with open(f"/proc/{pid}/wchan") as f:
+            raw = f.read().strip()
+    except (OSError, FileNotFoundError, PermissionError):
+        return None
+    return raw if raw and raw != "0" else None
+
+
+_SECRETISH = (
+    "token",
+    "secret",
+    "key",
+    "auth",
+    "bearer",
+    "password",
+    "passwd",
+    "credential",
+    "cookie",
+)
+# Flags whose value is a header line ("Name: value"): the value is hidden
+# whatever the header name, the flag itself stays visible.
+_HEADER_FLAGS = frozenset({"-H", "--header", "--headers", "--http-header"})
+# Auth schemes that precede the credential proper ("Bearer <token>").
+_AUTH_SCHEMES = ("bearer", "basic", "token", "digest")
+_REDACTED = "<redacted>"
+
+
+def _is_secret_token(token: str) -> bool:
+    lowered = token.lower()
+    if any(word in lowered for word in _SECRETISH):
+        return True
+    # A JWT (base64url JSON header) needs no keyword to be a credential.
+    return token.strip("\"'").startswith("eyJ") and len(token) >= 16
+
+
+def _opens_secret_value(token: str) -> bool:
+    """Does a redacted ``token`` introduce a value that must also go?
+
+    ``--api-key`` (bare flag), ``Authorization:`` / ``X-Api-Key=`` (a name
+    awaiting its value) and ``Bearer`` (a scheme awaiting its credential).
+    """
+    if token.startswith("-") and "=" not in token:
+        return True
+    lowered = token.lower().strip("\"'")
+    return lowered.endswith((":", "=")) or lowered.endswith(_AUTH_SCHEMES)
+
+
+def _argv_tokens(argv: list[str]) -> list[str]:
+    """Whitespace-split every argv element.
+
+    #800: some processes (setproctitle-style MCP servers) carry their whole
+    command line in ``argv[0]``, and a single element can hold a full
+    header line (``"Authorization: Bearer …"``). Splitting first means the
+    executable is just the first word — not ``basename()`` of the title,
+    which a later ``/`` in the arguments would cut mid-string — and every
+    word goes through the redaction scan.
+    """
+    tokens: list[str] = []
+    for arg in argv:
+        tokens.extend(arg.split())
+    return tokens
+
+
+def describe_process(pid: int, *, max_args: int = 5, max_len: int = 80) -> str | None:
+    """A short, redacted one-line command description for diagnostics.
+
+    #791: child processes of a wedged Claude CLI are usually MCP servers
+    whose argv can carry credentials (``--header Authorization:Bearer …``,
+    ``--api-key …``). Keeps the executable basename plus the first
+    ``max_args`` arguments and replaces any argument that looks
+    secret-bearing — and the value a secret-looking flag, header name or
+    auth scheme introduces — with ``<redacted>`` (a contiguous run collapses
+    to one marker). #800: ``argv[0]`` is scanned too, elements are split on
+    whitespace first, and redaction is decided on the whole token *before*
+    truncating to ``max_len``, so no prefix of a secret survives the cut.
+    Returns None when the cmdline is unreadable.
+    """
+    argv = read_cmdline_argv(pid)
+    if not argv:
+        return None
+    tokens = _argv_tokens(argv)
+    if not tokens:
+        return None
+
+    def _shown(token: str) -> str:
+        return token if len(token) <= max_len else token[: max_len - 1] + "…"
+
+    exe = os.path.basename(tokens[0]) or tokens[0]
+    out: list[str] = []
+    redact_next = False
+    if _is_secret_token(tokens[0]):
+        out.append(_REDACTED)
+        redact_next = _opens_secret_value(tokens[0])
+    else:
+        out.append(_shown(exe))
+    rest = tokens[1:]
+    for token in rest[:max_args]:
+        if redact_next or _is_secret_token(token):
+            if out[-1] != _REDACTED:
+                out.append(_REDACTED)
+            redact_next = _opens_secret_value(token)
+            continue
+        out.append(_shown(token))
+        redact_next = token in _HEADER_FLAGS
+    if len(rest) > max_args:
+        out.append(f"(+{len(rest) - max_args} args)")
+    return " ".join(out)
+
+
 def _find_children(pid: int) -> list[int]:
     """Find child PIDs via /proc/pid/task/*/children."""
     children: list[int] = []

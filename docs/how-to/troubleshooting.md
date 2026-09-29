@@ -215,6 +215,20 @@ The stall watchdog monitors engine subprocesses for periods of inactivity (no JS
 
 **Tuning:** All thresholds are configurable via `[watchdog]` in `untether.toml`. Use `tool_timeout` to increase the initial threshold for local tools (default 10 min), and `mcp_tool_timeout` for MCP tools (default 15 min). See the [config reference](../reference/config.md#watchdog).
 
+**Expected waits don't warn.** A Claude rate-limit rejection, an API retry back-off and a live session waiting between turns for background work are all silent by design, so no stall warning fires for them (see the next section, and *Messages arrive after the run finished* below). A live session's idle hold is reported separately as `peak_live_idle_seconds` in the `session.summary` log line, not as `peak_idle_seconds` ([#787](https://github.com/littlebearapps/untether/issues/787)).
+
+## Rate-limit and API-retry notes (Claude)
+
+**Symptoms:** The progress message shows one of these lines:
+
+| Note | Meaning |
+|---|---|
+| `⚠️ 5h limit 85% used — resets 17:30` | Heads-up only. Your subscription window is nearly used up; the run keeps going. Shown at most once per window ([#790](https://github.com/littlebearapps/untether/issues/790)). |
+| `⏳ Rate limited until 17:30 (~30 min)` | Claude Code reported the limit as reached and extra usage isn't covering it. Untether treats the wait as expected until the reset time, so no stall warning fires. |
+| `🔁 API error 529 (overloaded) — retrying in 8s (attempt 2/10)` | Anthropic's API returned a retryable error and Claude Code is backing off before retrying. The line updates in place for each attempt ([#792](https://github.com/littlebearapps/untether/issues/792)). |
+
+Before v0.35.5 Untether misread Claude Code's routine usage snapshots and showed a brief `Rate limited` note every few minutes on healthy sessions. That no longer happens: routine snapshots are recorded but not shown.
+
 ## Claude Code hangs after an MCP tool_result
 
 **Symptoms:** Claude Code goes silent immediately after an MCP tool returns — the `tool_result` arrives in the JSONL stream but the assistant never responds. Ring buffer fills with `user`/`tool_result` events and stays there. Often hits Cloudflare's remote MCP servers via `mcp-remote`.
@@ -274,6 +288,9 @@ Type-B (cold-start zero-byte) is **never** retried — retrying just hammers a d
 
 **Symptoms:** Claude has clearly finished the turn (you can see the final answer in Telegram), but the session metadata indicates it's still running. The bidirectional Claude CLI is sitting idle holding stdin open.
 
+!!! note "v0.35.5 and later"
+    With live sessions on (the default), a session that stays open after its answer is usually doing background work, and it closes itself about a minute after that work ends. See [Messages arrive after the run finished](#messages-arrive-after-the-run-finished). The post-result watchdog settings below apply when `[watchdog] live_sessions = false`.
+
 The post-result idle watchdog ([#333](https://github.com/littlebearapps/untether/issues/333)) closes the gap: every successful `result` event arms `[watchdog] post_result_idle_timeout` (default 600s / 10 min, range 30s–1h). Once the deadline passes the runner closes stdin and the CLI exits cleanly (rc=0). The footer also shows a `✓ turn complete` marker on every successful turn so you have an immediate visual confirmation that the turn has ended even if the process is still alive briefly.
 
 **To disable the timer entirely** (Claude CLI handles its own exit):
@@ -290,7 +307,7 @@ post_result_idle_enabled = false
 post_result_idle_timeout = 60   # 1 minute
 ```
 
-If a button-click `control_response` is mid-flight when the deadline arrives, the timer re-arms instead of closing — preventing orphaned approvals. Look for `claude.post_result_idle.deferred` and `claude.post_result_idle.closing_stdin` in the logs to confirm the watchdog's behaviour.
+If a button-click `control_response` is mid-flight when the deadline arrives, the timer re-arms instead of closing — preventing orphaned approvals. Look for `claude.post_result_idle.armed`, `claude.post_result_idle.deferred` and `claude.post_result_idle.closing_stdin` in the logs to confirm the watchdog's behaviour. The every-30-s `claude.post_result_idle.tick` heartbeat is INFO only while the timer is armed or an approval is pending; otherwise it is DEBUG (start with `untether --debug` to see it).
 
 When the watchdog actually closes stdin, Untether also sends one (and only one) Telegram closing message: `✓ turn complete · session closed after Nm idle`. While the watchdog is running, stall warnings are suppressed (`progress_edits.stall_post_result_suppressed`) so you don't get noise during the legitimate idle window — genuinely-frozen post-result sessions still warn via the frozen-ring escalation.
 
@@ -408,13 +425,23 @@ Run `untether doctor` to validate voice configuration.
 
 - **Chat mode** (`session_mode = "chat"`): Just send another message — it auto-resumes. Use `/new` to start fresh.
 - **Stateless mode** (`session_mode = "stateless"`): You must **reply** to a message that contains a resume token. Plain messages start new sessions.
-- If resume fails silently, the previous session may be **poisoned** by an upstream turn-state bug (a resume that returns 0 turns / an empty answer). Untether detects this, quarantines that session so it is never resumed again, and automatically re-sends your message on a **fresh** session — you'll see a short notice that it did so ([#631](https://github.com/littlebearapps/untether/issues/631), [#632](https://github.com/littlebearapps/untether/issues/632)). A session force-killed after delivering its result is quarantined proactively, so your *next* message diverts fresh before any empty result appears.
+- If resume fails silently, the previous session may be **poisoned** by an upstream turn-state bug (a resume that returns 0 turns / an empty answer). Untether detects this, quarantines that session so it is never resumed again, and automatically re-sends your message on a **fresh** session — you'll see a short notice that it did so ([#631](https://github.com/littlebearapps/untether/issues/631), [#632](https://github.com/littlebearapps/untether/issues/632)). A session force-killed after delivering its result is quarantined proactively, so your *next* message diverts fresh before any empty result appears. Since v0.35.5 sessions normally close gracefully, so this fresh-session divert is rare, and an idle session that is merely slow to exit is no longer quarantined ([#791](https://github.com/littlebearapps/untether/issues/791)).
 
 ## Follow-up message says it's "queued"
 
-**Symptoms:** You send a follow-up (or voice note) and it sits on a `queued` notice for a while instead of running immediately.
+**Symptoms:** You send a follow-up (or voice note) and it shows a `queued` notice instead of running immediately.
 
-This is expected when the previous Claude turn is still doing background work (subagents, a `Monitor`, background Bash) after delivering its answer. Since v0.35.4 the notice tells you why — the live background-task count, that your context will carry over, and a `/cancel` hint if you'd rather interrupt ([#654](https://github.com/littlebearapps/untether/issues/654)). The message runs automatically once the prior work finishes; it is not a hang. If the wait is genuinely stuck, `/cancel` and resend.
+A follow-up waits for the current Claude turn to finish; it isn't mixed into a turn that's still running. Since v0.35.5, if the session is still open (for example, background tasks are running after the reply), the message goes into **that same session** as soon as the turn ends, usually within seconds, even while the background tasks keep going ([#776](https://github.com/littlebearapps/untether/issues/776), [#647](https://github.com/littlebearapps/untether/issues/647)). The notice reads `⏳ Queued — sent as soon as Claude's current turn ends (background tasks keep running).` ([#781](https://github.com/littlebearapps/untether/issues/781)). With `[watchdog] live_sessions = false` the follow-up really does wait for the background work, and the notice says `⏳ Queued behind the previous run's N background task(s) — starts when they finish …` instead. If you see `⚠️ The session ended before this message ran — please send it again`, the session closed before your message started; resend it. If a queue is genuinely stuck, `/cancel` and resend.
+
+## Messages arrive after the run finished (🔔 / 📡 / ⏰)
+
+**Symptoms:** After Claude's answer, more messages appear on their own: `🔔 Background task finished — …`, `📡 Monitor — …`, or `⏰ Scheduled wake-up`.
+
+This is expected since v0.35.5. When Claude starts a background task, a subagent, a `Monitor` or a `ScheduleWakeup` and ends its turn, Untether keeps the session open. Claude then carries on by itself when the work finishes, and each of those turns is delivered as its own message. Before v0.35.5 these turns ran with nothing shown in Telegram. Monitor updates arrive silently (no notification); the others notify, once per finished task ([#785](https://github.com/littlebearapps/untether/issues/785)). Approval buttons work inside these turns as normal ([#776](https://github.com/littlebearapps/untether/issues/776)).
+
+The session stays open while background work is live, up to 30 minutes after the last turn (`[watchdog] post_result_bg_max_hold`) and 4 hours in total (`live_session_max_s`). With no background work it closes about a minute after the reply. When it closes over running tasks you get a notice naming them, such as `⏳ Closing session — 1 background task still running at the background hold limit: … Stopping it; reply to continue.` Replying resumes the same conversation. `/cancel`, changing settings (`/planmode`, model) and Untether restarts close the session the same way, with a notice.
+
+To turn this off and get the pre-v0.35.5 behaviour back (stop at the first answer), set `live_sessions = false` under `[watchdog]`.
 
 ## Claude Code plugin interference
 
@@ -563,7 +590,7 @@ Look for `handle.worker_failed`, `handle.runner_failed`, or `config.read.toml_er
 
 All logs include `session_id` once a session starts, enabling per-session filtering with `grep` or `jq`.
 
-Telegram bot tokens, OpenAI API keys (`sk-...`), and GitHub tokens (`ghp_`, `ghs_`, `github_pat_`) are automatically redacted in all log output.
+Telegram bot tokens, OpenAI API keys (`sk-...`), GitHub tokens (`ghp_`, `ghs_`, `github_pat_`), `Authorization:`/`Bearer` credentials, JWTs, and `api_key=`/`token=`/`secret=`/`password=` values are automatically redacted in all log output. Token *counts* such as `total_tokens=52000` are left alone.
 
 ## Error hints
 

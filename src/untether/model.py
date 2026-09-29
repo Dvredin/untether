@@ -23,7 +23,22 @@ type UntetherEventType = Literal[
     "started",
     "action",
     "completed",
+    "turn",
 ]
+
+type TurnPhase = Literal["started", "completed"]
+type TurnReason = Literal[
+    "task_finished",
+    "scheduled_wakeup",
+    "monitor_event",
+    "followup",
+    "unknown",
+]
+
+# #333: footer marker (``meta["complete"]``) for a finished turn — the session
+# is idle and waiting for the next prompt. The Claude runner adds it on the
+# run's first result; the bridge adds it on each live follow-up turn (#798).
+TURN_COMPLETE_MARKER = "\N{CHECK MARK} turn complete"
 
 type ActionPhase = Literal["started", "updated", "completed"]
 type ActionLevel = Literal["debug", "info", "warning", "error"]
@@ -75,4 +90,30 @@ class CompletedEvent:
     usage: dict[str, Any] | None = None
 
 
-type UntetherEvent = StartedEvent | ActionEvent | CompletedEvent
+@dataclass(frozen=True, slots=True)
+class TurnEvent:
+    """Boundary of a follow-up turn after a run's ``CompletedEvent`` (#776).
+
+    Only runners that keep their process live after the first result emit
+    these (Claude in control-channel mode). A run is still exactly one
+    ``Started → Action* → Completed``; each later turn in the same process
+    is a ``TurnEvent(started) → Action* → TurnEvent(completed)`` segment.
+    ``usage`` on the completed boundary is the raw result payload (session-
+    cumulative cost — consumers derive deltas).
+    """
+
+    type: Literal["turn"] = field(default="turn", init=False)
+    engine: EngineId
+    phase: TurnPhase
+    turn: int
+    reason: TurnReason = "unknown"
+    resume: ResumeToken | None = None
+    ok: bool | None = None
+    answer: str | None = None
+    error: str | None = None
+    usage: dict[str, Any] | None = None
+    command_uuid: str | None = None
+    detail: dict[str, Any] = field(default_factory=dict)
+
+
+type UntetherEvent = StartedEvent | ActionEvent | CompletedEvent | TurnEvent

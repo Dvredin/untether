@@ -147,6 +147,7 @@ Tests specific to how Untether uses Telegram — message formatting, media, inpu
 | T8 | **Stale button click** | Wait for a session to complete + clean up, then click an old Approve button | Toast "Expired" or similar, no crash, no spinner hang | Stale callback_data, cleaned-up session registry |
 | T9 | **Directive routing** | `/codex list the files here` (in Claude chat) | Codex runs instead of Claude, correct project context | Directive parsing, engine override |
 | T10 | **Branch directive** | `/claude @develop create hello.txt` | Run uses `develop` branch, not default | Branch directive, context resolution |
+| T11 | **Markdown table** ([#797](https://github.com/littlebearapps/untether/issues/797)) | `Reply with a 3-row, 3-column markdown table comparing tea, coffee and water (columns: drink, caffeine, notes), with inline code in one cell, then one sentence after it` | Each row on its own line; header row bold; no `|---|` separator line; inline code still renders as code; the sentence after the table is on its own line | commonmark has no table rule — rows used to collapse into one run-on line of pipes |
 
 ### Tier 4: Configuration and Overrides
 
@@ -188,9 +189,11 @@ Harder to trigger but catches the most production bugs.
 | S4 | **Verbose mode** | `/verbose` on, then send a prompt | Progress shows tool details (file paths, commands, patterns) | Verbose rendering |
 | S5 | **Config persistence** | Toggle settings via `/config`, restart dev bot, verify settings stick | Settings survive restart | State file persistence |
 | S6 | **Empty/whitespace prompt** | Send just spaces or an empty forward | Bot handles gracefully, no crash | Input validation |
-| S7 | **Rapid-fire prompts** | Send 5 messages in quick succession to same chat | Only one run starts (or queues), no double-spawn, no crash | Race condition, session locking |
+| S7 | **Rapid-fire prompts** | Send 5 short numbered messages (`rapid 1` … `rapid 5`) in quick succession to the same chat | No text is lost: every message is either merged into a run's prompt (all merged texts reach the agent, in order) or answered/queued on its own. No double-spawn, no crash. Ask the agent to echo the numbers it received, and check `forward.prompt.merged` (`merged_count`) / `forward.prompt.flushed` in the logs | Race condition, session locking, forward-coalesce merge ([#794](https://github.com/littlebearapps/untether/issues/794)) |
 | S8 | **Very long prompt** | Paste 4000+ characters as a single message | Prompt reaches engine intact, no truncation | Telegram message limits, prompt forwarding |
 | S9 | **Concurrent button clicks** | Two rapid clicks on the same Approve button | Only one approval processed, second gets toast, no double-execute | Callback deduplication |
+
+> **S7 and [#794](https://github.com/littlebearapps/untether/issues/794) (fixed in 0.35.5rc13):** prompts sent inside the `forward_coalesce_s` window (default 1 s) are now **merged** into one run instead of replacing each other. Messages sent further apart than the window run (or queue) separately, so a 5-message burst may produce one run or a few — either is fine. The pass bar is **no lost text**: for each of the 5 messages, confirm its number reached the agent (in a merged prompt, its own run, or a visible queue note). A message whose text appears in no run is a **FAIL**. `journalctl --user -u untether-dev -o cat | grep -E "forward.prompt.(merged|flushed)"` shows each merge (`merged_count`, `merged_message_ids`) and each early flush (`reason`).
 
 ### Tier 7: Command Smoke Tests (quick, any engine)
 
@@ -254,9 +257,66 @@ lifecycle and the control channel (`.claude/rules/control-channel.md`).
 | 4 | **Negative control** — in a fresh exchange with no background agent involved, send a plain two-message conversation, e.g. `what's 2+2?` then reply to the resume line with `and 3+3?` | Both messages resume the SAME session id — a healthy resume must not trigger spurious quarantine or fresh-session diversion |
 | 5 | **Log verification**: `journalctl --user -u untether-dev --since "10 minutes ago" \| grep -E "runner.empty_result\|session.auto_resend_fresh\|session.quarantined\|session.resume_diverted_fresh"` | If steps 1-3 hit the dangling/empty-resume path, every `runner.empty_result` line is followed by `session.auto_resend_fresh` (or the session already carries `session.quarantined` + `session.resume_diverted_fresh` from a prior hit) — never a bare `runner.empty_result` with no recovery event after it |
 
+> **0.35.5rc11 (#776):** with live sessions a follow-up to a lingering session is normally *injected into it* (same session id, no resume), so steps 1–3 now expect the SAME session id and a real answer, with `claude.live_session.injected` in the log and no `runner.empty_result`. The quarantine/fresh path is only expected with `[watchdog] live_sessions = false`. The B-LIVE scenarios below cover the new behaviour directly.
+
+### B-LIVE: live-session scenarios (0.35.5rc11+, #776)
+
+Run in the Claude chat (`5284581592`). Prompts that background work should say *"end your turn immediately"* so the result lands before the work finishes. Log checks: `journalctl --user -u untether-dev -o cat | grep -E "claude.task|claude.turn|live_turn|live_session|resume_guard|cost.turn_delta"`.
+
+| # | Scenario | Prompt shape | Pass criteria |
+|---|---|---|---|
+| B-LIVE-1 | Background Bash wake | start `sleep 40 && echo X` with `run_in_background`, end turn; reply "GOT: <output>" when notified | turn-1 final at result time; a **new** message `🔔 Background task finished — <desc>` with the output ~40 s later; `claude.turn.started reason=task_finished`; `cost.turn_delta` for both |
+| B-LIVE-2 | Background Agent wake + follow-up while it runs | launch one background subagent (`sleep 45`, report), end turn; while it works send a quick question | the question is answered **immediately** under its own message (`claude.live_session.injected`); the agent's result arrives later with the 🔔 header (not "Claude continued") |
+| B-LIVE-3 | Follow-up into a live session | start a 50 s background task, end turn; send a follow-up | exactly **one** `subprocess.spawn` for the exchange; follow-up answered within seconds; wake delivered afterwards; no `session.resume_diverted_fresh` / `auto_resend_fresh` |
+| B-LIVE-4 | Restart with a live task | start a 600 s background task, end turn; `systemctl --user restart untether-dev` | restart completes in seconds (not the 120 s drain); `shutdown.live_sessions_closed count=1`; notice `⏳ Untether is restarting — stopping 1 background task: …`; rc=0, nothing quarantined |
+| B-LIVE-5 | Monitor ticks | Monitor a 3-tick loop (10 s apart), end turn; reply "TICK n" per tick | one silent `📡 Monitor — <desc>` message per tick; the stream end arrives as a 🔔 wake |
+| B-LIVE-6 | `/cancel` idle session, then resume | start a 600 s background task, end turn; `/cancel`; then ask a question | `⏹ Stopped 1 background task: …`; `claude.live_session.stdin_closed reason=cancel`; the question resumes the same session and gets a real answer; `claude.resume_guard.absorbed`; no `runner.empty_result` |
+| B-LIVE-7 | Approval inside a wake turn (plan mode) | start a 20 s background task, end turn; "when it finishes, create /tmp/x via ExitPlanMode" | the ExitPlanMode keyboard renders on the **wake turn's** progress message; Approve → file written; wake final delivered |
+
 **Required tiers:** rc7 → Tier 7 (command smoke) + Tier 1 (Claude only) + B-RESUME. rc8 → add Tier 1 (all 6 engines, confirm no cross-engine regression from the quarantine store) + Tier 2 (interactive/plan).
 
 Automate via Telegram MCP (`send_message`, `get_history`) + Bash (`journalctl --user -u untether-dev`) exactly as the other tiers. See `scripts/audit-noop-resume.sh` for the post-deploy fleet-wide correlation check (Layer 4 of the remediation plan) that runs the same five-event correlation across all hosts after rollout.
+
+---
+
+## rc12 scenarios (0.35.5rc12)
+
+Run these in addition to the standard tiers and B-LIVE for rc12. Unless noted, use the Claude chat (`5284581592`). Log checks: `journalctl --user -u untether-dev -o cat --since "30 minutes ago" | grep -E "<pattern>"`.
+
+| # | Scenario | What to do | Pass criteria |
+|---|---|---|---|
+| RC12-1 | **Per-run stream binding ([#510](https://github.com/littlebearapps/untether/issues/510))** | Start a long Claude run in the Claude chat (e.g. `run sleep 90 in the foreground, then say DONE`). While it runs, send a short Claude prompt in a second chat (the Codex chat with a `/claude` directive, see T9). | Two `session.summary` lines with **different** `session_id`s; the short run's `event_count` / `duration_seconds` are its own (small), and the long run's summary, written after the short one finished, shows its own `event_count` and `last_event_type=result` — never the short run's values. The long run shows no stall warning or wake-up countdown borrowed from the other chat. |
+| RC12-2 | **No false rate-limit notes ([#790](https://github.com/littlebearapps/untether/issues/790))** | Run U1-U4 and B-LIVE-1 in the Claude chat; also `uv run pytest tests/test_claude_cli_schema_drift.py` against the installed CLI. | No `⏳ Rate limited` note on healthy runs; no `claude.rate_limit_event` line with `retry_after_source=bare` or `default` unless a real `rejected` snapshot arrived. A `⚠️ 5h limit N% used — resets HH:MM` note appears at most once per window, and only if utilisation is ≥ 70%. Drift test passes (or skips when the CLI is absent). |
+| RC12-3 | **API-retry note ([#792](https://github.com/littlebearapps/untether/issues/792))** | Opportunistic: only if a `claude.api_retry` line appears during the session (Anthropic 429/529/5xx). | The progress message shows one `🔁 API error <status> (<category>) — retrying in Ns (attempt n/m)` line that updates in place; no stall WARN during the back-off (`threshold_reason=api_retry_waiting`); `claude.api_retry` is INFO, WARN only on the final attempt. If no retry occurs, mark *not exercised*, not fail. |
+| RC12-4 | **Live-idle hold is not a stall ([#787](https://github.com/littlebearapps/untether/issues/787))** | Start `sleep 300` with `run_in_background`, end the turn; wait for the 🔔 wake. | No `progress_edits.stall_detected` and no stall message during the hold; one `progress_edits.stall_live_idle_suppressed` INFO; the run's `session.summary` has `stall_warnings=0`, `peak_live_idle_seconds` close to the hold, and a small `peak_idle_seconds`. |
+| RC12-5 | **Close-grace overrun, no quarantine ([#791](https://github.com/littlebearapps/untether/issues/791))** | Passive: after any idle close, check `close_grace_expired`. Forced repro (optional): after a plain reply with no background work, find the Claude PID and `kill -STOP <pid>` so it can't honour stdin EOF; wait ~80 s (60 s idle + 15 s grace + 5 s); then send a follow-up. | Any `claude.live_session.close_grace_expired` WARN carries a proc snapshot (state, wchan, CPU, children) and `idle_clean=true` for an idle close; it is followed by SIGINT, then `claude.live_session.forced_teardown ... quarantined=false`. No `session.quarantined reason=forced_teardown_after_result` for that session; the follow-up resumes the **same** session id with no `session.resume_diverted_fresh`. A close over a live task (not idle) is still quarantined. |
+| RC12-6 | **Wake-turn attribution, one push per finish ([#785](https://github.com/littlebearapps/untether/issues/785))** | Launch one background subagent that runs 2-3 tool calls and reports, end the turn. | Exactly **one** notifying `🔔 Background task finished — <task description>` message per finish (not `🔔 Claude continued`, and not a subagent's inner task name); any second turn for the same task arrives silently. Logs may show `claude.turn.retro_attributed`, `claude.turn.task_end_paired`, `live_turn.retro_attributed` or `claude.turn.notification_ignored`. |
+| RC12-7 | **Queued note under a live session ([#781](https://github.com/littlebearapps/untether/issues/781))** | Start a 60 s background task, end the turn; immediately send a follow-up. | The follow-up shows `⏳ Queued — sent as soon as Claude's current turn ends (background tasks keep running).` (no `/cancel to drop it`) and is answered within seconds in the same session. With `live_sessions = false` the old `⏳ Queued behind the previous run's N background task(s) …` wording returns. |
+| RC12-8 | **`<br>` rendering ([#786](https://github.com/littlebearapps/untether/issues/786))** | `Reply with exactly: first line<br>second line, then a two-row markdown table with a <br> inside one cell, then the literal text <br> inside backticks` | The first `<br>` renders as a line break; the table cell shows a space, not `<br>`; the backticked `<br>` stays literal code; no other HTML tag is interpreted. |
+| RC12-9 | **Filenames not auto-linked ([#788](https://github.com/littlebearapps/untether/issues/788))** | `Mention CLAUDE.md, scripts/healthcheck.sh:12, src/untether/runner.py and https://example.com/notes.md in plain text, no code formatting` | The three filenames render as inline code, not links (no `claude.md` domain link); the `https://` URL stays a clickable link. |
+| RC12-10 | **Voice vocabulary ([#789](https://github.com/littlebearapps/untether/issues/789))** | `send_voice` a clip saying *"open CLAUDE dot MD and AGENTS dot MD and summarise them"* with no `voice_transcription_prompt` set in the dev config. | Transcript contains `CLAUDE.md` and `AGENTS.md` (not "Claw.md"); both render as inline code in the echoed transcript. Effect is model-dependent, so a near-miss is a soft fail: note it and don't block the release. |
+
+**Required for rc12:** Tier 7 + Tier 1 (all 4 supported engines, because #510 changed the base `run_impl` spawn order) + B-LIVE-1…7 + RC12-1…9, RC12-10 if a voice clip is available.
+
+---
+
+## rc13 scenarios (0.35.5rc13)
+
+Claude chat (`5284581592`) unless noted. Background prompts should use `python3 -c "import time; time.sleep(N)"` rather than a bare `sleep N`: the CLI blocks long foreground `sleep` calls inside subagents. Log checks: `journalctl --user -u untether-dev -o cat --since "30 minutes ago" | grep -E "<pattern>"`.
+
+| # | Scenario | What to do | Pass criteria |
+|---|---|---|---|
+| RC13-1 | **Background status ([#777](https://github.com/littlebearapps/untether/issues/777))** | `/planmode auto`; launch a background Agent (40 s Python sleep) plus two background Bash jobs (25 s, 75 s), reply "launched", end the turn; send `/ping` while they run | The progress message shows `⏳ background (N)` rows; after the answer, one **silent** status message replies to the prompt and is edited in place (`🤖 … · tok · tools`, `🐚 … · elapsed`); `/ping` shows `⏳ background: 3 tasks running`; the message finalises to `✅ all 3 background tasks done`. Logs: `background_status.opened` / `.finalised` |
+| RC13-2 | **Wake-ack consolidation ([#785](https://github.com/littlebearapps/untether/issues/785))** | Same as RC13-1, asking for one short sentence per finish and a summary at the end | Short acks appear as `↳` lines in the status message (`live_turn.fold_decision decision=fold`); only the final summary arrives as a new **pushed** 🔔 message; no `🔔 Claude continued` no-op push after it |
+| RC13-3 | **Wake reply anchor ([#795](https://github.com/littlebearapps/untether/issues/795))** | Launch background work from a follow-up that was injected into a live session | The 🔔 message and the status message reply to the follow-up that launched the task, not to the run's first prompt |
+| RC13-4 | **Resumed / orphaned agent ([#801](https://github.com/littlebearapps/untether/issues/801))** | Background Agent prints `first`; on notify, SendMessage it back to run a 60 s Python sleep with `run_in_background=true`; reply with the output | `claude.task.revived`; the orphaned bash (`owned_by_subagent=True`) is listed in the status message and ends `status=completed` (never `killed`); `stdin_closed reason=idle_no_tasks` only after it; the output reaches the chat |
+| RC13-5 | **Steer ([#775](https://github.com/littlebearapps/untether/issues/775))** | (a) run a 40 s foreground Python sleep, then `/steer also tell me the hostname`; (b) `/config` → ↪️ Follow-up → Steer, run `echo hi` + a 400-word story, send a plain message while the story streams; (c) with steer on, `/cancel` a run then send a question; (d) Codex chat: `/steer hi`; then `/queue` to reset | (a) `↪️ Steered into the current run.`, a `↪️ steer received` progress row, one final answering both (`claude.live_session.injected_absorbed`); (b) toast `Follow-up: steer`, the plain message runs as its own turn replying to it; (c) `steer_window_closed reason=cancel` then `↪️ No live Claude run to steer — queued instead.` and a normal resumed answer; (d) `↪️ Steer isn't supported on codex — queued instead.`; an idle live session gets no steer ack |
+| RC13-6 | **Plan label ([#793](https://github.com/littlebearapps/untether/issues/793))** | `/planmode on`: plan A, tap ❌ Deny; in the same session plan B, tap ✅ Approve | The deny final has no `📋 Plan (approved):`; the approve final shows **plan B**; any `claude.plan.stale_input` line shows the file won |
+| RC13-7 | **Turn complete + footer ([#798](https://github.com/littlebearapps/untether/issues/798), [#770](https://github.com/littlebearapps/untether/issues/770))** | Reply to a short prompt, then send a follow-up within 60 s; run U3 | The injected follow-up final ends `· ✓ turn complete`; on U3 only the last chunk has `💰`/`⚡`/`🏷`/`↩️` |
+| RC13-8 | **Rapid prompts + tables ([#794](https://github.com/littlebearapps/untether/issues/794), [#797](https://github.com/littlebearapps/untether/issues/797))** | Send `rapid 1`, `rapid 2`, `rapid 3 — reply with the numbers` back to back; then `ALPHA` + `/codex … BETA` back to back; ask for a 3-row markdown table | One run answering 1, 2, 3 (`forward.prompt.merged merged_count=3`); ALPHA and BETA answered separately (`forward.prompt.flushed reason=directive`); every table row on its own line |
+| RC13-9 | **Logs ([#799](https://github.com/littlebearapps/untether/issues/799), [#800](https://github.com/littlebearapps/untether/issues/800))** | After the above, count `claude.post_result_idle.tick` lines; grep for `Bearer [^[<]` and `eyJ[A-Za-z0-9_-]{10}` | Ticks appear only while an approval or question is pending; no credential shapes in the journal |
+
+**Required for rc13:** Tier 7 + Tier 1 (all 4 supported engines) + Tier 2 (C1, C2, plan approve/deny) + B-LIVE + RC13-1…9.
 
 ---
 
@@ -375,15 +435,18 @@ Integration tests are run by Claude Code via Telegram MCP tools (see "Automated 
 | Changed area | Must-run tests |
 |---|---|
 | Runner code (`runners/*.py`) | U1-U4 (all engines), U6, U7 |
+| Per-run stream binding (`runner.py` `RunStreamHandle` / `publish_run_stream`, `runner_bridge.py` stall monitor) | RC12-1, S1, S2, U1-U4 (all engines), B-LIVE-1 |
+| Claude stream schema / rate-limit / API-retry handling (`schemas/claude.py`, `runners/claude.py`) | `uv run pytest tests/test_claude_cli_schema_drift.py`, RC12-2, RC12-3, S1 |
 | Runner bridge / auto-continue / no-op resume recovery (`runner_bridge.py`, `runners/claude.py`) | B-RESUME, U1-U4 (Claude), U6, U7 |
+| Live sessions / follow-up injection / scheduler (`runners/claude.py`, `runner_bridge.py`, `live_followup.py`, `scheduler.py`) | B-LIVE-1…7, RC12-4…7, C1-C6, S7, U1-U4 (Claude) |
 | Telegram transport (`telegram/*.py`) | T1-T10, S7, S8 |
 | Control channel (`claude_control.py`) | C1-C6, T8, S9 |
 | Config/settings (`settings.py`) | O1-O9, S5, upgrade path |
 | Cost tracking (`cost_tracker.py`) | B1-B3, U8 |
-| Progress/formatting (`markdown.py`) | U3, T6, T7, S4, S8 |
+| Progress/formatting (`markdown.py`, `telegram/render.py`) | U3, T6, T7, S4, S8, RC12-8, RC12-9 |
 | Commands (`commands/*.py`) | Tier 7 (all), specific command test |
 | File transfer (`file_transfer.py`) | T2, T3, T5 |
-| Voice (`voice.py`) | T1 |
+| Voice (`voice.py`) | T1, RC12-10 |
 | Topics (`topics.py`, `topic_state.py`) | O1, O5, O6, O8 |
 | Directives (`directives.py`) | T9, T10 |
 | Shutdown (`shutdown.py`) | S3, B4 |

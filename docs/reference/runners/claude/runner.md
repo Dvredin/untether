@@ -57,8 +57,9 @@ Key control channel features:
 * Session registries (`_SESSION_STDIN`, `_REQUEST_TO_SESSION`) for concurrent session support
 * Auto-approve for routine tools (Grep, Glob, Read, Bash, etc.)
 * `ExitPlanMode` requests shown as Telegram inline buttons (Approve / Deny / Pause & Outline Plan) in `plan` mode; post-outline buttons add **Let's discuss** for plan discussion before approval
-* `ExitPlanMode` requests silently auto-approved in `auto` mode (no buttons shown)
+* `ExitPlanMode` requests silently auto-approved in `plan-auto` mode (no buttons shown)
 * Text-based outline gate on ExitPlanMode after "Pause & Outline Plan" — retries without written outline text are auto-denied; the former time-based progressive cooldown was retired in [#570](https://github.com/littlebearapps/untether/issues/570) (upstream retry loop fixed in Claude Code ≥ 2.1.215)
+* `📋 Plan (approved)` re-emit (#508): each `ExitPlanMode` control request is recorded per `request_id` (`ClaudeStreamState.exitplanmode_plans`) and settled only by a decision on that request. Its body becomes `last_exitplanmode_plan`, the prepend source, only when the request is approved: by Telegram Approve (`write_control_response`), by the `plan-auto` stamp, or by the post-outline `_DISCUSS_APPROVED` auto-approve. It is dropped on any denial or timeout. **The plan file is the source of truth, not `input.plan`.** On plan-file CLIs (seen on 2.1.284) Claude issues the plan-file `Write` and `ExitPlanMode` in the same message, and the CLI reads `input.plan` before the Write lands, so the input carries the *previous* plan. Untether tracks the parent's `Write`/`Edit`/`MultiEdit` calls to `<config dir>/plans/*.md` (`~/.claude` or `$CLAUDE_CONFIG_DIR`; subagent writes are ignored) in `plan_file_path` / `plan_file_content`. At decision time the body is the last full `Write`'s content if there is one, otherwise the file read from disk (at most 256 KiB, and only if it still resolves to a plan file, so a symlink can't point it elsewhere), otherwise `input.plan` as a fallback for CLIs without plan files. When the input disagrees with the file, Untether logs `claude.plan.stale_input` (INFO: `decision`, `plan_source`, `input_chars`, `file_chars`) and uses the file. On the input-only fallback, bodies you explicitly deny (❌ Deny) are remembered for the process, and an approved input identical to one of them logs `claude.plan.stale_input reason=matches_rejected` and prepends nothing. Pause & Outline and Let's discuss denials pass `rejects_plan=False`: they are procedural, not a verdict on the plan ([#793](https://github.com/littlebearapps/untether/issues/793))
 
 **Safety note:** `-p/--print` skips the workspace trust dialog; only use this flag in trusted directories.
 
@@ -92,7 +93,7 @@ Recommended v1 schema:
 
     [claude]
     model = "claude-sonnet-4-5-20250929" # optional (Claude Code supports model override in settings too)
-    permission_mode = "auto"             # optional: "plan", "auto", or "acceptEdits"
+    permission_mode = "plan-auto"        # optional — see "Permission modes" below
     allowed_tools = ["Bash", "Read", "Edit", "Write"] # optional but strongly recommended for automation
     extra_args = ["--chrome"]           # optional: extra upstream CLI flags (e.g. --chrome opts into Claude-in-Chrome)
     dangerously_skip_permissions = false # optional (high risk; prefer sandbox use only)
@@ -105,9 +106,157 @@ Notes:
 * Claude Code tools (Bash/Edit/Write/WebSearch/etc.) and whether permission is required are documented. ([Claude Code][2])
 * If `allowed_tools` is omitted, Untether defaults to `["Bash", "Read", "Edit", "Write"]`.
 * Untether reads `model`, `permission_mode`, `allowed_tools`, `extra_args`, `dangerously_skip_permissions`, and `use_api_billing` from `[claude]`.
-* `permission_mode = "auto"` uses `--permission-mode plan` on the CLI but auto-approves ExitPlanMode requests without showing Telegram buttons. Can also be set per chat via `/planmode auto`.
+* `permission_mode` is validated at config load against the same allowlist crons use ([#742](https://github.com/littlebearapps/untether/issues/742)); an unknown value raises a `ConfigError` instead of failing at subprocess spawn. See "Permission modes" below.
 * `extra_args` lets you pass additional upstream `claude` CLI flags that Untether doesn't expose directly — for example `["--chrome"]` opts into the Claude-in-Chrome extension (otherwise gated off by Claude Code 2.1.x), or `["--strict-mcp-config"]` / `["--mcp-config", "path"]` for MCP tweaks. Flags Untether manages internally (`-p`, `--print`, `--output-format`, `--input-format`, `--resume`/`-r`, `--continue`/`-c`, `--permission-mode`, `--permission-prompt-tool`) are rejected at config-load with a `ConfigError`. Mirrors `codex.extra_args` and `pi.extra_args`.
 * By default Untether strips `ANTHROPIC_API_KEY` from the subprocess environment so Claude Code uses subscription billing. Set `use_api_billing = true` to keep the key.
+
+### Permission modes
+
+Derived from **Claude Code CLI 2.1.228** (verified on lba-1, 2026-08-12). The
+canonical set lives in `runners/run_options.py`
+(`CLAUDE_CLI_PERMISSION_MODES`); `tests/test_claude_permission_modes.py`
+re-derives it from the installed binary and fails on drift.
+
+| `permission_mode` | Flag sent to the CLI | Meaning |
+|---|---|---|
+| `default` | `--permission-mode default` | Reads only; everything else prompts |
+| `manual` | `--permission-mode manual` | Documented alias for `default` (CLI ≥ 2.1.200) |
+| `acceptEdits` | `--permission-mode acceptEdits` | Reads, in-scope file edits, common filesystem commands |
+| `plan` | `--permission-mode plan` | Research only; edits blocked until the plan is approved |
+| **`plan-auto`** | `--permission-mode plan` | **Untether-only sugar** — plan mode with `ExitPlanMode` auto-approved |
+| `auto` | `--permission-mode auto` | Claude Code's own classifier-gated auto mode |
+| `dontAsk` | `--permission-mode dontAsk` | Auto-denies anything that would prompt; only pre-approved tools run |
+| `bypassPermissions` | `--permission-mode bypassPermissions` | Skips all checks |
+
+`plan-auto` is the **only** value Untether translates. Every other value
+reaches the CLI verbatim.
+
+> **Renamed in 0.35.5rc8 ([#741](https://github.com/littlebearapps/untether/issues/741)).**
+> `plan-auto` was spelled `auto` until 0.35.5rc7, which shadowed the CLI's own
+> `auto` mode and made it unreachable. Stored chat prefs are rewritten once,
+> at first load, guarded by a `permission_mode_migrated` flag in
+> `telegram_chat_prefs_state.json` — it must be one-shot, because after the
+> rename `auto` is a value the user can legitimately *choose* from the UI, and
+> a per-read rewrite would make the new mode permanently unreachable. A TOML
+> `permission_mode = "auto"` is never rewritten: it now means the CLI's auto
+> mode and logs a one-shot `claude.permission_mode.auto_semantics_changed`
+> WARN.
+
+**Interaction with `--permission-prompt-tool stdio`.** Untether passes the
+prompt tool alongside *every* mode, and the two compose rather than conflict:
+
+* Modes that prompt (`default`, `manual`, `plan`) raise a `control_request`
+  for each gated tool, which becomes a Telegram approval.
+* Modes that don't prompt for routine work (`acceptEdits`, `auto`) raise no
+  `control_request` for the actions they auto-approve. `diff_preview` is
+  therefore inert in those modes — it has been inert under `acceptEdits`
+  since it shipped, and `auto` behaves the same way.
+* **`AskUserQuestion` still raises a `can_use_tool` control_request in `auto`
+  mode** (probed on 2.1.228 against Untether's exact argv), so ask-mode option
+  buttons keep working. This was the load-bearing question for
+  [#741](https://github.com/littlebearapps/untether/issues/741): adopting
+  upstream `auto` does not cost Untether its interactivity.
+* `ExitPlanMode` does not arise in `auto` — there is no plan gate — so the
+  outline gate and `_DISCUSS_APPROVED` machinery apply to `plan` / `plan-auto`
+  only.
+* When auto mode's classifier blocks an action 3 times consecutively or 20
+  times in total, Claude Code falls back to prompting; because Untether
+  supplies a prompt tool, that fallback surfaces as a normal Telegram
+  approval rather than a silently dropped action.
+
+Auto mode requires a supported model (Opus 4.6+/Sonnet 4.6+/Fable 5) and an
+organisation that has not set `permissions.disableAutoMode`. Where it is
+unavailable the CLI rejects `--permission-mode auto` at startup with rc=1 and
+a stderr message, which Untether surfaces through the normal fatal-error path.
+
+#### The six-stage permission pipeline, and where Untether sits ([#749](https://github.com/littlebearapps/untether/issues/749))
+
+A tool call passes through six stages inside Claude Code before it runs. Only
+two of them are Untether's:
+
+| Stage | Decided by | Untether's lever |
+|---|---|---|
+| 1 · hooks | `PreToolUse` hooks | — |
+| 2 · deny rules | `permissions.deny` in settings | — |
+| 3 · ask rules | `permissions.ask` in settings | — |
+| 4 · mode logic | `--permission-mode` (incl. auto's classifier) | chooses the mode |
+| **5 · allow rules** | `permissions.allow` + **`--allowedTools`** | **sends or omits the allowlist** |
+| **6 · prompt** | `--permission-prompt-tool stdio` → `can_use_tool` | **approves, denies, or routes to Telegram** |
+
+Reaching **stage 6 means every earlier stage declined to decide** — it is
+unresolved permission work by definition. Until 0.35.5rc9 Untether
+blanket-approved every stage-6 request except `ExitPlanMode` and
+`AskUserQuestion`, in *all* modes. Combined with `--allowedTools
+Bash,Read,Edit,Write` at stage 5, that made `default`, `manual` and
+`acceptEdits` behave indistinguishably from `bypassPermissions`.
+
+rc9 makes the stage-6 gate mode-derived (`is_claude_prompting_mode`, carried
+onto the run as `ClaudeStreamState.prompting_mode`):
+
+| Mode class | Modes | Stage 6 behaviour |
+|---|---|---|
+| **Prompting** | `default`, `manual`, `acceptEdits` | **Every** tool routes to a Telegram approval |
+| **Autonomous** | `plan`, `plan-auto`, `auto`, `dontAsk`, `bypassPermissions` | Only `ExitPlanMode` / `AskUserQuestion` route; the rest are approved |
+
+Autonomous modes keep the narrow set deliberately. `DEFAULT_ALLOWED_TOOLS`
+only covers `Bash`/`Read`/`Edit`/`Write`, so `Glob`, `Grep`, `WebFetch` and
+`Task` already arrive at stage 6 under `plan`. Gating them would raise an
+approval button per tool in the fleet's most-used mode while buying no safety
+— plan mode blocks writes internally, verified by probe G (a `Write` was never
+created and never surfaced as a `can_use_tool`).
+
+#### `--allowedTools` is mode-aware ([#749](https://github.com/littlebearapps/untether/issues/749))
+
+Stage 5 runs *before* the prompt, so the allowlist is the stronger of the two
+levers: whatever it covers never reaches a Telegram approval no matter what
+stage 6 does. Since 0.35.5rc9 Untether sends it only where it doesn't
+contradict the mode.
+
+| Mode | Allowlist sent | Resulting gate |
+|---|---|---|
+| `default` | ✗ | every tool prompts |
+| `manual` | ✗ | every tool prompts |
+| `acceptEdits` | ✗ | in-scope edits auto-run in the CLI; out-of-scope writes prompt |
+| `plan` | ✓ | reads pre-approved; writes blocked internally by plan mode |
+| `plan-auto` | ✓ | as `plan`, plus `ExitPlanMode` rubber-stamped |
+| `auto` | ✓ | classifier decides at stage 4; stage 6 is the fallback path |
+| `dontAsk` | ✓ | **only** the allowlisted tools can run — see below |
+| `bypassPermissions` | ✓ | no checks |
+| *(unset)* | ✓ | legacy `-p` path, no control channel |
+
+`DEFAULT_ALLOWED_TOOLS` itself is unchanged (`Bash`, `Read`, `Edit`, `Write`)
+— rc9 changes *when* it is sent, not what it contains. An explicit
+`[engines.claude] allowed_tools` always wins, in every mode; when it applies
+in a prompting mode Untether logs
+`claude.allowed_tools.prompting_mode_override` (INFO, once per mode per
+process) so the interaction is discoverable rather than silent.
+
+> **`dontAsk` is deliberately more than the CLI's `dontAsk`** (decisions.md
+> D-6). Untether's `dontAsk` = the CLI's `dontAsk` **plus** `Bash`, `Read`,
+> `Edit` and `Write` pre-approved. The CLI's own `dontAsk` auto-denies
+> anything that would prompt, so without an allowlist it cannot run any tool
+> at all (probe F). Those four are adopted as a defensible core surface for a
+> locked-down agent — this is an owned product decision, not inherited
+> plumbing. Narrowing it to `Read,Glob,Grep` would make the mode genuinely
+> read-only and closer to its documented "locked-down CI" purpose; revisit if
+> `dontAsk` acquires real usage.
+
+> **Known gap, carried to v0.35.6.** An explicit `permissions.ask` rule reaches
+> stage 6 *even under `bypassPermissions`* — the CLI deliberately overriding
+> the mode to honour the user's highest-priority rule. Because autonomous modes
+> retain both the two-tool gate and the stage-5 allowlist, such a rule is still
+> pre-empted for the four allowlisted tools. Closing that requires a stage-5
+> change, not a wider stage-6 gate.
+
+**`--permission-prompt-tool` is a hidden flag** — it is absent from
+`claude --help`, so its continued existence can only be established by
+spawning the binary. `tests/test_claude_permission_modes.py::
+test_750_permission_prompt_tool_flag_still_accepted` does that by passing the
+flag with its argument missing and reading commander's error, which costs zero
+tokens. That probe is rc9's entire mitigation for
+[#750](https://github.com/littlebearapps/untether/issues/750): if Anthropic
+ever drops the flag, CI fails there instead of five fleet hosts failing in
+production.
 
 ---
 
@@ -140,9 +289,11 @@ A companion runtime audit (gated by `[security] env_audit = true`, default true)
 
 ### Post-result idle timeout + "✓ turn complete" hint ([#333](https://github.com/littlebearapps/untether/issues/333))
 
+> **0.35.5rc11:** with live sessions on (the default) the post-result phase is owned by the live-session lifecycle below; this watchdog keeps only the pre-result silence cap ([#592](https://github.com/littlebearapps/untether/issues/592)). The text below describes `[watchdog] live_sessions = false`.
+
 After Claude Code emits its final `result` event the bidirectional CLI can sit alive for up to ~36 min before exiting on its own, leaving Untether's progress message looking stuck. The runner now closes that gap two ways:
 
-1. **Footer marker** — every successful `result` event arms a supplementary `StartedEvent` with `meta={"complete": "✓ turn complete"}`, which `markdown.format_meta_line` renders alongside model / effort / permission / trigger so the user sees the turn boundary immediately. Errored results don't emit the hint (no false "complete" tag on a failure).
+1. **Footer marker** — every successful `result` event arms a supplementary `StartedEvent` with `meta={"complete": "✓ turn complete"}`, which `markdown.format_meta_line` renders alongside model / effort / permission / trigger so the user sees the turn boundary immediately. Errored results don't emit the hint (no false "complete" tag on a failure). Live-session follow-up and wake turns get the same marker on their finals from the bridge ([#798](https://github.com/littlebearapps/untether/issues/798)).
 2. **Server-side timer** — `_post_result_idle_watchdog` arms `result_received_at` and closes stdin (`this_proc_stdin.aclose()`) once the deadline passes, after which the CLI hits stdin EOF and exits cleanly (rc=0). Claude's auto-continue safety gate already excludes `last_event_type == "result"` so the clean exit will not phantom-resume the session.
 
 Configure via `[watchdog]`:
@@ -152,7 +303,7 @@ Configure via `[watchdog]`:
 
 Approval-state guard: if `_REQUEST_TO_SESSION` or `_PENDING_ASK_REQUESTS` has live entries for the session the timer re-arms instead of closing — prevents orphaning a button-click `control_response` mid-flight.
 
-Two structlog events for ops: `claude.post_result_idle.deferred` (approval guard fired) and `claude.post_result_idle.closing_stdin` (deadline passed cleanly).
+Two structlog events for ops: `claude.post_result_idle.deferred` (approval guard fired) and `claude.post_result_idle.closing_stdin` (deadline passed cleanly). The per-poll `claude.post_result_idle.tick` (every ≤30 s) logs at INFO only while the timer is armed, or while an approval/ask is pending (`pending_requests`/`pending_asks` > 0 — the "waiting on the user" marker, [#696](https://github.com/littlebearapps/untether/issues/696)); an unarmed tick — every in-progress turn, and every tick of a live session, whose post-result idle `_live_session_lifecycle` owns — is DEBUG. Arming emits one INFO `claude.post_result_idle.armed` edge ([#799](https://github.com/littlebearapps/untether/issues/799)). With live sessions on, the watchdog still owns the #592 pre-result silence cap (each turn) and the #333 stdout-closed-but-alive subcountdown; only its post-result close branch stands down.
 
 #### This watchdog is PERMANENT, not a transitional workaround ([#569](https://github.com/littlebearapps/untether/issues/569))
 
@@ -176,13 +327,60 @@ When Claude fails with `API Error: Stream idle timeout - partial response receiv
 
 Auto-retry on Type-A is deferred to v0.35.4 pending upstream Anthropic stabilisation.
 
-### `rate_limit_event` surfacing ([#349](https://github.com/littlebearapps/untether/issues/349))
+### `rate_limit_event` surfacing ([#349](https://github.com/littlebearapps/untether/issues/349) / [#790](https://github.com/littlebearapps/untether/issues/790))
 
-When Anthropic throttles the API, Claude Code emits a `rate_limit_event` JSONL message. The runner translates this to a visible `note`-kind action rendered as `⏳ Rate limited — retrying in Xs` in Telegram (previously the runner returned an empty list and the session appeared to hang). `ClaudeStreamState.rate_limit_total_s` accumulates wait time across the session for future cost-footer annotation; structured `claude.rate_limit_event` logs `retry_after_s`, `count`, and `cumulative_s` for triage.
+Claude Code's `rate_limit_event` is a **quota-status snapshot** (`status` = `allowed` / `allowed_warning` / `rejected`, plus `resetsAt`, `rateLimitType` and per-window `unifiedWindows` utilization), sent whenever an API response moves the rounded usage — not only when throttled. Only a `rejected` snapshot that paid extra usage isn't covering is treated as a throttle: the runner renders `⏳ Rate limited until 17:30 AEST (~30 min)` from the stream's own `resetsAt` and latches `rate_limit_wait_until` (clamped to 24 h) so the stall detector treats the gap as an expected wait. `allowed` heartbeats are stashed on `ClaudeStreamState.rate_limit_windows` and otherwise ignored; `allowed_warning` produces at most one `⚠️ … limit N% used` note per window. Before #790 the schema modelled a shape the CLI never sends, so every heartbeat decoded as "bare" and the [#657](https://github.com/littlebearapps/untether/issues/657) fallback showed a fake `~60s` throttle every few minutes; bare events now latch nothing. Full decision table: [stream-json cheatsheet](stream-json-cheatsheet.md#rate_limit_event).
 
-### Per-session background-task tracking ([#346](https://github.com/littlebearapps/untether/issues/346) / [#347](https://github.com/littlebearapps/untether/issues/347))
+`ClaudeStreamState.rate_limit_total_s` accumulates throttle time (extension-only for repeats against one deadline); structured `claude.rate_limit_event` logs `status`, `rate_limit_type`, `resets_at`, `retry_after_s`, `retry_after_source` (`resets_at` / `retry_after_ms` / `reset_ts` / `result_error` / `action_required` / `default` / `bare` / `stale` / `covered_by_overage`), `count` and `cumulative_s`.
 
-Claude Code v2.1.72+ has primitives that arm long-running work and return the subprocess to "ready" while the primitive continues in the background: `Monitor`, `Bash run_in_background=true`, `Agent run_in_background=true`, `ScheduleWakeup`, `RemoteTrigger`. The runner tracks each by `tool_use_id` in `ClaudeStreamState.live_monitors` / `live_bg_bashes` / `live_bg_agents` / `live_wakeups` / `live_remote_triggers`. The wedge detector (`_detect_stuck_after_tool_result` from [#322](https://github.com/littlebearapps/untether/issues/322)) gates on `has_live_background_work()` so legitimate background primitives don't trip the SIGTERM path.
+### `system/api_retry` back-offs ([#792](https://github.com/littlebearapps/untether/issues/792))
+
+When an API call fails with a retryable error (429/529/5xx/connection), Claude Code emits `system/api_retry` with `attempt`, `max_retries`, `retry_delay_ms`, `error_status` and an `error` category before backing off. The runner renders one updating note per retry sequence (`🔁 API error 529 (overloaded) — retrying in 8s (attempt 2/10)`) and latches `api_retry_wait_until` so the bridge's stall monitor treats the back-off as an expected wait (`awaiting_api_retry()`, reason `api_retry_waiting`) rather than a hang. `claude.api_retry` logs at INFO, WARN on the final attempt. Shapes in the [stream-json cheatsheet](stream-json-cheatsheet.md).
+
+### Per-session background-task tracking ([#346](https://github.com/littlebearapps/untether/issues/346) / [#347](https://github.com/littlebearapps/untether/issues/347) / [#776](https://github.com/littlebearapps/untether/issues/776))
+
+Claude Code can arm long-running work and end its turn while the work continues: `Monitor`, `Bash run_in_background=true`, background `Agent`/`Task` (the default for subagents), `ScheduleWakeup`, `RemoteTrigger`.
+
+**Native task map (0.35.5rc11+).** Claude Code reports its own background-task lifecycle on stream-json (`system/task_started`, `task_progress`, `task_updated`, `task_notification`, `background_tasks_changed`; shapes in the [stream-json cheatsheet](stream-json-cheatsheet.md)). `translate_claude_event` folds them into `ClaudeStreamState.tasks` (`ClaudeTask` by `task_id`). A task *holds the live session open* (`ClaudeTask.holds_session`) iff it is `is_backgrounded` and its status is `running`/`pending`. That includes a subagent's own backgrounded task (`owned_by_subagent`), which outlives the agent that started it; before [#801](https://github.com/littlebearapps/untether/issues/801) the idle close killed one mid-run. A subagent's foreground tools (`is_backgrounded=false`) don't count. `task_updated.patch.status` / `task_notification.status` end a task. The `background_tasks_changed` snapshot is the parent's own list, so it reconciles only top-level tasks (`is_live_background`: backgrounded, not `owned_by_subagent`), and wake-turn attribution (#785) likewise uses only top-level tasks. Registration and end are logged as `claude.task.registered` / `claude.task.ended` ([#662](https://github.com/littlebearapps/untether/issues/662)).
+
+**Resumed tasks (0.35.5rc13+).** When Claude sends a finished background agent back to work (e.g. `SendMessage` — "send it back to re-check"), the CLI reuses the **same** `task_id` and emits a fresh snapshot listing it plus a new `task_started`. That task is *revived*: its status goes back to `running`, `ended_at` is cleared, `started_at` resets to the revival and `ClaudeTask.revived_count` increments, logged as `claude.task.revived` (INFO for background tasks; `prior_status`, `ended_ago_s`, `source`). `task_started` and a `task_updated` patch with a live status revive at once. A snapshot that lists an ended id revives it only if the task ended at least 5 s earlier; a listing inside that window overlaps the end events and is ignored (`claude.task.snapshot_revive_skipped`, DEBUG). Likewise, a snapshot that omits a task revived under 5 s ago predates the revival and does not end it (`claude.task.snapshot_end_deferred`, DEBUG); the resumed run's own `task_updated` ends it as usual. `task_progress` never revives a task, because it carries no status and a late one must not hold the session open. Revival also clears the task from the #785 announced set, and a turn completing while the task is live again does not mark it announced, so the resumed run's finish opens a normal `task_finished` wake turn. Before this fix the task stayed terminal, `live_tasks` read 0, and the idle close SIGINT'd the resumed agent partway through its work ([#801](https://github.com/littlebearapps/untether/issues/801)).
+
+Once the CLI emits any task event, the native map is authoritative for Monitor / Bash-bg / Agent-bg liveness. The older tool_use handles (`live_monitors`, `live_bg_bashes`, `live_bg_agents` with their bounded age-outs, [#374](https://github.com/littlebearapps/untether/issues/374) / [#573](https://github.com/littlebearapps/untether/issues/573) / [#646](https://github.com/littlebearapps/untether/issues/646)) remain only as a fallback for CLIs that never emit task events. `ScheduleWakeup` and `RemoteTrigger` emit no task events, so they keep their handles, and a pending ScheduleWakeup is tracked from its confirmation text ("scheduled for … (in 94s)") plus a 60 s grace. `has_live_background_work()`, `session_live_bg_count()` and the `background_task_summary()` footer all read one counting function, so they can't disagree.
+
+### Live sessions ([#776](https://github.com/littlebearapps/untether/issues/776))
+
+In control-channel mode (a permission mode is set) the Claude CLI keeps running after a `result`: a finished background task, each Monitor line and a firing ScheduleWakeup each start a new turn by themselves, and a user line written to stdin while idle runs as another turn. Before 0.35.5rc11 Untether stopped reading at the first `result` and closed stdin, so those turns ran invisibly (or died — closing stdin stops background work), and SIGTERM/quarantine later sent the next follow-up to a fresh session. Probe evidence: [`docs/findings/2026-09-27-claude-live-session-probes.md`](../../../findings/2026-09-27-claude-live-session-probes.md).
+
+**Stream.** The run is still `StartedEvent → ActionEvent* → CompletedEvent` (turn 1, the user's message). The runner keeps reading; every later turn is a `TurnEvent(started) → ActionEvent* → TurnEvent(completed)` segment with a `reason`:
+
+| reason | trigger | Telegram header |
+|---|---|---|
+| `task_finished` | a `task_notification` preceded the turn | 🔔 Background task finished — <task> |
+| `monitor_event` | a Monitor task is live, no notification | 📡 Monitor — <monitor> (sent silently) |
+| `scheduled_wakeup` | `command_lifecycle(started)` with an unknown uuid | ⏰ Scheduled wake-up |
+| `followup` | `command_lifecycle.command_uuid` matches a line Untether injected | none — a normal reply under the follow-up |
+
+Background subagent events (tagged `parent_tool_use_id`) arriving while the parent is idle do not open a turn. Only a top-level background task's `task_notification` attributes a turn — a subagent's own task (`owned_by_subagent`, or not `is_backgrounded`) is ignored for labels (`claude.turn.notification_ignored`), and the registered task description is preferred over the notification summary. The CLI often starts the wake turn on a background agent's result *before* any task event names it, so it opens `unknown`: if the task ends during that turn, the turn completes as `task_finished` for it (`claude.turn.retro_attributed`; the bridge delivers the real header); if it ends within 30 s after, it is paired with that turn (`claude.turn.task_end_paired`). Either way the task's own notification turn that follows carries `detail.already_announced` and is delivered without a push — one buzz per finish ([#785](https://github.com/littlebearapps/untether/issues/785)).
+
+**Delivery.** `FollowupTurnRouter` (bridge) gives each turn a fresh tracker, a progress message only if the turn runs >5 s, uses a tool or raises an approval (approval/plan/question keyboards attach to it), then a new final with the header, replying to the message whose turn launched the task it reports on — each `ClaudeTask` records its `origin_turn`, a wake turn's `TurnEvent.detail` carries `task_ids` + `origin_turn`, and the router maps turns to the message each answered (the run's prompt, or an injected follow-up's own message; unknown → the run's prompt; a retro-attributed `unknown` turn is re-anchored before its final is sent) ([#795](https://github.com/littlebearapps/untether/issues/795)); outbox files are delivered per turn; turn messages are aliases of the live run in `running_tasks` so replies and `/cancel` reach it.
+
+**Background status ([#777](https://github.com/littlebearapps/untether/issues/777)).** Rendered by `background_status.py` over the native task map — no extra event parsing. Pre-result, the run's `ProgressEdits.background_provider` appends a `⏳ background (N)` block (`live_shown()`: every live task that holds the session open — #801 `holds_session` — except a subagent's own task while the Agent that spawned it is listed, linked via the subagent tool_use's `parent_tool_use_id` → `ClaudeTask.owner_tool_use_id`; once that agent ends, or the owner is unknown, the task gets its own row, so the panel never shows nothing while the session is held; agent rows carry elapsed · `task_progress` tokens · tool uses · current step from the progress `description`; shell/Monitor rows carry elapsed; descriptions are markdown-escaped) and the heartbeat tick repaints it. Post-result, `BackgroundStatusManager.after_turn()` runs after the run's answer and after each later turn: with live background tasks and no active status message it sends one (`notify=False`, plain text, registered in `active_progress.json`), which a 1 s poll edits at most every 30 s — sooner (≥2 s spacing) when the task set or a status changes — and finalises when the set empties. The run's end (`/cancel`, `/new`, idle/max-hold/cap close, drain, process death) finalises it with the close reason; rows still live become ⏹️ stopped. `[progress] show_background_tasks` / `background_tasks_max_rows`. Logs: `background_status.opened|finalised`.
+
+**Wake-ack consolidation ([#785](https://github.com/littlebearapps/untether/issues/785) part 2).** With `[progress] consolidate_wake_turns` (default on) and a status message present, `_deliver_final` asks `wake_fold_decision()` before sending a wake turn's final: reasons `task_finished` / `unknown` / `scheduled_wakeup` / `monitor_event`, `ok`, no non-note action in the turn (tools, approvals, questions; thinking notes don't count and don't open a progress message), answer ≤ `FOLD_MAX_CHARS` (300) → the answer is folded, one line, in full, under the attributed task's row (`TurnEvent.detail.task_ids`) or as a 💬 note, and the status message is edited instead (accounting — cost delta, `runner.completed`, stats — still runs; a budget/outlier notice forces a normal delivery). Content decides first because the report turn often opens `unknown` before the last task's end lands; at completion a turn that left no background work running is `last_task` and breaks out (pushed) when it is a new `task_finished` (not already announced), or a `task_finished`/`unknown` turn in a batch that hasn't pushed yet; a restatement or an unnamed `unknown` no-op after the batch has pushed ("nothing new since the report") folds into the finalised status message instead, as does a late `scheduled_wakeup` no-op. When the report itself raced the task's end and folded, the restatement carries the batch's push and the earlier note is filed under the task's row. If every wake turn of a batch folded, then once its status message finalises and the session has idled 5 s (or the run ends normally), one short pushed notice (`✅ all N background tasks done`) replies to the launching prompt (`background_status.quiet_notice`). Any wake turn that is delivered as its own message while its batch has not pushed yet always pushes (`live_turn.push_promoted`), even when flagged `already_announced` — that flag can come from a finish that was only folded, or from pairing the task's end with an unrelated `unknown` ack turn that completed within 30 s before it. Off → rc12 per-turn delivery. Logs: `live_turn.fold_decision` (`decision=fold|tools|long_answer|last_task|error|not_wake`, `folded`), `background_status.folded`.
+
+**Follow-ups.** A queued resume job for a session whose process is live is written into that process (`live_followup.inject_live_followup` → `inject_when_idle` → `write_user_message`), queue semantics: it waits until the current turn has ended (a mid-turn write would be folded into the running turn — that is steer, [#775](https://github.com/littlebearapps/untether/issues/775)). `ThreadScheduler` offers queued jobs to the injector while the live run is in flight. No live process, a closing one, or another engine → the unchanged `--resume` path.
+
+**Steer ([#775](https://github.com/littlebearapps/untether/issues/775)).** With follow-up mode `steer` (`/steer <text>`, bare `/steer`, `/config` → Follow-up, `[transports.telegram] followup_mode`), the Telegram loop writes a plain-text/voice prompt into the live session *immediately* (`telegram/steer.maybe_steer` → `steer_into_session` → `write_user_message`, fresh `command_uuid`, reply anchor registered) instead of queueing it. Probed on CLI 2.1.284: the CLI emits `command_lifecycle{queued}` at the write; mid-tool, `command_lifecycle{started}` follows the running tool's result **while the turn is still open** and the line is folded into that turn (one result) — `translate_claude_event` turns that into a `↪️ steer received: …` note (`detail.absorbed_command_uuid`, log `claude.live_session.injected_absorbed`), clears the line's awaiting marker and the bridge drops its anchor; after the turn's last tool call, `started` arrives after the `result` and the line runs as the next turn (`reason=followup`, replying to the steer). `--replay-user-messages` is **not** needed (and not passed): `command_lifecycle` carries our uuid either way. **Race guard:** `steer_into_session` checks and writes under `LiveSession.lock`; the window is closed by `close_live_session` (`closing`) and by `close_steer_window` (`steer_closed`, set by the bridge the moment `/cancel`/`/new` hits an active turn), so a steer either lands before the close or falls back to the queue path — never into a pipe that is closing. An idle session whose chat options changed also falls back (the queue path restarts it with the new options). Files, media groups, forwards and commands always queue; a pending AskUserQuestion wins; other engines, legacy mode and `live_sessions = false` fall back with a one-line notice (`steer.fallback`). Logs: `steer.written`, `steer.fallback`, `claude.live_session.steered`, `claude.live_session.steer_window_closed`, `live_followup.anchor_absorbed`.
+
+**Lifecycle** (`_live_session_lifecycle`, per run). While idle: nothing live for `post_result_limbo_grace` (60 s) → close stdin; background work still live `post_result_bg_max_hold` (1800 s, re-armed each turn) after the last turn → notice + close; `live_session_max_s` (4 h) from spawn → notice + close; a pending approval/ask or an injected line not yet started pauses the timers. Closing stdin makes the CLI stop its tasks and exit rc=0 (graceful — nothing quarantined); only if it hasn't exited 15 s later does Untether log a process snapshot (`claude.live_session.close_grace_expired`: state, wchan, CPU across the grace, FDs, TCP, children with redacted cmdlines) and escalate — SIGINT (the CLI's Ctrl-C path), then SIGTERM/SIGKILL 5 s later. The session is quarantined (`forced_teardown_after_result`) only when the close was not clean: a close of an idle turn with no live background work leaves a complete transcript, so it is not quarantined even if the CLI needed a signal ([#791](https://github.com/littlebearapps/untether/issues/791)); #631 empty-resume recovery remains the backstop. `/cancel`, `/new` and drain/restart close idle live sessions the same way with a notice naming the stopped tasks; a turn in progress is still killed by `/cancel`.
+
+**Resume guard.** On `--resume` of a session whose previous process ended with background work still live, the CLI replays `task_notification{stopped}` and answers it with a 0-turn result before running the real turn. That result is absorbed (`claude.resume_guard.absorbed`), not delivered — no empty-resume quarantine or resend.
+
+**Cost.** `total_cost_usd` is cumulative per session (also across `--resume`); the bridge records per-turn deltas via `session_costs.json` ([#778](https://github.com/littlebearapps/untether/issues/778)). A turn's delta includes spend by background subagents during it.
+
+**Kill switch:** `[watchdog] live_sessions = false` restores the pre-rc11 "stop at the first result" behaviour. Legacy `-p` mode (no permission mode) is always single-result.
+
+Logs: `claude.turn.started|completed`, `live_turn.started|interrupted`, `claude.live_session.stdin_closed` (reason `idle_no_tasks|max_hold|abs_cap|cancel|drain`), `claude.live_session.injected|inject_unavailable|injected_turn_timeout|followup_not_run|close_grace_expired|exited_after_sigint|forced_teardown`, `cost.turn_delta`, `cost.baseline_unknown`; `session.summary` carries `followup_turns` and `peak_live_idle_seconds` (live-idle holds are kept out of `peak_idle_seconds`, and the stall monitor stays silent while live-idle — [#787](https://github.com/littlebearapps/untether/issues/787)).
 
 ---
 

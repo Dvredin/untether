@@ -185,6 +185,10 @@ class TelegramTransportSettings(BaseModel):
     voice_transcription_url_allowlist: list[str] = Field(default_factory=list)
     session_mode: Literal["stateless", "chat"] = "stateless"
     show_resume_line: bool = True
+    # #775: what a message sent during a live Claude run does by default —
+    # "queue" (wait for the turn to end) or "steer" (fold it into the running
+    # turn). Per-chat / per-topic overrides via /config, /steer and /queue.
+    followup_mode: Literal["queue", "steer"] = "queue"
     forward_coalesce_s: float = Field(default=1.0, ge=0)
     media_group_debounce_s: float = Field(default=1.0, ge=0)
     topics: TelegramTopicsSettings = Field(default_factory=TelegramTopicsSettings)
@@ -609,6 +613,16 @@ class WatchdogSettings(BaseModel):
     # (pre-rc10 fixed-cap behaviour). Range 0-2h.
     post_result_bg_max_hold: float = Field(default=1800.0, ge=0, le=7200)
 
+    # #776: live-session model for Claude (control-channel mode). The process
+    # stays live after its reply: background-task / scheduled-wakeup /
+    # Monitor turns are delivered to Telegram and follow-ups are written into
+    # the live process instead of resuming. Kill switch: false restores the
+    # pre-rc11 "stop reading at the first result" behaviour.
+    live_sessions: bool = True
+    # #776: absolute lifetime cap for one live Claude process, from spawn
+    # (backstop against e.g. an endless Monitor). Range 10 min - 24 h.
+    live_session_max_s: float = Field(default=14400.0, ge=600, le=86400)
+
     # #481: grace window for fresh Bash/BashOutput tool calls. When the most
     # recent action is Bash/BashOutput/KillShell and its age is less than
     # bash_grace_seconds, ProgressEdits._stall_monitor suppresses the Telegram
@@ -649,6 +663,14 @@ class ProgressSettings(BaseModel):
     # stall_check_interval) and only runs the threshold check at the slower
     # cadence. Range 5s-120s.
     heartbeat_interval: float = Field(default=30.0, ge=5, le=120)
+    # #777: live background-task status (Claude). The pre-result block in the
+    # progress message plus the post-result status message, and its row cap
+    # ("+N more" beyond it).
+    show_background_tasks: bool = True
+    background_tasks_max_rows: int = Field(default=5, ge=1, le=20)
+    # #785 part 2: fold short wake-turn acks (no tools, no approval, short
+    # answer) into that status message instead of a new pushed message.
+    consolidate_wake_turns: bool = True
 
 
 _ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")

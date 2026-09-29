@@ -77,11 +77,14 @@ When Claude Code wants to run a tool that needs approval — write a file, run a
 
 If you click "Pause & Outline Plan", Claude writes a plain-language summary of what it's about to do, and you get a second round of buttons: ✅ Approve Plan / ❌ Deny / 💬 Let's discuss. Approving here also auto-approves the next plan-exit so you don't get prompted twice for the same plan.
 
-Per-chat plan mode (`/planmode on/auto/off`) controls when the buttons appear:
+Per-chat permission mode (`/planmode on/plan-auto/auto/off`, or `/config → Permission mode`) controls when the buttons appear:
 
 - **on** — every plan transition prompts for approval.
-- **auto** — plan transitions auto-approve, but tool approvals still appear.
-- **off** — no plan phase; tools auto-execute (subject to engine policy).
+- **plan-auto** — plan mode, with the plan transition approved for you, so no buttons appear.
+- **auto** — Claude Code's own auto mode: a classifier approves routine work and blocks risky actions such as sending sensitive data to external endpoints. Questions the agent asks you still come through as buttons.
+- **off** — no plan phase; file edits run freely, and other actions (most shell commands, web fetches, MCP tools) ask for approval unless your Claude Code settings allow them.
+
+The **plan-auto** mode was called `auto` before v0.35.5. It was renamed because Claude Code introduced its own `auto` mode, and the two names collided. If you set `permission_mode = "auto"` in `untether.toml` and want the old behaviour, change it to `"plan-auto"` — Untether logs a warning at startup if it spots the ambiguous value. Per-chat settings you made through the buttons are migrated for you.
 
 For non-Claude engines, approval is enforced per-engine pre-run (Codex `--ask-for-approval`, Gemini `--approval-mode`) rather than via mid-run buttons. Full guide: [Interactive approval](https://untether.littlebearapps.com/how-to/interactive-approval/).
 
@@ -90,9 +93,13 @@ For non-Claude engines, approval is enforced per-engine pre-run (Codex `--ask-fo
 Untether is built around the assumption that your phone is unreliable but your computer isn't. Two things matter here:
 
 1. **Your agent keeps running.** It's a subprocess on your machine. It doesn't care whether your phone is connected, whether Telegram is open, or whether you've gone to sleep. Progress messages buffer locally; reconnection rendering is automatic.
-2. **Untether catches the common failure modes.** If a Claude Code session exits prematurely after a tool result without processing it (a known upstream bug), Untether auto-resumes it. If a resume comes back empty — 0 turns and no answer, another upstream turn-state bug — Untether quarantines that session and automatically retries your message on a fresh one, telling you it did so. If the bot is restarted while a run is in progress, ephemeral approval messages are cleaned up and orphaned progress messages get a `⚠️ interrupted by restart` marker. Stalls that look "alive but silent" trigger progressive warnings, and the watchdog auto-cancels truly dead processes.
+2. **Untether catches the common failure modes.** If a Claude Code session exits prematurely after a tool result without processing it (a known upstream bug), Untether auto-resumes it. If a resume comes back empty — 0 turns and no answer, another upstream turn-state bug — Untether quarantines that session and automatically retries your message on a fresh one, telling you it did so. When Claude hands work to a background task or subagent and ends its turn, Untether keeps the session open: the task's result comes back as a new `🔔 Background task finished` message, and anything you send meanwhile goes into that same session rather than a new one. If you `/cancel` or Untether restarts while background tasks are running, it stops them cleanly and tells you which ones. If the bot is restarted while a run is in progress, ephemeral approval messages are cleaned up and orphaned progress messages get a `⚠️ interrupted by restart` marker. Stalls that look "alive but silent" trigger progressive warnings, and the watchdog auto-cancels truly dead processes.
 
 Everything important — Telegram update offsets, active progress message references, trigger fire history — is persisted to disk so a restart picks up where you left off without dropping or duplicating messages.
+
+## Can I change Claude's instructions while it's still working?
+
+Yes, with Claude Code. By default a message you send while a run is working is queued: it runs as the next turn once the current one finishes. Send `/steer <text>` instead and the message goes straight into the running turn. Claude reads it the next time a tool finishes and folds it into the answer it's already writing. You get a `↪️ Steered into the current run.` reply, and the progress message shows when Claude has picked it up. To make steer the default for a chat, send `/steer` on its own or use `/config` → Follow-up. `/queue` switches back, and `/queue <text>` queues a single message. Steering needs a permission mode (`/planmode`) so the session stays live. Files, forwards and other engines always queue, and Untether tells you when a steer couldn't be delivered. Full guide: [Steer follow-ups](https://untether.littlebearapps.com/how-to/steer-follow-ups/).
 
 ## How do I keep agents from spending too much money?
 
@@ -112,11 +119,11 @@ If you set no budget at all, Untether still flags a single run that costs more t
 
 `/usage` shows the current run's cost; `/usage debug` shows OAuth token expiry, schema-mismatch counters, and cache freshness — useful when the subscription footer goes silent. `/stats` reports per-engine totals across today, this week, and all time.
 
-Cost tracking is most accurate for Claude (full USD reporting via API metadata) and OpenCode. Codex, Pi, Gemini, and Amp report tokens-only. Subscription users (Claude Pro/Max, ChatGPT, Gemini, Amp) see a `5h: N% / 7d: N%` indicator instead of dollars. See the [cost-budgets guide](https://untether.littlebearapps.com/how-to/cost-budgets/) for tuning.
+Cost tracking is most accurate for Claude (full USD reporting via API metadata) and OpenCode. For Claude, the figure on each reply is what that reply cost — Claude reports a running total for the whole session, so Untether records the difference since the previous reply (resumed sessions are no longer counted twice). Codex, Pi, Gemini, and Amp report tokens-only. Subscription users (Claude Pro/Max, ChatGPT, Gemini, Amp) see a `5h: N% / 7d: N%` indicator instead of dollars. See the [cost-budgets guide](https://untether.littlebearapps.com/how-to/cost-budgets/) for tuning.
 
 ## Does /loop work via Untether?
 
-By default, no — Claude Code's `/loop` and `ScheduleWakeup` are session-scoped, and the Untether subprocess exits when each turn finishes. Schedules registered by Claude don't fire afterwards.
+Partly, by default. Claude Code's `/loop` and `ScheduleWakeup` are session-scoped. Since v0.35.5 Untether keeps a Claude session open after its reply while a wake-up is pending (up to 30 minutes), so short waits fire on their own and arrive as a `⏰ Scheduled wake-up` message. Longer schedules still end with the session.
 
 To enable end-to-end /loop support, turn on **Loop mode** in `/config → 🔁 Loop mode`. When on, Untether observes Claude's schedule registrations and re-fires each iteration when due, spawning a fresh `claude --resume` subprocess per fire.
 
@@ -136,7 +143,7 @@ voice_transcription_language = "en"       # optional ISO-639-1 hint
 voice_transcription_prompt = "Trello, Untether, Claude Code"  # optional vocabulary bias
 ```
 
-Groq's Whisper Large v3 Turbo is fast and cheap; any OpenAI-compatible Whisper endpoint works (including a self-hosted one). If you only ever speak one language, set `voice_transcription_language` (e.g. `"en"`) — without the hint, Whisper-family models occasionally guess the wrong language on very short voice notes. Untether already biases the decoder toward the terms every user speaks — the engine names (Claude Code, Codex, OpenCode, Gemini, Amp, Pi) plus Untether's own vocabulary. If transcription keeps mangling *your* project or tool names ("trollo" instead of Trello), set `voice_transcription_prompt` to a short comma-separated list of those names; your value replaces the built-in list, so include the engine names you care about too. Keep it to genuinely high-frequency nouns (≤1000 characters, and effect varies by model): an overstuffed prompt can make the model hallucinate those terms on short or silent clips. Set it to `""` to switch the bias off entirely. The API key is `SecretStr`-masked in `repr()` / `str()` / structlog so it never lands in journal or crash output. For safety, `voice_transcription_base_url` is SSRF-checked — a URL that resolves to a private/reserved address (e.g. a self-hosted Whisper on `10.x` or `192.168.x`) is rejected unless you explicitly allow its range with `voice_transcription_url_allowlist = ["10.0.0.0/8"]`. Full setup: [Voice notes](https://untether.littlebearapps.com/how-to/voice-notes/).
+Groq's Whisper Large v3 Turbo is fast and cheap; any OpenAI-compatible Whisper endpoint works (including a self-hosted one). If you only ever speak one language, set `voice_transcription_language` (e.g. `"en"`) — without the hint, Whisper-family models occasionally guess the wrong language on very short voice notes. Untether already biases the decoder toward the terms every user speaks — the engine names (Claude Code, Codex, OpenCode, Gemini, Amp, Pi), the agent context files (`CLAUDE.md`, `AGENTS.md`), plus Untether's own vocabulary. If transcription keeps mangling *your* project or tool names ("trollo" instead of Trello), set `voice_transcription_prompt` to a short comma-separated list of those names; your value replaces the built-in list, so include the engine names you care about too. Keep it to genuinely high-frequency nouns (≤1000 characters, and effect varies by model): an overstuffed prompt can make the model hallucinate those terms on short or silent clips. Set it to `""` to switch the bias off entirely. The API key is `SecretStr`-masked in `repr()` / `str()` / structlog so it never lands in journal or crash output. For safety, `voice_transcription_base_url` is SSRF-checked — a URL that resolves to a private/reserved address (e.g. a self-hosted Whisper on `10.x` or `192.168.x`) is rejected unless you explicitly allow its range with `voice_transcription_url_allowlist = ["10.0.0.0/8"]`. Full setup: [Voice notes](https://untether.littlebearapps.com/how-to/voice-notes/).
 
 ## Can agents send files back to me automatically?
 

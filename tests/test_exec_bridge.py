@@ -897,24 +897,25 @@ class TestMaybeAppendUsageFooterAlwaysShow:
             "untether.telegram.commands.usage.fetch_claude_usage", _fake_fetch
         )
 
-        warn_calls: list[tuple[str, dict]] = []
+        from structlog.testing import capture_logs
 
-        def _warn(event: str, **kwargs) -> None:
-            warn_calls.append((event, kwargs))
-
-        monkeypatch.setattr(rb.logger, "warning", _warn)
-
-        # Call _validate_usage_schema directly to exercise per-call behaviour
-        # (the cached fetcher path memoises within the TTL window).
-        rb._validate_usage_schema(
-            {"five_hour": {"utilization": 25.0}, "seven_day": {"utilization": 10.0}}
-        )
-        rb._validate_usage_schema(
-            {"five_hour": {"utilization": 25.0}, "seven_day": {"utilization": 10.0}}
-        )
-        rb._validate_usage_schema(
-            {"five_hour": {"utilization": 25.0}, "seven_day": {"utilization": 10.0}}
-        )
+        # capture_logs, not monkeypatch.setattr(rb.logger, "warning", …):
+        # restoring an attribute on structlog's lazy proxy pins a bound
+        # method with the default processors, silently hiding every later
+        # runner_bridge warning from capture_logs() in the same process.
+        with capture_logs() as logs:
+            # Call _validate_usage_schema directly to exercise per-call
+            # behaviour (the cached fetcher path memoises within the TTL).
+            rb._validate_usage_schema(
+                {"five_hour": {"utilization": 25.0}, "seven_day": {"utilization": 10.0}}
+            )
+            rb._validate_usage_schema(
+                {"five_hour": {"utilization": 25.0}, "seven_day": {"utilization": 10.0}}
+            )
+            rb._validate_usage_schema(
+                {"five_hour": {"utilization": 25.0}, "seven_day": {"utilization": 10.0}}
+            )
+        warn_calls = [(e["event"], e) for e in logs if e.get("log_level") == "warning"]
 
         mismatch = [c for c in warn_calls if c[0] == "claude_usage.schema_mismatch"]
         assert len(mismatch) == 3  # one per call now, not one per process
@@ -5705,6 +5706,8 @@ def _make_engine_state(**fields):
         # ClaudeStreamState methods.
         "awaiting_user_approval": lambda: False,
         "awaiting_rate_limit_retry": lambda: False,
+        # #792: CLI api_retry back-off window.
+        "awaiting_api_retry": lambda: False,
     }
     defaults.update(fields)
     return SimpleNamespace(**defaults)
@@ -7763,6 +7766,104 @@ def test_500_rate_limit_waiting_probe() -> None:
     assert edits._is_rate_limit_waiting() is False
 
 
+def test_792_api_retry_waiting_probe() -> None:
+    transport = FakeTransport()
+    edits = _make_edits(transport, _KeyboardPresenter())
+    edits.stream = _make_stream(
+        engine_state=_make_engine_state(awaiting_api_retry=lambda: True)
+    )
+    assert edits._is_api_retry_waiting() is True
+    # Independent of the quota-throttle probe.
+    assert edits._is_rate_limit_waiting() is False
+    edits.stream = _make_stream(engine_state=None)
+    assert edits._is_api_retry_waiting() is False
+
+
+def test_792_api_retry_probe_survives_exception() -> None:
+    def _boom() -> bool:
+        raise RuntimeError("engine state exploded")
+
+    transport = FakeTransport()
+    edits = _make_edits(transport, _KeyboardPresenter())
+    edits.stream = _make_stream(
+        engine_state=_make_engine_state(awaiting_api_retry=_boom)
+    )
+    assert edits._is_api_retry_waiting() is False
+
+
+def test_792_real_claude_state_drives_the_probe() -> None:
+    """End-to-end through the real ClaudeStreamState: an api_retry frame arms
+    the bridge's expected-wait probe; a real `allowed` rate-limit heartbeat
+    (#790) arms nothing."""
+    from untether.runners.claude import ClaudeStreamState, translate_claude_event
+    from untether.schemas import claude as claude_schema
+
+    state = ClaudeStreamState()
+    transport = FakeTransport()
+    edits = _make_edits(transport, _KeyboardPresenter())
+    edits.stream = _make_stream(engine_state=state)
+
+    heartbeat = claude_schema.decode_stream_json_line(
+        b'{"type":"rate_limit_event","rate_limit_info":{"status":"allowed",'
+        b'"resetsAt":1790578200,"rateLimitType":"five_hour","isUsingOverage":false,'
+        b'"unifiedWindows":{"five_hour":{"utilization":0.09,"resetsAt":1790578200}}},'
+        b'"uuid":"u","session_id":"s"}'
+    )
+    translate_claude_event(
+        heartbeat, title="claude", state=state, factory=state.factory
+    )
+    assert edits._is_rate_limit_waiting() is False
+    assert edits._is_api_retry_waiting() is False
+
+    retry = claude_schema.decode_stream_json_line(
+        b'{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,'
+        b'"retry_delay_ms":60000,"error_status":529,"error":"overloaded",'
+        b'"uuid":"u","session_id":"s"}'
+    )
+    translate_claude_event(retry, title="claude", state=state, factory=state.factory)
+    assert edits._is_api_retry_waiting() is True
+
+
+@pytest.mark.anyio
+async def test_792_api_retry_wait_emits_no_warn_and_no_count() -> None:
+    """A long CLI back-off is an expected wait: demoted INFO, no
+    stall_detected WARN, no stall_warnings metric."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL_FIRST = 0.05
+    edits._stall_repeat_seconds = 0.02
+
+    edits.stream = _make_stream(
+        last_event_type="system",
+        engine_state=_make_engine_state(awaiting_api_retry=lambda: True),
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        async with anyio.create_task_group() as tg:
+
+            async def drive() -> None:
+                clock.set(110.0)
+                await anyio.sleep(0.25)
+                edits.signal_send.close()
+
+            tg.start_soon(edits.run)
+            tg.start_soon(drive)
+
+    events = [entry.get("event") for entry in logs]
+    assert "progress_edits.stall_detected" not in events
+    assert "progress_edits.frozen_ring_escalation" not in events
+    pending = [e for e in logs if e.get("event") == "subprocess.approval_pending"]
+    assert pending and pending[0]["reason"] == "api_retry_waiting"
+    assert edits._total_stall_warn_count == 0
+    assert edits._frozen_ring_count == 0
+
+
 @pytest.mark.anyio
 async def test_495_499_500_approval_wait_emits_no_warn_and_no_count() -> None:
     """End-to-end: a session parked on an approval must emit the demoted INFO,
@@ -8498,7 +8599,10 @@ def _572_watchdog(monkeypatch, **kw) -> None:
 
 class _StreamIdleThenAnswerRunner(MockRunner):
     """First run() fails with a Type-A stream-idle timeout; the next run()
-    delivers a real answer — models a transient mid-generation API stall."""
+    delivers a real answer — models a transient mid-generation API stall.
+
+    ``current_stream`` is the stream each run publishes to the bridge's
+    per-run handle (#510) — tests swap it to vary the stall class / rc."""
 
     def __init__(
         self,
@@ -8514,9 +8618,11 @@ class _StreamIdleThenAnswerRunner(MockRunner):
 
     async def run(self, prompt, resume):
         from untether.model import StartedEvent
+        from untether.runner import publish_run_stream
         from untether.runners.mock import _resume_token
 
         self.calls.append((prompt, resume))
+        publish_run_stream(self.current_stream, None)
         token_value = resume.value if resume else self._resume_value
         token = _resume_token(self.engine, token_value)
         async with self.lock_for(token):
@@ -8857,3 +8963,167 @@ def test_model_log_fields_survives_late_meta_merge() -> None:
         "model": "claude-fable-5",
         "model_display": "fable 5",
     }
+
+
+# ===========================================================================
+# #510 — each run binds its OWN JsonlStreamState, never the shared singleton
+# ===========================================================================
+
+
+def _510_publish(stream, pid: int) -> None:
+    from untether.runner import publish_run_stream
+
+    publish_run_stream(stream, pid)
+
+
+class _510SharedSingletonRunner:
+    """One runner instance shared by two chats, modelling ClaudeRunner:
+    ``current_stream`` / ``last_pid`` are overwritten by every spawn, and each
+    ok result is followed by a supplementary ``StartedEvent(meta=complete)``.
+
+    Ordering: A spawns + inits -> B spawns (overwriting the singletons) ->
+    A yields its supplementary StartedEvent + CompletedEvent."""
+
+    engine = CODEX_ENGINE
+
+    def __init__(self) -> None:
+        from untether.runner import JsonlStreamState
+
+        self._stream_cls = JsonlStreamState
+        self.current_stream = None
+        self.last_pid: int | None = None
+        self.a_inited = anyio.Event()
+        self.b_spawned = anyio.Event()
+        self.streams: dict[str, object] = {}
+
+    async def run(self, prompt, resume):
+        sid = prompt
+        is_a = sid == "sess-A"
+        if not is_a:
+            await self.a_inited.wait()
+        pid = 1001 if is_a else 1002
+        stream = self._stream_cls(expected_session=None)
+        stream.event_count = 7 if is_a else 42
+        token = ResumeToken(engine=self.engine, value=sid)
+        stream.found_session = token
+        self.streams[sid] = stream
+        # The real runners' shared-instance diagnostics singletons.
+        self.last_pid = pid
+        self.current_stream = stream
+        _510_publish(stream, pid)
+        yield StartedEvent(engine=self.engine, resume=token, title="fake")
+        if is_a:
+            self.a_inited.set()
+            await self.b_spawned.wait()
+            yield StartedEvent(
+                engine=self.engine,
+                resume=token,
+                title="fake",
+                meta={"complete": "✓ turn complete"},
+            )
+            yield CompletedEvent(
+                engine=self.engine, resume=token, ok=True, answer="A done"
+            )
+        else:
+            self.b_spawned.set()
+            yield CompletedEvent(
+                engine=self.engine, resume=token, ok=True, answer="B done"
+            )
+
+
+@pytest.mark.anyio
+async def test_510_supplementary_started_does_not_rebind_foreign_stream() -> None:
+    """#510 D1: a supplementary StartedEvent arriving after another chat's
+    spawn must not rebind this run's ``edits.stream`` to the other chat's
+    stream — and ``session.summary`` must report this run's own counters."""
+    from untether.runner_bridge import run_runner_with_cancel
+
+    runner = _510SharedSingletonRunner()
+    transport = FakeTransport()
+    edits_a = _make_edits(transport, _KeyboardPresenter())
+    edits_b = _make_edits(transport, _KeyboardPresenter())
+
+    async def drive(sid: str, edits: ProgressEdits) -> None:
+        await run_runner_with_cancel(
+            runner,  # type: ignore[arg-type]
+            prompt=sid,
+            resume_token=None,
+            edits=edits,
+            running_task=None,
+            on_thread_known=None,
+        )
+
+    with structlog.testing.capture_logs() as logs, anyio.fail_after(5):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(drive, "sess-A", edits_a)
+            tg.start_soon(drive, "sess-B", edits_b)
+
+    assert edits_a.stream is runner.streams["sess-A"]
+    assert edits_b.stream is runner.streams["sess-B"]
+    assert edits_a.pid == 1001
+    assert edits_b.pid == 1002
+    summaries = {
+        r["session_id"]: r for r in logs if r.get("event") == "session.summary"
+    }
+    assert summaries["sess-A"]["event_count"] == 7
+    assert summaries["sess-B"]["event_count"] == 42
+
+
+class _510StaleSingletonRunner:
+    """A runner whose singletons still hold a PREVIOUS spawn's pid/stream
+    when this run starts; the new spawn only happens after some pre-spawn
+    work (arg building, RAM guard) during which the bridge's early-PID
+    poller is already ticking."""
+
+    engine = CODEX_ENGINE
+
+    def __init__(self, edits: ProgressEdits) -> None:
+        from untether.runner import JsonlStreamState
+
+        self._stream_cls = JsonlStreamState
+        self.stale_stream = JsonlStreamState(expected_session=None)
+        self.current_stream = self.stale_stream
+        self.last_pid: int | None = 999
+        self.edits = edits
+        self.observed_before_spawn: tuple[object, object] | None = None
+        self.stream = None
+
+    async def run(self, prompt, resume):
+        await anyio.sleep(0.3)  # pre-spawn work; thread_pid ticks meanwhile
+        self.observed_before_spawn = (self.edits.pid, self.edits.stream)
+        stream = self._stream_cls(expected_session=None)
+        self.stream = stream
+        self.last_pid = 1001
+        self.current_stream = stream
+        _510_publish(stream, 1001)
+        token = ResumeToken(engine=self.engine, value="sess-A")
+        yield StartedEvent(engine=self.engine, resume=token, title="fake")
+        yield CompletedEvent(engine=self.engine, resume=token, ok=True, answer="ok")
+
+
+@pytest.mark.anyio
+async def test_510_thread_pid_never_binds_previous_spawn() -> None:
+    """#510 D2: the early-PID poller must not bind the previous spawn's
+    ``last_pid`` / ``current_stream`` left on the shared runner."""
+    from untether.runner_bridge import run_runner_with_cancel
+
+    transport = FakeTransport()
+    edits = _make_edits(transport, _KeyboardPresenter())
+    runner = _510StaleSingletonRunner(edits)
+
+    with anyio.fail_after(5):
+        await run_runner_with_cancel(
+            runner,  # type: ignore[arg-type]
+            prompt="p",
+            resume_token=None,
+            edits=edits,
+            running_task=None,
+            on_thread_known=None,
+        )
+
+    assert runner.observed_before_spawn is not None
+    seen_pid, seen_stream = runner.observed_before_spawn
+    assert seen_pid != 999
+    assert seen_stream is not runner.stale_stream
+    assert edits.pid == 1001
+    assert edits.stream is runner.stream

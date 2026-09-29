@@ -8,6 +8,8 @@ to prevent deadlock when keeping stdin open for control responses.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import functools
 import html
 import json
 import os
@@ -18,12 +20,13 @@ import signal
 import subprocess as subprocess_module
 import time
 import tty
+import weakref
 from collections import OrderedDict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 import msgspec
@@ -33,6 +36,7 @@ from ..config import ConfigError
 from ..events import EventFactory
 from ..logging import get_logger
 from ..model import (
+    TURN_COMPLETE_MARKER,
     Action,
     ActionKind,
     CompletedEvent,
@@ -49,6 +53,7 @@ from ..runner import (
     _rc_label,
     _session_label,
     _stderr_excerpt,
+    publish_run_stream,
 )
 from ..schemas import claude as claude_schema
 from ..session_quarantine import get_quarantine_store
@@ -69,6 +74,7 @@ from .run_options import (
     claude_cli_permission_mode,
     get_run_options,
     is_claude_plan_auto,
+    is_claude_prompting_mode,
 )
 from .tool_actions import tool_input_path, tool_kind_and_title
 
@@ -230,6 +236,433 @@ _OUTLINE_MIN_CHARS = 200
 _PENDING_ASK_REQUESTS: dict[str, tuple[int, str]] = {}
 
 
+# #776: stdin writes now come from several tasks (the reader's drains, the
+# control-response path, follow-up injection, the live-session lifecycle's
+# close), so every writer serialises on a per-pipe lock. Keyed weakly on the
+# stream object itself so the entry dies with the process's pipe.
+_STDIN_LOCKS: weakref.WeakKeyDictionary[Any, anyio.Lock] = weakref.WeakKeyDictionary()
+
+
+def _stdin_lock(stdin: Any) -> anyio.Lock | None:
+    try:
+        lock = _STDIN_LOCKS.get(stdin)
+        if lock is None:
+            lock = anyio.Lock()
+            _STDIN_LOCKS[stdin] = lock
+        return lock
+    except TypeError:  # not weak-referenceable (exotic test doubles)
+        return None
+
+
+async def _locked_send(stdin: Any, data: bytes) -> None:
+    lock = _stdin_lock(stdin)
+    if lock is None:
+        await stdin.send(data)
+        return
+    async with lock:
+        await stdin.send(data)
+
+
+async def write_user_message(session_id: str, text: str, *, command_uuid: str) -> bool:
+    """Write a user turn into the live Claude process that owns ``session_id``.
+
+    #776: the stream-json input shape is the one ``stdin_payload`` sends at
+    spawn, plus ``uuid`` — the CLI echoes it back as
+    ``command_lifecycle.command_uuid`` (F7), which is how the next turn is
+    attributed to this message. Written while the session is idle the CLI
+    runs it as its own turn (F6); written mid-turn it is folded into the
+    running turn (F5 — steer semantics, rc12), so callers decide *when*.
+    Returns False when there is no live stdin or the pipe is closed.
+    """
+    stdin = _SESSION_STDIN.get(session_id)
+    if stdin is None:
+        return False
+    state = _SESSION_BG_STATE.get(session_id)
+    if state is not None:
+        # Record before writing: command_lifecycle can race the send.
+        state.injected_commands[command_uuid] = time.monotonic()
+        state.awaiting_injected[command_uuid] = time.monotonic()
+    payload = {
+        "type": "user",
+        "uuid": command_uuid,
+        "session_id": session_id,
+        "message": {"role": "user", "content": text},
+        "parent_tool_use_id": None,
+    }
+    try:
+        await _locked_send(stdin, (json.dumps(payload) + "\n").encode())
+    except (OSError, anyio.ClosedResourceError, anyio.BrokenResourceError) as exc:
+        if state is not None:
+            state.injected_commands.pop(command_uuid, None)
+            state.awaiting_injected.pop(command_uuid, None)
+        logger.warning(
+            "claude.live_session.write_failed",
+            session_id=session_id,
+            command_uuid=command_uuid,
+            error_type=exc.__class__.__name__,
+        )
+        return False
+    logger.info(
+        "claude.live_session.user_message_written",
+        session_id=session_id,
+        command_uuid=command_uuid,
+        text_len=len(text),
+    )
+    return True
+
+
+@dataclass(slots=True)
+class LiveSession:
+    """A Claude process kept live after its reply (#776).
+
+    The session is *accepting input* until the lifecycle (or /cancel, /new,
+    drain) starts closing it; ``lock`` serialises that transition against
+    follow-up injection so a message can never be written into a pipe that is
+    about to close (the #775 race guard, built here).
+    """
+
+    session_id: str
+    state: ClaudeStreamState
+    stdin: Any
+    pid: int | None = None
+    lock: anyio.Lock = field(default_factory=anyio.Lock)
+    spawned_at: float = field(default_factory=time.monotonic)
+    idle_since: float | None = None
+    hold_started: float | None = None
+    had_live_work: bool = False
+    closing: bool = False
+    close_reason: str | None = None
+    # #791: set when Untether closed stdin on an idle session (turn closed,
+    # no injected line pending) with no live background work — the
+    # transcript is complete, so a close that overruns its grace must not
+    # quarantine it.
+    closed_idle_clean: bool = False
+    # #775: the steer window. Set (under ``lock``) when /cancel or /new
+    # interrupts an active turn — the process is about to be killed, so a
+    # steer must fall back to the queue path instead of being written into a
+    # pipe nobody will answer. Closing stdin (``closing``) shuts it too.
+    steer_closed: bool = False
+    steer_closed_reason: str | None = None
+    listeners: list[Callable[[str, dict[str, Any]], Any]] = field(default_factory=list)
+
+    @property
+    def idle(self) -> bool:
+        return self.state.completed_turns > 0 and not self.state.turn_open
+
+    @property
+    def accepting_input(self) -> bool:
+        return not self.closing
+
+    @property
+    def accepting_steer(self) -> bool:
+        return not self.closing and not self.steer_closed
+
+
+_LIVE_SESSIONS: dict[str, LiveSession] = {}
+
+
+def get_live_session(session_id: str) -> LiveSession | None:
+    return _LIVE_SESSIONS.get(session_id)
+
+
+def is_session_accepting(session_id: str) -> bool:
+    """True when ``session_id`` has a live Claude process whose stdin is open
+    and not closing — i.e. a follow-up can be written into it (#776)."""
+    live = _LIVE_SESSIONS.get(session_id)
+    return live is not None and live.accepting_input
+
+
+def add_live_session_listener(
+    session_id: str, callback: Callable[[str, dict[str, Any]], Any]
+) -> bool:
+    """Subscribe to lifecycle notices (``"closing"``) for a live session.
+
+    Callbacks may be sync or async; exceptions are logged and swallowed."""
+    live = _LIVE_SESSIONS.get(session_id)
+    if live is None:
+        return False
+    live.listeners.append(callback)
+    return True
+
+
+def live_task_descriptions(state: ClaudeStreamState) -> list[str]:
+    return [
+        task.description or task.task_type or "task"
+        for task in _live_native_tasks(state)
+    ]
+
+
+async def _notify_live_listeners(
+    live: LiveSession, kind: str, payload: dict[str, Any]
+) -> None:
+    for callback in list(live.listeners):
+        try:
+            result = callback(kind, payload)
+            if hasattr(result, "__await__"):
+                await result
+        except Exception:  # noqa: BLE001 — a listener must never break teardown
+            logger.warning(
+                "claude.live_session.listener_failed",
+                session_id=live.session_id,
+                kind=kind,
+                exc_info=True,
+            )
+
+
+async def close_live_session(
+    session_id: str,
+    reason: str,
+    *,
+    notice: bool = False,
+    only_if_idle: bool = False,
+) -> bool:
+    """Gracefully close a live session's stdin (#776).
+
+    The CLI then stops any live background task (recording the stop in the
+    transcript, F3) and exits rc=0 — no SIGTERM, no quarantine. Idempotent;
+    returns False when there is nothing (left) to close. With ``notice``
+    listeners get a ``"closing"`` event naming the tasks being stopped.
+    """
+    live = _LIVE_SESSIONS.get(session_id)
+    if live is None:
+        return False
+    async with live.lock:
+        if live.closing:
+            return False
+        if only_if_idle and (not live.idle or live.state.awaiting_injected):
+            # A follow-up was written (or a turn opened) since the caller
+            # decided to close — re-checked under the injection lock
+            # (review finding, #776).
+            return False
+        live.closing = True
+        live.close_reason = reason
+        live.state.live_close_reason = reason
+        live.closed_idle_clean = _is_clean_idle(live)
+    tasks = live_task_descriptions(live.state)
+    logger.info(
+        "claude.live_session.stdin_closed",
+        session_id=session_id,
+        reason=reason,
+        live_tasks=len(tasks),
+        turn=live.state.turn,
+        age_s=round(time.monotonic() - live.spawned_at, 1),
+    )
+    if notice:
+        await _notify_live_listeners(
+            live, "closing", {"reason": reason, "tasks": tasks}
+        )
+    lock = _stdin_lock(live.stdin)
+    with contextlib.suppress(Exception):
+        if lock is None:
+            await live.stdin.aclose()
+        else:
+            async with lock:
+                await live.stdin.aclose()
+    return True
+
+
+def _is_clean_idle(live: LiveSession) -> bool:
+    """#791: the session sits between turns with nothing live or pending —
+    its last turn's transcript is complete (no dangling tool_use for a
+    SIGTERM to strand, the #632 concern)."""
+    state = live.state
+    return (
+        live.idle
+        and not state.awaiting_injected
+        and not _live_native_tasks(state)
+        and not has_live_background_work(state)
+    )
+
+
+def _close_grace_diag(pid: int, start: Any) -> dict[str, Any]:
+    """#791: a structured process snapshot for a live close that overran its
+    grace — what the CLI was doing when Untether had to signal it."""
+    from ..utils.proc_diag import (
+        collect_proc_diag,
+        describe_process,
+        format_diag,
+        is_cpu_active,
+        is_tree_cpu_active,
+        read_wchan,
+    )
+
+    fields: dict[str, Any] = {}
+    try:
+        diag = collect_proc_diag(pid)
+        if diag is None:
+            return {"diag": None}
+        fields["diag"] = format_diag(diag)
+        fields["process_state"] = diag.state
+        fields["wchan"] = read_wchan(pid)
+        fields["rss_kb"] = diag.rss_kb
+        fields["threads"] = diag.threads
+        fields["fd_count"] = diag.fd_count
+        fields["tcp_established"] = diag.tcp_established
+        fields["tcp_total"] = diag.tcp_total
+        # CPU across the whole grace window: busy (flushing / shutting MCP
+        # servers down) vs. blocked.
+        fields["cpu_active_during_grace"] = is_cpu_active(start, diag)
+        fields["tree_cpu_active_during_grace"] = is_tree_cpu_active(start, diag)
+        fields["children"] = [
+            {
+                "pid": child,
+                "wchan": read_wchan(child),
+                "cmd": describe_process(child),
+            }
+            for child in diag.child_pids[:12]
+        ]
+        fields["child_count"] = len(diag.child_pids)
+    except Exception:  # noqa: BLE001 — diagnostics must never break teardown
+        logger.debug("claude.live_session.close_diag_failed", exc_info=True)
+    return fields
+
+
+_INJECTED_TURN_TIMEOUT_S = 120.0
+
+
+def _awaiting_injected(state: ClaudeStreamState) -> bool:
+    """True while an injected follow-up hasn't started its turn yet. Entries
+    expire (logged) so a line the CLI never picked up can't pin the session."""
+    if not state.awaiting_injected:
+        return False
+    now = time.monotonic()
+    for command_uuid, written_at in list(state.awaiting_injected.items()):
+        if now - written_at > _INJECTED_TURN_TIMEOUT_S:
+            state.awaiting_injected.pop(command_uuid, None)
+            logger.warning(
+                "claude.live_session.injected_turn_timeout",
+                command_uuid=command_uuid,
+                waited_s=round(now - written_at, 1),
+            )
+    return bool(state.awaiting_injected)
+
+
+async def inject_when_idle(
+    session_id: str,
+    text: str,
+    *,
+    command_uuid: str,
+    poll_s: float = 0.2,
+) -> bool:
+    """Queue-semantics follow-up (#776 phase 06): wait until the live session
+    is idle — its turn ended and no earlier injected line is still waiting to
+    start — then write ``text`` as a new turn. Returns False (caller falls
+    back to --resume) if the session is gone or starts closing first.
+
+    Writing mid-turn would fold the message into the running turn (probe F5
+    — that is #775's *steer*), which is why this waits.
+    """
+    while True:
+        live = _LIVE_SESSIONS.get(session_id)
+        if live is None or not live.accepting_input:
+            return False
+        if live.idle and not _awaiting_injected(live.state):
+            async with live.lock:
+                if not live.accepting_input:
+                    return False
+                if live.idle and not live.state.awaiting_injected:
+                    ok = await write_user_message(
+                        session_id, text, command_uuid=command_uuid
+                    )
+                    if ok:
+                        live.idle_since = time.monotonic()
+                    return ok
+        await anyio.sleep(poll_s)
+
+
+# ``steered``: written while a turn was open (folded into it, or run as the
+# next turn if it arrived after the last tool call). ``written_idle``: the
+# session sat between turns, so the line simply runs as the next turn — an
+# ordinary follow-up, nothing was steered.
+SteerOutcome = Literal[
+    "steered",
+    "written_idle",
+    "no_live_session",
+    "window_closed",
+    "options_changed",
+    "write_failed",
+]
+
+_UNSET_OPTIONS: Any = object()
+
+
+async def close_steer_window(session_id: str, reason: str) -> bool:
+    """Stop accepting steers into ``session_id`` (#775 race guard).
+
+    Taken under ``LiveSession.lock`` — the same lock :func:`steer_into_session`
+    holds while it checks the window and writes — so a steer either lands
+    before this returns or sees the window closed and falls back to the queue
+    path. Idempotent; False when there is no live session.
+    """
+    live = _LIVE_SESSIONS.get(session_id)
+    if live is None:
+        return False
+    async with live.lock:
+        if live.steer_closed:
+            return True
+        live.steer_closed = True
+        live.steer_closed_reason = reason
+    logger.info(
+        "claude.live_session.steer_window_closed", session_id=session_id, reason=reason
+    )
+    return True
+
+
+async def steer_into_session(
+    session_id: str,
+    text: str,
+    *,
+    command_uuid: str,
+    run_options: Any = _UNSET_OPTIONS,
+) -> SteerOutcome:
+    """Steer mode (#775): write ``text`` into the live session *now*.
+
+    Unlike :func:`inject_when_idle` this does not wait for the turn to end:
+    written mid-turn the CLI folds it into the running turn at the next tool
+    boundary (F5; the fold is confirmed by ``command_lifecycle{started}``
+    arriving while the turn is open — see :func:`_absorb_injected`); written
+    after the turn's last tool call or between turns it becomes the next turn
+    in the same process (F6), delivered as a follow-up turn.
+
+    The window check and the write happen under ``LiveSession.lock``, which
+    :func:`close_live_session` and :func:`close_steer_window` also take, so a
+    steer can never be written into a pipe that is closing (no orphan turns).
+    ``run_options``: when given and the session is idle between turns, a
+    mismatch with the options the process was spawned with returns
+    ``options_changed`` — the queue path then restarts it with the new ones.
+    """
+    live = _LIVE_SESSIONS.get(session_id)
+    if live is None:
+        return "no_live_session"
+    async with live.lock:
+        if not live.accepting_steer:
+            return "window_closed"
+        if (
+            run_options is not _UNSET_OPTIONS
+            and live.idle
+            and run_options != live.state.spawn_run_options
+        ):
+            return "options_changed"
+        state = live.state
+        # Record before writing: command_lifecycle can race the send.
+        state.steered_commands[command_uuid] = text
+        ok = await write_user_message(session_id, text, command_uuid=command_uuid)
+        if not ok:
+            state.steered_commands.pop(command_uuid, None)
+            return "write_failed"
+        mid_turn = not live.idle
+        if not mid_turn:
+            live.idle_since = time.monotonic()
+    logger.info(
+        "claude.live_session.steered",
+        session_id=session_id,
+        command_uuid=command_uuid,
+        mid_turn=mid_turn,
+        turn=live.state.turn,
+    )
+    return "steered" if mid_turn else "written_idle"
+
+
 def is_session_alive(session_id: str) -> bool:
     """Return True if a Claude subprocess for ``session_id`` is currently
     running and has an open stdin (registered in :data:`_SESSION_STDIN`).
@@ -254,28 +687,10 @@ def session_live_bg_count(session_id: str) -> int:
     diverting to a fresh contextless session after the base 30 s timeout.
     """
     state = _SESSION_BG_STATE.get(session_id)
-    if state is None or not has_live_background_work(state):
+    if state is None:
         return 0
-    count = (
-        _live_bg_agent_count(state)
-        + _live_bounded_handle_count(state.live_bg_bashes, state.bg_bash_deadlines)
-        + _live_bounded_handle_count(
-            state.live_remote_triggers, state.remote_trigger_deadlines
-        )
-        + sum(
-            1
-            for deadline in state.live_monitors.values()
-            if deadline == 0.0 or deadline > time.monotonic()
-        )
-        + sum(
-            1
-            for deadline in state.live_wakeups.values()
-            if deadline == 0.0 or deadline > time.monotonic()
-        )
-    )
-    # has_live_background_work() was True, so never report fewer than 1 even
-    # if the individual counts race to zero between the two reads.
-    return max(1, count)
+    watchers, bg_tasks = _live_background_counts(state)
+    return watchers + bg_tasks
 
 
 def session_linger_info(session_id: str) -> tuple[bool, int] | None:
@@ -463,6 +878,80 @@ _DISCUSS_ESCALATION_MESSAGE = (
 )
 
 
+# #776: task statuses that keep a native background task live. Anything else
+# reported by ``task_updated.patch.status`` / ``task_notification.status``
+# (completed, killed, stopped, failed, ...) is terminal — ending on an unknown
+# status is the safe direction, because the ``background_tasks_changed``
+# snapshot would otherwise be the only backstop against a pinned session.
+_TASK_LIVE_STATUSES = frozenset({"running", "pending"})
+
+# #801: a snapshot is a provisional signal next to the authoritative
+# task_started / task_updated. Within this window of an end (or a revival) a
+# snapshot that disagrees is taken to straddle those events, not to revive
+# (or re-end) the task: it can neither pin a just-finished task open nor end
+# a just-resumed one. task_started / task_updated always apply at once.
+_TASK_REVIVE_GRACE_S = 5.0
+
+
+@dataclass(slots=True)
+class ClaudeTask:
+    """One entry of the native task map, keyed by the CLI's ``task_id`` (#776).
+
+    Built from ``system/task_*`` events (verified on CLI 2.1.283). The CLI's
+    own lifecycle replaces the tool_use/tool_result guesses for Monitor,
+    background Bash and background Agent work.
+    """
+
+    task_id: str
+    task_type: str | None = None
+    tool_use_id: str | None = None
+    description: str | None = None
+    subagent_type: str | None = None
+    is_backgrounded: bool = False
+    owned_by_subagent: bool = False
+    status: str = "running"
+    started_at: float = field(default_factory=time.monotonic)
+    ended_at: float | None = None
+    last_usage: dict[str, Any] | None = None
+    last_tool_name: str | None = None
+    # #801: times this task_id came back after ending — Claude resuming a
+    # finished agent (SendMessage) reuses its id. ``started_at`` is reset to
+    # the latest revival, so ``started_at``/``ended_at`` describe the current
+    # run only.
+    revived_count: int = 0
+    # #777: the agent's current step from ``task_progress.description``
+    # ("Running <step>") — kept apart from ``description`` (the task's label).
+    last_step: str | None = None
+    # #795: the live-session turn the task was launched in (1 = the run's
+    # own prompt), so its wake turn can reply to the message that asked.
+    origin_turn: int | None = None
+    # #777: for a subagent's own task, the ``tool_use_id`` of the Agent call
+    # that spawned the subagent (from the subagent's tool_use
+    # ``parent_tool_use_id``) — the status panel only lists such a task on
+    # its own once that agent is gone. None = unknown.
+    owner_tool_use_id: str | None = None
+
+    @property
+    def is_live_background(self) -> bool:
+        """A live background task the parent session launched itself — the
+        ones the parent's ``background_tasks_changed`` snapshot lists and
+        wake turns are attributed to (#785)."""
+        return (
+            self.is_backgrounded
+            and not self.owned_by_subagent
+            and self.status in _TASK_LIVE_STATUSES
+        )
+
+    @property
+    def holds_session(self) -> bool:
+        """#801: live background work the live session must stay open for,
+        whoever launched it. A subagent's backgrounded task (``Bash
+        run_in_background`` inside an agent) outlives the agent that started
+        it; closing stdin under it kills it. A subagent's foreground tools
+        (``is_backgrounded=False``) die with the subagent and don't count."""
+        return self.is_backgrounded and self.status in _TASK_LIVE_STATUSES
+
+
 @dataclass(slots=True)
 class ClaudeStreamState:
     factory: EventFactory = field(default_factory=lambda: EventFactory(ENGINE))
@@ -488,26 +977,61 @@ class ClaudeStreamState:
     # Auto-approve ExitPlanMode when permission_mode is `plan-auto` (#741;
     # spelled `auto` before 0.35.5rc8)
     auto_approve_exit_plan_mode: bool = False
+    # #749 the run's permission mode promises the user a prompt, so every
+    # stage-6 `can_use_tool` request routes to Telegram instead of being
+    # blanket-approved.  Armed in `new_state()` from
+    # `is_claude_prompting_mode`.  Default False keeps the legacy `-p` path
+    # (no control channel, no requests) and every autonomous mode unchanged.
+    prompting_mode: bool = False
     # Whether this run is a resume (for error diagnostics)
     resumed: bool = False
     # Track max text block length seen (for cooldown bypass — survives overwrites)
     max_text_len_since_cooldown: int = 0
     # Store outline text for embedding in synthetic approve/deny action
     outline_text: str | None = None
-    # #508 ExitPlanMode plan body — captured from the tool_use input on
-    # every ExitPlanMode call so the bridge can re-emit it as part of the
-    # final answer when the post-approval result is brief or empty
-    # (research/audit tasks where Claude has nothing left to say after
-    # the user approves).  Plan messages on Telegram are deleted on
-    # approve, so this is the only path to retain the body.
+    # #508 ExitPlanMode plan body the user APPROVED in this turn, re-emitted
+    # as "📋 Plan (approved)" in the final answer when the post-approval
+    # result is brief or empty (research/audit tasks where Claude has nothing
+    # left to say after the user approves).  Plan messages on Telegram are
+    # deleted on approve, so this is the only path to retain the body.
+    # #793: set only when a request is approved — never from a denied one.
     last_exitplanmode_plan: str | None = None
+    # #793: ExitPlanMode ``input.plan`` per control request awaiting a
+    # decision (request_id -> input, "" when absent). Resolved to the plan
+    # body at decision time — see ``_resolve_exitplanmode_plan``.
+    exitplanmode_plans: dict[str, str] = field(default_factory=dict)
+    # #793: plan bodies the user explicitly rejected (❌ Deny) in this
+    # process — only consulted when the body had to come from the
+    # (possibly stale) ``input.plan`` fallback.
+    rejected_exitplanmode_plans: set[str] = field(default_factory=set)
+    # #793: the plan file (``…/.claude/plans/*.md``) this session writes, and
+    # its content when the last write was a full ``Write``. The plan file is
+    # the source of truth: on plan-file CLIs ExitPlanMode's ``input.plan``
+    # lags it by one write when both are issued in the same message.
+    plan_file_path: str | None = None
+    plan_file_content: str | None = None
     # Cumulative seconds the session spent in Anthropic-side rate-limit waits (#349).
-    # Sum of every rate_limit_event's retry_after_ms, so the cost footer can annotate
-    # "(incl. Xm Ys rate-limited)" when a run finishes after one or more throttles.
+    # #790: only *throttling* events accrue (a `rejected` snapshot, or the
+    # legacy retry_after_ms/reset-ts shape) — `allowed` heartbeats never do.
+    # Repeats against one deadline accrue only the extension.
     rate_limit_total_s: float = 0.0
-    # Count of rate_limit_event emissions in this session — feeds a unit-test hook
-    # and future /stats surfacing (#349 v2).
+    # Count of throttling rate_limit_events in this session (#349 v2); `allowed`
+    # / `allowed_warning` snapshots and bare events are not counted (#790).
     rate_limit_count: int = 0
+    # #790: latest quota snapshot from any rate_limit_event — `status` plus the
+    # per-window {utilization, resets_at} from `unifiedWindows`, keyed by
+    # window name (five_hour / seven_day / seven_day_overage_included).
+    # Stashed for the subscription footer / #692 work; nothing reads it for
+    # throttle decisions.
+    rate_limit_status: str | None = None
+    rate_limit_windows: dict[str, dict[str, float | None]] = field(default_factory=dict)
+    # #790: (rate_limit_type, resets_at) pairs already announced by an
+    # `allowed_warning` note — one heads-up per window, not one per snapshot.
+    rate_limit_warned: set[tuple[str | None, float | None]] = field(default_factory=set)
+    # #790: the throttle note for the current deadline, so repeated
+    # `rejected` snapshots for one window update it in place.
+    rate_limit_action_id: str | None = None
+    rate_limit_action_deadline: float = 0.0
 
     # #347 per-session background-task tracking. Claude Code v2.1.72+ has
     # primitives that arm long-running work and return the subprocess to
@@ -528,6 +1052,77 @@ class ClaudeStreamState:
     live_bg_agents: set[str] = field(default_factory=set)
     live_wakeups: dict[str, float] = field(default_factory=dict)
     live_remote_triggers: set[str] = field(default_factory=set)
+
+    # #776: native task map from ``system/task_*`` events, keyed by task_id.
+    # ``native_tasks_seen`` flips on the first such event; from then on the
+    # map is authoritative for Monitor / Bash-bg / Agent-bg liveness and the
+    # tool_use handles above only matter for ScheduleWakeup / RemoteTrigger,
+    # which emit no task events (F9). Before that (older CLI) the legacy
+    # handles decide, unchanged.
+    tasks: dict[str, ClaudeTask] = field(default_factory=dict)
+    native_tasks_seen: bool = False
+    # #777: subagent tool_use id -> the parent Agent's tool_use id (from
+    # ``parent_tool_use_id``), linking a subagent-owned task to its agent.
+    tool_parents: dict[str, str] = field(default_factory=dict)
+
+    # #776 live-session turn segmentation. ``live_mode`` is armed by
+    # ``ClaudeRunner.run_impl`` in control-channel mode (kill switch
+    # ``[watchdog] live_sessions``). Turn 1 is the run itself; after its
+    # result every later turn is bracketed by TurnEvent(started/completed).
+    live_mode: bool = False
+    completed_turns: int = 0
+    turn: int = 1
+    turn_open: bool = True
+    turn_reason: str = "unknown"
+    turn_command_uuid: str | None = None
+    # Hints collected while idle, consumed when the next turn opens.
+    pending_command_uuid: str | None = None
+    turn_notifications: list[str] = field(default_factory=list)
+    # #785: task ids behind ``turn_notifications`` (a notification for a task
+    # the map doesn't know contributes a label but no id).
+    turn_notification_ids: list[str] = field(default_factory=list)
+    # #785: the open turn's TurnEvent detail, re-sent on its completion.
+    turn_detail: dict[str, Any] = field(default_factory=dict)
+    # #785: top-level background tasks that ended while an ``unknown`` turn
+    # was open — the CLI starts the wake turn on an agent's result before any
+    # task event names it, so the turn is attributed at its completion.
+    turn_ended_tasks: list[tuple[str, str]] = field(default_factory=list)
+    # #785: tasks whose finish a wake turn already delivered; a later turn
+    # opened only by their notification is the same finish, not news.
+    announced_task_ids: set[str] = field(default_factory=set)
+    # #785: when the last wake turn completed still ``unknown``; a task
+    # ending within ``_WAKE_PAIR_WINDOW_S`` after it is paired with it.
+    unattributed_turn_completed_at: float | None = None
+    # uuid -> monotonic write time for user lines Untether injected (#776).
+    injected_commands: dict[str, float] = field(default_factory=dict)
+    # Injected lines whose turn hasn't opened yet: the lifecycle must not
+    # close stdin under them, and the next queued follow-up waits for them.
+    awaiting_injected: dict[str, float] = field(default_factory=dict)
+    # #775: uuid -> text of lines written in steer mode (a subset of
+    # ``injected_commands``), used to label the "steer received" row.
+    steered_commands: dict[str, str] = field(default_factory=dict)
+    # #775: injected lines the CLI folded into an already-open turn.
+    absorbed_commands: set[str] = field(default_factory=set)
+    # #776 resume guard (F11): the stopped-task replay + 0-turn result that
+    # precede the real answer on --resume of a session whose previous
+    # process ended with live background work.
+    saw_assistant_output: bool = False
+    stopped_notification_pre_output: bool = False
+    absorbed_results: int = 0
+    absorbed_cost_baseline: float | None = None
+    live_session_max_s: float = 14400.0
+    # #776: the per-chat run options this process was spawned with (CLI
+    # flags + runtime toggles). A follow-up is only written into the live
+    # process when the chat's current options still match.
+    spawn_run_options: Any = None
+    # #776: a ScheduleWakeup the CLI will fire itself while stdin stays open
+    # (F9). Monotonic deadline = announced fire time + 60 s grace; the
+    # tool_use handle is cleared by its own confirmation tool_result, so it
+    # can't be what holds the session.
+    pending_wakeup_until: float | None = None
+    # #776: why the live session's stdin was closed (idle_no_tasks /
+    # max_hold / abs_cap / cancel / new / drain); None while still open.
+    live_close_reason: str | None = None
 
     # #374 (rc7): deadline map paralleling `live_bg_agents`. Kept as a
     # separate dict (rather than converting `live_bg_agents` to
@@ -686,6 +1281,19 @@ class ClaudeStreamState:
     # window" as an expected wait, not a stall. ``0.0`` = not throttled.
     rate_limit_wait_until: float = 0.0
 
+    # #792: ``system/api_retry`` back-off tracking. ``api_retry_wait_until``
+    # is a monotonic deadline (retry delay, plus the retry's first-byte
+    # window when ``no_response`` is present) read by awaiting_api_retry().
+    # Kept apart from the rate-limit fields: a 529/5xx back-off is not a
+    # quota throttle, and conflating them would skew rate_limit_total_s.
+    api_retry_wait_until: float = 0.0
+    api_retry_count: int = 0
+    api_retry_total_s: float = 0.0
+    # One updating note per retry sequence: the action id is reused until
+    # the attempt counter goes backwards (a new sequence).
+    api_retry_action_id: str | None = None
+    api_retry_last_attempt: int = 0
+
     # #572: set when the run's StreamResultMessage was a Stream-idle-timeout
     # failure — "type_a" (mid-generation stall, retryable) or "type_b"
     # (cold-start zero-byte stall, never retried). runner_bridge reads this
@@ -712,15 +1320,49 @@ class ClaudeStreamState:
         """True while Claude is inside an upstream rate-limit retry window."""
         return self.rate_limit_wait_until > time.monotonic()
 
+    def awaiting_api_retry(self) -> bool:
+        """#792: True while the CLI is backing off before retrying a failed
+        API call (``system/api_retry``). Probed by the bridge's stall
+        monitor via engine_state duck-typing, like
+        :meth:`awaiting_rate_limit_retry` — silence here is expected."""
+        return self.api_retry_wait_until > time.monotonic()
 
-# #657: conservative wait window latched when a `rate_limit_event` arrives with
-# no parseable timing at all (no `retry_after_ms`, no reset timestamps). Upstream
-# throttles are rarely sub-second, and without *some* deadline
-# `awaiting_rate_limit_retry()` reports False while the session genuinely is
-# waiting on upstream — making a throttled-but-healthy session indistinguishable
-# from a hung one. 60s is well under every stall threshold (600s+), so a wrong
-# guess can only delay a stall verdict, never mask one.
-DEFAULT_BARE_RATE_LIMIT_WAIT_S = 60.0
+
+# #657 → #790: conservative wait window latched when a *confirmed* rejection
+# (`status: "rejected"`) arrives with no parseable timing at all — no
+# `resetsAt`, no legacy `retry_after_ms` / reset timestamps, no harvested
+# #692 reset. Without *some* deadline `awaiting_rate_limit_retry()` reports
+# False while the session genuinely is waiting on upstream. 60s is well under
+# every stall threshold (600s+), so a wrong guess can only delay a stall
+# verdict, never mask one.
+#
+# #657 applied this to *bare* events (no status, no timing). That premise was
+# a schema-mismatch artefact: the real status snapshot decoded to all-None,
+# so every healthy `allowed` heartbeat faked a 60s throttle. Bare events no
+# longer latch anything (#790).
+DEFAULT_REJECTED_RATE_LIMIT_WAIT_S = 60.0
+
+# #790: a `rejected` window can reset days away (seven_day*). The stall latch
+# is clamped so one snapshot can't park the stall detector for a week; the
+# on-screen wait still shows the true time.
+MAX_RATE_LIMIT_LATCH_S = 24 * 3600.0
+
+# #790: upstream suppresses `allowed_warning` below ~70% utilization; mirror
+# that so the one-shot heads-up note only fires when it means something.
+RATE_LIMIT_WARNING_UTILIZATION = 0.7
+
+# #790: unknown `rate_limit_info.status` values already warned about, so a new
+# upstream enum member is surfaced once per process rather than per event.
+_UNKNOWN_RATE_LIMIT_STATUSES_LOGGED: set[str] = set()
+
+_RATE_LIMIT_WINDOW_LABELS: dict[str, str] = {
+    "five_hour": "5h",
+    "seven_day": "7-day",
+    "seven_day_opus": "7-day Opus",
+    "seven_day_sonnet": "7-day Sonnet",
+    "seven_day_overage_included": "7-day (incl. extra usage)",
+    "overage": "extra-usage",
+}
 
 # #692: subscription-cap reset deadlines harvested from result-error text
 # ("… resets 5:30pm (Australia/Melbourne)"), keyed by auth namespace
@@ -730,7 +1372,7 @@ _RATE_LIMIT_RESET_LATCH: dict[str, tuple[float, str]] = {}
 
 # Case-insensitive; timezone REQUIRED — without an explicit zone the clock
 # time is unresolvable (containers commonly run UTC while the account does
-# not), so we fail closed to the #657 default rather than guess.
+# not), so we fail closed to the 60s default rather than guess.
 _RESET_CLAUSE_RE = re.compile(
     r"resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*\(([^)]+)\)",
     re.IGNORECASE,
@@ -740,7 +1382,7 @@ _RESET_CLAUSE_RE = re.compile(
 # #701: the OTHER cap class — "You've reached your Fable 5 limit. Run
 # /usage-credits to continue or switch models with /model." carries no time at
 # all, so #692's result_error tier has nothing to harvest and every subsequent
-# bare event falls through to the #657 60s default. Showing "~60s" for a cap
+# rejection without a reset fell through to the 60s default. Showing "~60s" for a cap
 # whose remedy is an action (not a wait) is not merely inaccurate — it is the
 # wrong *kind* of answer, and the user waits instead of acting.
 #
@@ -756,7 +1398,7 @@ ACTION_REQUIRED_LATCH_TTL_S = 30 * 60.0
 
 # Both halves required: the "reached your <X> limit" phrasing alone also appears
 # on time-based caps, and it's the /usage-credits | /model remedy that marks this
-# as the action-required class. Fail closed to #657 when either is absent.
+# as the action-required class. Fail closed to the 60s default when either is absent.
 _ACTION_CAP_RE = re.compile(
     r"reached\s+your\s+(?P<model>[\w.\- ]{1,40}?)\s+limit",
     re.IGNORECASE,
@@ -822,7 +1464,8 @@ def _maybe_latch_rate_limit_reset(
     result_text: str | None, *, state: ClaudeStreamState
 ) -> None:
     """#692: harvest the reset clause from a result error and latch it for
-    subsequent bare rate_limit_events (this run and the next ones in the
+    subsequent `rejected` rate_limit_events that carry no `resetsAt` of
+    their own (#790; this run and the next ones in the
     same process/auth namespace)."""
     parsed = _parse_rate_limit_reset_clause(result_text)
     if parsed is None:
@@ -831,7 +1474,7 @@ def _maybe_latch_rate_limit_reset(
     deadline = time.monotonic() + wait_s
     _RATE_LIMIT_RESET_LATCH[_rate_limit_latch_key()] = (deadline, display)
     # Keep the stall detector's "throttled upstream, not hung" context alive
-    # for the whole window, not just 60s past the last bare event.
+    # for the whole window, not just 60s past the last rate_limit_event.
     state.rate_limit_wait_until = max(state.rate_limit_wait_until, deadline)
     logger.info(
         "claude.rate_limit_reset_latched",
@@ -861,7 +1504,7 @@ def _parse_action_required_cap(text: str | None) -> str | None:
     ("Fable 5"), or "" when the remedy is present but no model is named.
 
     ``None`` means "not this cap class" — the caller falls through to the
-    #657 default rather than claiming an action is required.
+    60s default rather than claiming an action is required.
     """
     if not text or _ACTION_REMEDY_RE.search(text) is None:
         return None
@@ -873,7 +1516,8 @@ def _parse_action_required_cap(text: str | None) -> str | None:
 
 def _maybe_latch_action_required(result_text: str | None) -> None:
     """#701: arm the action-required latch from a result error so subsequent
-    bare rate_limit_events render the remedy instead of a countdown."""
+    `rejected` rate_limit_events without a `resetsAt` render the remedy
+    instead of a countdown (#790)."""
     model = _parse_action_required_cap(result_text)
     if model is None:
         return
@@ -924,6 +1568,76 @@ def _format_wait_approx(seconds: float) -> str:
     return f"~{hours}h {rem}m" if rem else f"~{hours}h"
 
 
+def _format_reset_clock(epoch_s: float) -> str:
+    """#790: render a `resetsAt` epoch as host-local wall-clock time —
+    "17:30 AEST" today, "Wed 17:30 AEST" on another day. The zone
+    abbreviation stays so a UTC-configured host can't mislead."""
+    from datetime import datetime
+
+    reset = datetime.fromtimestamp(epoch_s, UTC).astimezone()
+    now = datetime.now(UTC).astimezone()
+    clock = reset.strftime("%H:%M")
+    zone = reset.strftime("%Z")
+    if reset.date() != now.date():
+        clock = f"{reset.strftime('%a')} {clock}"
+    return f"{clock} {zone}".strip()
+
+
+def _rate_limit_window_label(rate_limit_type: str | None) -> str:
+    if not rate_limit_type:
+        return "Usage"
+    return _RATE_LIMIT_WINDOW_LABELS.get(rate_limit_type, rate_limit_type)
+
+
+def _rate_limit_utilization(info: claude_schema.RateLimitInfo) -> float | None:
+    """Utilization for the snapshot's own window: the top-level field when
+    present, else the matching `unifiedWindows` entry."""
+    if info.utilization is not None:
+        return info.utilization
+    windows = info.unified_windows
+    if windows is None or not info.rate_limit_type:
+        return None
+    window = getattr(windows, info.rate_limit_type, None)
+    if isinstance(window, claude_schema.RateLimitWindow):
+        return window.utilization
+    return None
+
+
+def _stash_rate_limit_snapshot(
+    info: claude_schema.RateLimitInfo, state: ClaudeStreamState
+) -> None:
+    """#790: keep the latest quota snapshot on the state (footer / #692)."""
+    state.rate_limit_status = info.status
+    windows = info.unified_windows
+    if windows is None:
+        return
+    for name in ("five_hour", "seven_day", "seven_day_overage_included"):
+        window = getattr(windows, name, None)
+        if window is not None:
+            state.rate_limit_windows[name] = {
+                "utilization": window.utilization,
+                "resets_at": window.resets_at,
+            }
+
+
+def _rejection_needs_action(info: claude_schema.RateLimitInfo) -> bool:
+    """#790 + #701: a rejection with no reset time whose remedy is an action
+    (buy credits / switch model) rather than a wait."""
+    return (
+        info.error_code == "credits_required"
+        or info.rate_limit_type == "overage"
+        or info.overage_disabled_reason == "out_of_credits"
+    )
+
+
+def _has_legacy_rate_limit_timing(info: claude_schema.RateLimitInfo | None) -> bool:
+    return info is not None and (
+        info.retry_after_ms is not None
+        or bool(info.requests_reset)
+        or bool(info.tokens_reset)
+    )
+
+
 def _derive_retry_after_s(info: claude_schema.RateLimitInfo | None) -> float | None:
     """#518: when `rate_limit_event` omits `retry_after_ms`, fall back to the
     earlier of `requests_reset` / `tokens_reset` ISO timestamps.
@@ -961,6 +1675,393 @@ def _derive_retry_after_s(info: claude_schema.RateLimitInfo | None) -> float | N
     return min(candidates)
 
 
+def _legacy_retry_after(
+    info: claude_schema.RateLimitInfo | None,
+) -> tuple[float, str] | None:
+    """#349/#518 timing from the legacy shape: explicit ``retry_after_ms``
+    first, then the earlier of the ISO reset timestamps."""
+    if info is None:
+        return None
+    if info.retry_after_ms is not None:
+        return info.retry_after_ms / 1000.0, "retry_after_ms"
+    derived = _derive_retry_after_s(info)
+    if derived is not None:
+        return derived, "reset_ts"
+    return None
+
+
+def _rate_limit_note(
+    factory: EventFactory,
+    *,
+    action_id: str,
+    title: str,
+    detail: dict[str, Any],
+) -> list[UntetherEvent]:
+    return [
+        factory.action_started(
+            action_id=action_id, kind="note", title=title, detail=detail
+        ),
+        factory.action_completed(
+            action_id=action_id,
+            kind="note",
+            title=title,
+            ok=True,
+            level="info",
+            detail=detail,
+        ),
+    ]
+
+
+def _rate_limit_log_fields(info: claude_schema.RateLimitInfo | None) -> dict[str, Any]:
+    """Structured fields for ``claude.rate_limit_*`` logs (#518: log what
+    upstream actually sent, not a back-inferred summary)."""
+    if info is None:
+        return {"status": None}
+    legacy: dict[str, Any] = {}
+    for field_name in (
+        "requests_limit",
+        "requests_remaining",
+        "requests_reset",
+        "tokens_limit",
+        "tokens_remaining",
+        "tokens_reset",
+        "retry_after_ms",
+    ):
+        value = getattr(info, field_name, None)
+        if value is not None:
+            legacy[field_name] = value
+    return {
+        "status": info.status,
+        "rate_limit_type": info.rate_limit_type,
+        "resets_at": info.resets_at,
+        "utilization": _rate_limit_utilization(info),
+        "overage_status": info.overage_status,
+        "is_using_overage": info.is_using_overage,
+        "error_code": info.error_code,
+        "info": legacy or None,
+    }
+
+
+def _rate_limit_warning_note(
+    info: claude_schema.RateLimitInfo,
+    *,
+    state: ClaudeStreamState,
+    factory: EventFactory,
+) -> list[UntetherEvent]:
+    """#790: `allowed_warning` — a heads-up, never a latch. One note per
+    (window, reset); silent below the upstream ~70% threshold or while paid
+    extra usage covers the overflow (mirrors the CLI's own banner logic,
+    which also warns when utilization is absent)."""
+    utilization = _rate_limit_utilization(info)
+    key = (info.rate_limit_type, info.resets_at)
+    if (
+        info.is_using_overage
+        or (utilization is not None and utilization < RATE_LIMIT_WARNING_UTILIZATION)
+        or key in state.rate_limit_warned
+    ):
+        logger.debug("claude.rate_limit_snapshot", **_rate_limit_log_fields(info))
+        return []
+    state.rate_limit_warned.add(key)
+    label = _rate_limit_window_label(info.rate_limit_type)
+    if utilization is not None:
+        title = f"⚠️ {label} limit {round(utilization * 100)}% used"
+    else:
+        title = f"⚠️ Approaching {label} limit"
+    if info.resets_at is not None and info.resets_at > time.time():
+        title += f" — resets {_format_reset_clock(info.resets_at)}"
+    logger.info("claude.rate_limit_warning", **_rate_limit_log_fields(info))
+    state.note_seq += 1
+    detail: dict[str, Any] = {"status": info.status}
+    if info.rate_limit_type:
+        detail["rate_limit_type"] = info.rate_limit_type
+    if utilization is not None:
+        detail["utilization"] = utilization
+    return _rate_limit_note(
+        factory,
+        action_id=f"rate_limit_warning_{state.note_seq}",
+        title=title,
+        detail=detail,
+    )
+
+
+def _translate_rate_limit_event(
+    info: claude_schema.RateLimitInfo | None,
+    *,
+    state: ClaudeStreamState,
+    factory: EventFactory,
+) -> list[UntetherEvent]:
+    """#349/#518/#692/#701/#790: `rate_limit_event` → throttle note + latch,
+    only when the snapshot says we are actually throttled.
+
+    The real event (CLI 2.1.283) is a quota-status snapshot sent on every
+    API response that moves a rounded utilization or reset. Decision table:
+
+    * ``allowed`` — snapshot only: stash windows, DEBUG log, nothing else.
+    * ``allowed_warning`` — optional one-shot heads-up note, no latch.
+    * ``rejected`` (not covered by overage, reset still ahead) — throttle:
+      latch until ``resetsAt`` (clamped 24h), extension-only accounting.
+      Without ``resetsAt``: legacy timing → action-required remedy
+      (credits_required / overage) → #692 harvested reset → #701 latch →
+      conservative 60s default.
+    * unknown status — WARN once per value, no latch.
+    * no status: legacy ``retry_after_ms`` / reset timestamps keep the #518
+      path; a truly bare event latches nothing (#657's 60s guess retired).
+    """
+    retry_s: float | None = None
+    source = ""
+    reset_display: str | None = None
+    action_display: str | None = None
+    extension_only = False
+
+    if info is None or info.status is None:
+        legacy = _legacy_retry_after(info)
+        if legacy is None:
+            logger.info(
+                "claude.rate_limit_event",
+                retry_after_s=None,
+                retry_after_source="bare",
+                count=state.rate_limit_count,
+                cumulative_s=state.rate_limit_total_s,
+                **_rate_limit_log_fields(info),
+            )
+            return []
+        retry_s, source = legacy
+    else:
+        status = info.status
+        _stash_rate_limit_snapshot(info, state)
+        if status == "allowed":
+            logger.debug("claude.rate_limit_snapshot", **_rate_limit_log_fields(info))
+            return []
+        if status == "allowed_warning":
+            return _rate_limit_warning_note(info, state=state, factory=factory)
+        if status != "rejected":
+            if status not in _UNKNOWN_RATE_LIMIT_STATUSES_LOGGED:
+                _UNKNOWN_RATE_LIMIT_STATUSES_LOGGED.add(status)
+                logger.warning(
+                    "claude.rate_limit_event.unknown_status",
+                    known=list(claude_schema.CLAUDE_RATE_LIMIT_STATUSES),
+                    **_rate_limit_log_fields(info),
+                )
+            return []
+        if info.is_using_overage:
+            # Paid extra usage covers the overflow — nothing is cut off.
+            logger.info(
+                "claude.rate_limit_event",
+                retry_after_s=None,
+                retry_after_source="covered_by_overage",
+                count=state.rate_limit_count,
+                cumulative_s=state.rate_limit_total_s,
+                **_rate_limit_log_fields(info),
+            )
+            return []
+        if info.resets_at is not None:
+            remaining = info.resets_at - time.time()
+            if remaining <= 0:
+                # Upstream treats a rejection whose reset has passed as stale.
+                logger.info(
+                    "claude.rate_limit_event",
+                    retry_after_s=None,
+                    retry_after_source="stale",
+                    count=state.rate_limit_count,
+                    cumulative_s=state.rate_limit_total_s,
+                    **_rate_limit_log_fields(info),
+                )
+                return []
+            # The stream's own reset time is authoritative — it beats the
+            # #692 result-text parse.
+            retry_s = remaining
+            source = "resets_at"
+            reset_display = _format_reset_clock(info.resets_at)
+            extension_only = True
+        elif (legacy := _legacy_retry_after(info)) is not None:
+            retry_s, source = legacy
+        elif _rejection_needs_action(info):
+            # #701 class, flagged by the stream itself: no countdown, but the
+            # stall detector still gets a deadline.
+            retry_s = DEFAULT_REJECTED_RATE_LIMIT_WAIT_S
+            source = "action_required"
+            action_display = _latched_action_required() or ""
+        elif (latched := _latched_rate_limit_reset()) is not None:
+            # #692: a reset deadline harvested from an earlier result error
+            # ("resets 5:30pm (…)") beats guessing.
+            retry_s, reset_display = latched
+            source = "result_error"
+            extension_only = True
+        elif (action_model := _latched_action_required()) is not None:
+            # #701: an action-required cap carries no reset time.
+            retry_s = DEFAULT_REJECTED_RATE_LIMIT_WAIT_S
+            source = "action_required"
+            action_display = action_model
+        else:
+            retry_s = DEFAULT_REJECTED_RATE_LIMIT_WAIT_S
+            source = "default"
+
+    now_mono = time.monotonic()
+    latch_s = min(retry_s, MAX_RATE_LIMIT_LATCH_S)
+    new_deadline = now_mono + latch_s
+    action_id: str | None = None
+    if extension_only:
+        # #692/#790: repeated events sharing ONE deadline accrue only the
+        # extension beyond the existing wait, and update the same note.
+        prev_deadline = max(state.rate_limit_wait_until, now_mono)
+        state.rate_limit_total_s += max(0.0, new_deadline - prev_deadline)
+        if (
+            state.rate_limit_action_id is not None
+            and abs(new_deadline - state.rate_limit_action_deadline) < 5.0
+        ):
+            action_id = state.rate_limit_action_id
+    else:
+        state.rate_limit_total_s += retry_s
+    # #495/#499/#500: latch a deadline so the stall detector can tell
+    # "throttled upstream, will resume by itself" apart from "hung".
+    state.rate_limit_wait_until = new_deadline
+    state.rate_limit_count += 1
+    if action_id is None:
+        state.note_seq += 1
+        action_id = f"rate_limit_{state.note_seq}"
+    state.rate_limit_action_id = action_id
+    state.rate_limit_action_deadline = new_deadline
+
+    display_s = int(retry_s) if retry_s >= 1 else f"{retry_s:.1f}"
+    if source in ("resets_at", "result_error"):
+        title = (
+            f"⏳ Rate limited until {reset_display} ({_format_wait_approx(retry_s)})"
+        )
+    elif source == "action_required":
+        # #701: no countdown at all — this cap wants an action.
+        title = _format_action_required_title(action_display or "")
+    elif source == "default":
+        # A guessed window is shown as an estimate, not as fact.
+        title = f"⏳ Rate limited — waiting to retry (~{display_s}s)"
+    else:
+        title = f"⏳ Rate limited — retrying in {display_s}s"
+
+    detail: dict[str, Any] = {}
+    if info is not None:
+        if info.status is not None:
+            detail["status"] = info.status
+        if info.rate_limit_type is not None:
+            detail["rate_limit_type"] = info.rate_limit_type
+        if info.resets_at is not None:
+            detail["resets_at"] = info.resets_at
+        if info.tokens_remaining is not None:
+            detail["tokens_remaining"] = info.tokens_remaining
+        if info.requests_remaining is not None:
+            detail["requests_remaining"] = info.requests_remaining
+        if info.retry_after_ms is not None:
+            detail["retry_after_ms"] = info.retry_after_ms
+    logger.info(
+        "claude.rate_limit_event",
+        retry_after_s=retry_s,
+        retry_after_source=source,
+        count=state.rate_limit_count,
+        cumulative_s=state.rate_limit_total_s,
+        # #701: greppable — `retry_after_source=action_required` says the wait
+        # was never going to help.
+        action_model=action_display or None,
+        **_rate_limit_log_fields(info),
+    )
+    return _rate_limit_note(factory, action_id=action_id, title=title, detail=detail)
+
+
+def _format_retry_seconds(seconds: float) -> str:
+    if 0 < seconds < 1:
+        return f"{seconds:.1f}s"
+    if seconds < 120:
+        return f"{round(seconds)}s"
+    return _format_wait_approx(seconds).lstrip("~")
+
+
+def _translate_api_retry(
+    event: claude_schema.StreamSystemMessage,
+    *,
+    state: ClaudeStreamState,
+    factory: EventFactory,
+) -> list[UntetherEvent]:
+    """#792: ``system/api_retry`` → one updating progress note per retry
+    sequence plus a short expected-wait latch for the stall monitor.
+
+    The CLI emits this when an API call fails with a retryable error
+    (429/529/5xx/connection) and it is about to back off; before #792 the
+    frame was dropped, so a back-off looked like a silent hang.
+    """
+    attempt = event.attempt or 0
+    max_retries = event.max_retries or 0
+    delay_s = max(0.0, (event.retry_delay_ms or 0) / 1000.0)
+    no_response = event.no_response
+    header_wait_s = 0.0
+    if no_response is not None and no_response.retry_wait_ms:
+        header_wait_s = max(0.0, no_response.retry_wait_ms / 1000.0)
+
+    now_mono = time.monotonic()
+    # The retry itself may legitimately sit silent for the first-byte
+    # window, so the expected wait covers delay + that window.
+    state.api_retry_wait_until = max(
+        state.api_retry_wait_until, now_mono + delay_s + header_wait_s
+    )
+    state.api_retry_count += 1
+    state.api_retry_total_s += delay_s
+
+    if state.api_retry_action_id is None or attempt <= state.api_retry_last_attempt:
+        state.note_seq += 1
+        state.api_retry_action_id = f"api_retry_{state.note_seq}"
+    state.api_retry_last_attempt = attempt
+    action_id = state.api_retry_action_id
+
+    category = event.error if isinstance(event.error, str) else None
+    if event.error_status is not None:
+        head = f"API error {event.error_status}"
+        if category and category != "unknown":
+            head += f" ({category.replace('_', ' ')})"
+    elif no_response is not None and no_response.waited_ms:
+        head = (
+            "No response from API after "
+            f"{_format_retry_seconds(no_response.waited_ms / 1000.0)}"
+        )
+    else:
+        head = "API unreachable"
+    counter = (
+        f"attempt {attempt}/{max_retries}" if max_retries else f"attempt {attempt}"
+    )
+    title = f"🔁 {head} — retrying in {_format_retry_seconds(delay_s)} ({counter})"
+
+    final_attempt = max_retries > 0 and attempt >= max_retries
+    log = logger.warning if final_attempt else logger.info
+    log(
+        "claude.api_retry",
+        attempt=attempt,
+        max_retries=max_retries,
+        retry_delay_ms=event.retry_delay_ms,
+        error_status=event.error_status,
+        error=category,
+        no_response_waited_ms=no_response.waited_ms if no_response else None,
+        count=state.api_retry_count,
+        cumulative_s=round(state.api_retry_total_s, 1),
+        session_id=event.session_id,
+    )
+    detail: dict[str, Any] = {
+        "attempt": attempt,
+        "max_retries": max_retries,
+        "retry_delay_ms": event.retry_delay_ms,
+        "error_status": event.error_status,
+    }
+    if category:
+        detail["error"] = category
+    return [
+        factory.action_started(
+            action_id=action_id, kind="note", title=title, detail=detail
+        ),
+        factory.action_completed(
+            action_id=action_id,
+            kind="note",
+            title=title,
+            ok=True,
+            level="warning" if final_attempt else "info",
+            detail=detail,
+        ),
+    ]
+
+
 def _normalize_tool_result(content: Any) -> str:
     if content is None:
         return ""
@@ -981,6 +2082,12 @@ def _normalize_tool_result(content: Any) -> str:
         if isinstance(text, str):
             return text
     return str(content)
+
+
+# #749 permission modes already warned about an explicit `allowed_tools`
+# override.  Process-scoped so a long-lived bot logs the interaction once per
+# mode instead of once per run.
+_PROMPTING_MODE_ALLOWLIST_LOGGED: set[str] = set()
 
 
 def _coerce_comma_list(value: Any) -> str | None:
@@ -1464,64 +2571,73 @@ def _live_bounded_handle_count(handles: set[str], deadlines: dict[str, float]) -
     return sum(1 for tool_id in handles if deadlines.get(tool_id, 0.0) > now)
 
 
-def has_live_background_work(state: ClaudeStreamState) -> bool:
-    """Return True when the session has any background handle whose deadline
-    (if any) is still in the future (#346 gate).
+def _live_native_tasks(state: ClaudeStreamState) -> list[ClaudeTask]:
+    """Live background tasks that hold the session open — top-level ones and
+    a subagent's backgrounded tasks alike (#801)."""
+    return [task for task in state.tasks.values() if task.holds_session]
 
-    Monitors + wakeups with expired deadlines are treated as "no longer
-    live" — the primitive should have fired and emitted its result by then.
-    Agent/Task-bg handles (#374, rc7) follow the same rule via
-    ``_live_bg_agent_count`` — a handle past its ``BG_AGENT_MAX_KEEP_S``
-    deadline no longer counts as live, otherwise this gate would wait forever
-    for a tool_result that may never arrive. Bg bashes and remote triggers
-    have no deadline so any entry counts as live.
-    """
+
+def _is_native_monitor(state: ClaudeStreamState, task: ClaudeTask) -> bool:
+    # Monitor registers as ``task_type=local_bash`` (F10); the tool_use handle
+    # registered in ``live_monitors`` (keyed by tool_use_id) tells it apart
+    # from a ``Bash(run_in_background=true)``.
+    return task.tool_use_id is not None and task.tool_use_id in state.live_monitors
+
+
+def _live_deadline_count(deadlines: dict[str, float]) -> int:
     now = time.monotonic()
-    for deadline in state.live_monitors.values():
-        if deadline == 0.0 or deadline > now:
-            return True
-    for deadline in state.live_wakeups.values():
-        if deadline == 0.0 or deadline > now:
-            return True
-    if _live_bg_agent_count(state) > 0:
-        return True
-    # #573 (rc8 slice): bg-bashes and remote triggers previously had NO
-    # deadline, so a single entry pinned this gate True for the rest of the
-    # run. That keeps `has_live_background_work` true long after the work is
-    # gone, which suppresses the post-result watchdog and leaves the process
-    # lingering in limbo — the exact state that gets SIGTERM'd and poisons the
-    # session (#631/#632). Same bounded-keep treatment as Agent/Task-bg in
-    # rc7: age out on a deadline rather than trusting a terminal signal that
-    # may never arrive.
-    if _live_bounded_handle_count(state.live_bg_bashes, state.bg_bash_deadlines) > 0:
-        return True
-    return (
-        _live_bounded_handle_count(
-            state.live_remote_triggers, state.remote_trigger_deadlines
-        )
-        > 0
+    return sum(
+        1 for deadline in deadlines.values() if deadline == 0.0 or deadline > now
     )
+
+
+def _live_background_counts(state: ClaudeStreamState) -> tuple[int, int]:
+    """Return ``(watchers, bg_tasks)`` currently live — the single source for
+    every liveness consumer (#776, D-4).
+
+    ScheduleWakeup and RemoteTrigger always come from their tool_use handles
+    (no native events exist for them). Monitor / Bash-bg / Agent-bg come from
+    the native task map once the CLI has emitted any task event in this
+    process; otherwise from the legacy handles (older CLIs).
+    """
+    watchers = _live_deadline_count(state.live_wakeups)
+    bg_tasks = _live_bounded_handle_count(
+        state.live_remote_triggers, state.remote_trigger_deadlines
+    )
+    if state.native_tasks_seen:
+        for task in _live_native_tasks(state):
+            if _is_native_monitor(state, task):
+                watchers += 1
+            else:
+                bg_tasks += 1
+    else:
+        watchers += _live_deadline_count(state.live_monitors)
+        bg_tasks += _live_bg_agent_count(state) + _live_bounded_handle_count(
+            state.live_bg_bashes, state.bg_bash_deadlines
+        )
+    return watchers, bg_tasks
+
+
+def has_live_background_work(state: ClaudeStreamState) -> bool:
+    """Return True when the session has any live background work (#346 gate).
+
+    #776: native ``system/task_*`` events decide for Monitor / Bash-bg /
+    Agent-bg as soon as the CLI emits them; the bounded tool_use handles
+    (#374/#573) remain for ScheduleWakeup / RemoteTrigger and as the fallback
+    for CLIs that never emit task events. See ``_live_background_counts``.
+    """
+    watchers, bg_tasks = _live_background_counts(state)
+    return watchers + bg_tasks > 0
 
 
 def background_task_summary(state: ClaudeStreamState) -> str | None:
     """Return a compact "⏳ 2 watchers · 1 bg task" summary or None if empty.
 
     Used by progress footer rendering (#347 v2) and the `/background`
-    command. v1 of this PR only computes it; the footer wiring lands in
-    a follow-up once meta-threading from ClaudeStreamState to
-    `ProgressTracker.meta` is confirmed safe for the other 5 engines.
-
-    #374 (rc7): the bg-agent portion of ``bg_tasks`` uses
-    ``_live_bg_agent_count`` so an aged-out Agent/Task-bg handle (bounded by
-    ``BG_AGENT_MAX_KEEP_S``) stops appearing in the footer the same way it
-    stops counting as live work in ``has_live_background_work``.
+    command. Counts come from ``_live_background_counts`` so the footer and
+    the liveness gate can never disagree (#776).
     """
-    watchers = len(state.live_monitors) + len(state.live_wakeups)
-    bg_tasks = (
-        len(state.live_bg_bashes)
-        + _live_bg_agent_count(state)
-        + len(state.live_remote_triggers)
-    )
+    watchers, bg_tasks = _live_background_counts(state)
     if watchers == 0 and bg_tasks == 0:
         return None
     parts: list[str] = []
@@ -1530,6 +2646,307 @@ def background_task_summary(state: ClaudeStreamState) -> str | None:
     if bg_tasks:
         parts.append(f"{bg_tasks} bg task{'s' if bg_tasks != 1 else ''}")
     return "⏳ " + " · ".join(parts)
+
+
+# #785: a task ending this soon after an ``unknown`` wake turn completed is
+# taken to be what that turn answered (nsd evidence: ~8 s between the turn's
+# result and the task's ``background_tasks_changed`` end).
+_WAKE_PAIR_WINDOW_S = 30.0
+
+
+def _is_top_level_background(task: ClaudeTask) -> bool:
+    """A background task the parent session launched itself — not a
+    subagent's own (nested / foreground) tool."""
+    return task.is_backgrounded and not task.owned_by_subagent
+
+
+def _task_label(task: ClaudeTask) -> str:
+    return task.description or task.task_type or "background task"
+
+
+def _note_task_end(state: ClaudeStreamState, task: ClaudeTask) -> None:
+    """#785: attribute a top-level background task's end to the wake turn it
+    belongs to — the open ``unknown`` turn (retro-attributed at completion)
+    or an ``unknown`` turn that completed moments ago (paired: the task's own
+    notification turn that follows is then flagged as already announced)."""
+    if not state.live_mode or state.completed_turns == 0:
+        return
+    if not _is_top_level_background(task) or task.task_id in state.announced_task_ids:
+        return
+    if state.turn_open:
+        if state.turn_reason == "unknown" and all(
+            task.task_id != tid for tid, _ in state.turn_ended_tasks
+        ):
+            state.turn_ended_tasks.append((task.task_id, _task_label(task)))
+        return
+    at = state.unattributed_turn_completed_at
+    if at is None:
+        return
+    gap = time.monotonic() - at
+    if gap > _WAKE_PAIR_WINDOW_S:
+        return
+    state.unattributed_turn_completed_at = None
+    state.announced_task_ids.add(task.task_id)
+    logger.info(
+        "claude.turn.task_end_paired",
+        turn=state.turn,
+        task_id=task.task_id,
+        description=_task_label(task)[:80],
+        gap_s=round(gap, 1),
+    )
+
+
+def _notification_labels_turn(
+    event: claude_schema.StreamSystemMessage, task: ClaudeTask | None
+) -> bool:
+    """#785: only a top-level background task's notification may attribute a
+    wake turn. A subagent's own task (``owned_by_subagent`` / foreground)
+    finishing is not the parent's news and named the wrong task on nsd."""
+    if task is not None:
+        return _is_top_level_background(task)
+    return event.owned_by_subagent is not True and event.is_backgrounded is not False
+
+
+def _end_task(
+    state: ClaudeStreamState, task: ClaudeTask, status: str, reason: str
+) -> None:
+    if task.ended_at is not None:
+        # The CLI sends the empty background_tasks_changed snapshot a moment
+        # before task_updated (F1/F3): let the authoritative status replace
+        # the snapshot's provisional "ended".
+        if task.status == "ended" and status != "ended":
+            task.status = status
+            logger.debug(
+                "claude.task.status_refined",
+                task_id=task.task_id,
+                status=status,
+                reason=reason,
+            )
+        return
+    task.status = status
+    task.ended_at = time.monotonic()
+    log = logger.info if task.is_backgrounded else logger.debug
+    log(
+        "claude.task.ended",
+        task_id=task.task_id,
+        task_type=task.task_type,
+        status=status,
+        reason=reason,
+        duration_s=round(task.ended_at - task.started_at, 1),
+    )
+    _note_task_end(state, task)
+
+
+def _revive_task(
+    state: ClaudeStreamState, task: ClaudeTask, source: str, status: str = "running"
+) -> None:
+    """#801: bring an ended task back to life. Claude resuming a finished
+    agent reuses its ``task_id``; left terminal, the task reads as idle and
+    the live session closes under the resumed agent."""
+    prior_status = task.status
+    ended_at = task.ended_at
+    task.status = status
+    task.ended_at = None
+    task.started_at = time.monotonic()
+    task.revived_count += 1
+    # #795: the turn that resumed it is the one its next wake turn answers.
+    task.origin_turn = state.turn
+    # Its next end is a new finish (#785): a wake turn may announce it again.
+    state.announced_task_ids.discard(task.task_id)
+    if task.holds_session:
+        state.background_observed = True
+    log = logger.info if task.is_backgrounded else logger.debug
+    log(
+        "claude.task.revived",
+        task_id=task.task_id,
+        task_type=task.task_type,
+        prior_status=prior_status,
+        ended_ago_s=(
+            round(task.started_at - ended_at, 1) if ended_at is not None else None
+        ),
+        revived_count=task.revived_count,
+        description=(task.description or "")[:80],
+        source=source,
+    )
+
+
+def _mark_announced(state: ClaudeStreamState, task_ids: Iterable[str]) -> None:
+    """#785: record finishes a wake turn delivered — except a task that has
+    been revived since (#801): its next end is news, not the same finish."""
+    for task_id in task_ids:
+        task = state.tasks.get(task_id)
+        if task is not None and task.ended_at is None:
+            continue
+        state.announced_task_ids.add(task_id)
+
+
+def _register_task(
+    state: ClaudeStreamState, event: claude_schema.StreamSystemMessage, source: str
+) -> ClaudeTask:
+    task_id = event.task_id or ""
+    task = state.tasks.get(task_id)
+    created = task is None
+    if task is None:
+        task = ClaudeTask(task_id=task_id)
+        state.tasks[task_id] = task
+    elif task.ended_at is not None and source == "task_started":
+        _revive_task(state, task, source)
+    if event.task_type is not None:
+        task.task_type = event.task_type
+    if event.tool_use_id is not None:
+        task.tool_use_id = event.tool_use_id
+    if event.description is not None:
+        task.description = event.description
+    if event.subagent_type is not None:
+        task.subagent_type = event.subagent_type
+    if event.is_backgrounded is not None:
+        task.is_backgrounded = event.is_backgrounded
+    if event.owned_by_subagent is not None:
+        task.owned_by_subagent = event.owned_by_subagent
+    if task.holds_session:
+        state.background_observed = True
+    if created or source == "task_started":
+        log = logger.info if task.is_backgrounded else logger.debug
+        log(
+            "claude.task.registered",
+            task_id=task_id,
+            task_type=task.task_type,
+            is_backgrounded=task.is_backgrounded,
+            owned_by_subagent=task.owned_by_subagent,
+            subagent_type=task.subagent_type,
+            description=(task.description or "")[:80],
+            source=source,
+        )
+    return task
+
+
+def _stamp_task_origin(state: ClaudeStreamState, task: ClaudeTask) -> None:
+    """#795: remember the turn a task was launched in (first sighting wins)."""
+    if task.origin_turn is None:
+        task.origin_turn = state.turn
+
+
+def _task_attribution(state: ClaudeStreamState, task_ids: list[str]) -> dict[str, Any]:
+    """#795/#785: TurnEvent detail naming the tasks a wake turn answers and
+    the turn that launched them (the bridge replies to that turn's message)."""
+    detail: dict[str, Any] = {"task_ids": list(task_ids)}
+    for tid in task_ids:
+        task = state.tasks.get(tid)
+        if task is not None and task.origin_turn is not None:
+            detail["origin_turn"] = task.origin_turn
+            break
+    return detail
+
+
+def _apply_task_event(
+    state: ClaudeStreamState, event: claude_schema.StreamSystemMessage
+) -> None:
+    """Fold one ``system/task_*`` / ``background_tasks_changed`` event into the
+    native task map (#776). Never emits Untether events."""
+    subtype = event.subtype
+    state.native_tasks_seen = True
+    if subtype == "background_tasks_changed":
+        snapshot = event.tasks or []
+        present: set[str] = set()
+        now = time.monotonic()
+        for entry in snapshot:
+            task_id = entry.get("task_id") if isinstance(entry, dict) else None
+            if not isinstance(task_id, str) or not task_id:
+                continue
+            present.add(task_id)
+            known = state.tasks.get(task_id)
+            if known is not None and known.ended_at is not None:
+                # #801: a finished task listed again — Claude resumed it (the
+                # snapshot precedes its task_started). A listing moments
+                # after its end straddles the end events instead.
+                if now - known.ended_at >= _TASK_REVIVE_GRACE_S:
+                    _revive_task(state, known, "snapshot")
+                else:
+                    logger.debug(
+                        "claude.task.snapshot_revive_skipped",
+                        task_id=task_id,
+                        status=known.status,
+                        ended_ago_s=round(now - known.ended_at, 1),
+                    )
+            elif known is None:
+                # The snapshot lands a moment before task_started; register a
+                # background placeholder so the gap can't read as "idle".
+                task = ClaudeTask(
+                    task_id=task_id,
+                    task_type=entry.get("task_type"),
+                    description=entry.get("description"),
+                    is_backgrounded=True,
+                )
+                state.tasks[task_id] = task
+                state.background_observed = True
+                _stamp_task_origin(state, task)
+                logger.info(
+                    "claude.task.registered",
+                    task_id=task_id,
+                    task_type=task.task_type,
+                    is_backgrounded=True,
+                    owned_by_subagent=False,
+                    subagent_type=None,
+                    description=(task.description or "")[:80],
+                    source="snapshot",
+                )
+        for task in list(state.tasks.values()):
+            if task.is_live_background and task.task_id not in present:
+                if task.revived_count and now - task.started_at < _TASK_REVIVE_GRACE_S:
+                    # #801: a snapshot from before the revival; the resumed
+                    # run's own task_updated (or a later snapshot) ends it.
+                    logger.debug(
+                        "claude.task.snapshot_end_deferred",
+                        task_id=task.task_id,
+                        revived_ago_s=round(now - task.started_at, 1),
+                    )
+                    continue
+                _end_task(state, task, "ended", "snapshot")
+        return
+    task_id = event.task_id
+    if not task_id:
+        return
+    if subtype == "task_started":
+        task = _register_task(state, event, "task_started")
+        _stamp_task_origin(state, task)
+        if task.owned_by_subagent and task.tool_use_id:
+            task.owner_tool_use_id = state.tool_parents.get(task.tool_use_id)
+        return
+    task = state.tasks.get(task_id)
+    if task is None:
+        # e.g. the "stopped" notification the CLI replays on --resume for a
+        # previous process's task (F11) — nothing live to track.
+        logger.debug(
+            "claude.task.unknown", task_id=task_id, subtype=subtype, status=event.status
+        )
+        return
+    if subtype == "task_progress":
+        # #801: progress carries no status, so it never revives an ended task
+        # — a straggler must not pin the session; a real resume sends
+        # task_started (and a snapshot listing the id).
+        if event.usage is not None:
+            task.last_usage = dict(event.usage)
+        if event.last_tool_name is not None:
+            task.last_tool_name = event.last_tool_name
+        if event.description:
+            # #777: on task_progress the description is the agent's current
+            # step ("Running tests"), not the task's label.
+            task.last_step = event.description
+        return
+    if subtype == "task_updated":
+        status = (event.patch or {}).get("status")
+        if isinstance(status, str) and status not in _TASK_LIVE_STATUSES:
+            _end_task(state, task, status, "task_updated")
+        elif isinstance(status, str) and task.ended_at is not None:
+            # #801: the CLI's own status patch says it runs again.
+            _revive_task(state, task, "task_updated", status)
+        return
+    if subtype == "task_notification":
+        if event.usage is not None:
+            task.last_usage = dict(event.usage)
+        status = event.status or "completed"
+        if status not in _TASK_LIVE_STATUSES:
+            _end_task(state, task, status, "task_notification")
 
 
 def _tool_result_event(
@@ -1763,6 +3180,175 @@ def _prepend_exitplanmode_plan(final_answer: str | None, plan_body: str | None) 
     return f"📋 Plan (approved):\n\n{body}"
 
 
+def _exitplanmode_plan_input(raw_input: Any) -> str | None:
+    plan = raw_input.get("plan") if isinstance(raw_input, dict) else None
+    return plan if isinstance(plan, str) and plan.strip() else None
+
+
+_PLAN_FILE_MAX_BYTES = 256 * 1024
+_PLAN_FILE_TOOLS = frozenset({"Write", "Edit", "MultiEdit"})
+
+
+def _is_plan_file_path(path: Path) -> bool:
+    """A Claude Code plan file: ``<config dir>/plans/<name>.md`` where the
+    config dir is ``~/.claude`` (any home) or ``$CLAUDE_CONFIG_DIR``."""
+    if not path.is_absolute() or path.suffix != ".md":
+        return False
+    plans = path.parent
+    if plans.name != "plans":
+        return False
+    if plans.parent.name == ".claude":
+        return True
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    return bool(config_dir) and plans.parent == Path(config_dir).expanduser()
+
+
+def _observe_plan_file_write(
+    state: ClaudeStreamState, tool_name: str, raw_input: Any
+) -> None:
+    """#793: remember the session's plan file, and its full content when the
+    CLI writes it whole — that content is the plan the next ExitPlanMode is
+    about, whatever its lagging ``input.plan`` says."""
+    if tool_name not in _PLAN_FILE_TOOLS or not isinstance(raw_input, dict):
+        return
+    file_path = raw_input.get("file_path")
+    if not isinstance(file_path, str) or not _is_plan_file_path(Path(file_path)):
+        return
+    state.plan_file_path = file_path
+    content = raw_input.get("content") if tool_name == "Write" else None
+    # An Edit/MultiEdit changes part of the file: read it from disk later.
+    state.plan_file_content = content if isinstance(content, str) else None
+
+
+def _read_plan_file(path_str: str) -> str | None:
+    """Read the plan file, bounded and only if it still resolves to a plan
+    file (no symlink escape). ``None`` on any problem."""
+    try:
+        path = Path(path_str).resolve(strict=True)
+        if not _is_plan_file_path(path) or not path.is_file():
+            return None
+        if path.stat().st_size > _PLAN_FILE_MAX_BYTES:
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
+
+
+def _resolve_exitplanmode_plan(
+    state: ClaudeStreamState,
+    request_id: str,
+    input_body: str,
+    *,
+    session_id: str | None,
+    decision: str,
+) -> tuple[str | None, str]:
+    """#793: the plan body a decision on ``request_id`` is about, and where
+    it came from (``write`` / ``file`` / ``input``).
+
+    The plan file wins over ExitPlanMode's ``input.plan``: when the CLI
+    issues the plan-file Write and ExitPlanMode in one message, the input is
+    read before the Write lands and carries the PREVIOUS plan (CLI 2.1.284,
+    dev-bot transcript). A disagreement is logged as the stale-input quirk.
+    """
+    file_body: str | None = None
+    source = "input"
+    if state.plan_file_content is not None and state.plan_file_content.strip():
+        file_body, source = state.plan_file_content, "write"
+    elif state.plan_file_path is not None:
+        disk = _read_plan_file(state.plan_file_path)
+        if disk is not None and disk.strip():
+            file_body, source = disk, "file"
+    if file_body is None:
+        return (input_body or None), "input"
+    if input_body and input_body.strip() != file_body.strip():
+        logger.info(
+            "claude.plan.stale_input",
+            request_id=request_id,
+            session_id=session_id,
+            decision=decision,
+            plan_source=source,
+            input_chars=len(input_body),
+            file_chars=len(file_body),
+        )
+    return file_body, source
+
+
+def _approve_exitplanmode_plan(
+    state: ClaudeStreamState,
+    request_id: str,
+    *,
+    session_id: str | None,
+    source: str,
+) -> None:
+    """#793: the user approved ExitPlanMode request ``request_id`` (Telegram
+    Approve, the ``plan-auto`` stamp, or the post-outline auto-approve) —
+    its plan body becomes the one the final answer may re-show."""
+    input_body = state.exitplanmode_plans.pop(request_id, None)
+    if input_body is None:
+        return
+    body, plan_source = _resolve_exitplanmode_plan(
+        state, request_id, input_body, session_id=session_id, decision="approved"
+    )
+    if body is None:
+        return
+    if plan_source == "input" and body in state.rejected_exitplanmode_plans:
+        # No plan file to check against, and the input repeats a plan the
+        # user denied — the stale-input quirk. Labelling it "approved" would
+        # be wrong, and an earlier approved body isn't what the agent now
+        # executes, so show none.
+        state.last_exitplanmode_plan = None
+        logger.info(
+            "claude.plan.stale_input",
+            request_id=request_id,
+            session_id=session_id,
+            decision="approved",
+            plan_source="input",
+            reason="matches_rejected",
+            input_chars=len(body),
+        )
+        return
+    state.last_exitplanmode_plan = body
+    logger.debug(
+        "claude.plan.approved",
+        request_id=request_id,
+        session_id=session_id,
+        source=source,
+        plan_source=plan_source,
+        plan_chars=len(body),
+    )
+
+
+def _drop_exitplanmode_plan(
+    state: ClaudeStreamState,
+    request_id: str,
+    *,
+    rejected: bool,
+    reason: str,
+    session_id: str | None = None,
+) -> None:
+    """#793: ExitPlanMode request ``request_id`` was not approved — its body
+    is never re-shown. ``rejected`` is the user's explicit ❌ Deny; procedural
+    denials (Pause & Outline, Let's discuss, outline guard, timeout) are not
+    a verdict on the plan, so a later identical approval still counts."""
+    input_body = state.exitplanmode_plans.pop(request_id, None)
+    if input_body is None:
+        return
+    plan_source = None
+    if rejected:
+        body, plan_source = _resolve_exitplanmode_plan(
+            state, request_id, input_body, session_id=session_id, decision="denied"
+        )
+        if body is not None:
+            state.rejected_exitplanmode_plans.add(body)
+    logger.debug(
+        "claude.plan.not_approved",
+        request_id=request_id,
+        rejected=rejected,
+        reason=reason,
+        plan_source=plan_source,
+    )
+
+
 def _maybe_audit_env(state: ClaudeStreamState, session_id: str) -> None:
     """One-shot ``/proc/<pid>/environ`` audit on first system.init (#361).
 
@@ -1960,7 +3546,402 @@ def _capture_orphan_descendants(
         )
 
 
+def _should_absorb_resume_result(
+    event: claude_schema.StreamResultMessage, state: ClaudeStreamState
+) -> bool:
+    """#776 resume guard (F11): on ``--resume`` of a session whose previous
+    process ended with background work still live, the CLI first replays a
+    ``task_notification{status: stopped}`` and answers it with a synthetic
+    0-turn result (~0.3 s, ``duration_api_ms == 0``) — only then does it run
+    the real turn. That first result is not the answer. At most once per run:
+    a second 0-turn result is a genuine empty result."""
+    return (
+        state.resumed
+        and state.completed_turns == 0
+        and state.absorbed_results == 0
+        and state.stopped_notification_pre_output
+        and not state.saw_assistant_output
+        and event.num_turns == 0
+        and event.duration_api_ms == 0
+        and not event.is_error
+    )
+
+
+_WAKEUP_IN_RE = re.compile(r"\(in (\d+)\s*s\)")
+_WAKEUP_FIRE_GRACE_S = 60.0
+
+
+def _note_pending_wakeup(
+    state: ClaudeStreamState, tool_use_id: str, raw_result: Any
+) -> None:
+    """Record when a ScheduleWakeup will fire (#776, F9).
+
+    The confirmation reads e.g. "Next wakeup scheduled for 19:15:00 (in
+    94s)" — the CLI rounds to its own boundary, so the announced delay beats
+    the requested ``delaySeconds``. Falls back to the handle's deadline."""
+    now = time.monotonic()
+    match = _WAKEUP_IN_RE.search(_normalize_tool_result(raw_result) or "")
+    if match:
+        fire_at = now + float(match.group(1))
+    else:
+        deadline = state.live_wakeups.get(tool_use_id, 0.0)
+        fire_at = deadline if deadline > now else now + 60.0
+    until = fire_at + _WAKEUP_FIRE_GRACE_S
+    if state.pending_wakeup_until is None or until > state.pending_wakeup_until:
+        state.pending_wakeup_until = until
+
+
+def _has_pending_wakeup(state: ClaudeStreamState) -> bool:
+    return (
+        state.pending_wakeup_until is not None
+        and state.pending_wakeup_until > time.monotonic()
+    )
+
+
+def _completed_keeps_session_live(evt: CompletedEvent) -> bool:
+    """A live session only survives a successful, non-empty first result."""
+    if not evt.ok:
+        return False
+    usage = evt.usage or {}
+    return not (
+        not (evt.answer or "").strip()
+        and (usage.get("num_turns", 1) or 0) == 0
+        and (usage.get("duration_api_ms", 1) or 0) == 0
+    )
+
+
+def _open_followup_turn(
+    state: ClaudeStreamState, factory: EventFactory
+) -> UntetherEvent:
+    """Open turn N+1 after a result, attributing it from the idle-time hints."""
+    reason = "unknown"
+    command_uuid = state.pending_command_uuid
+    detail: dict[str, Any] = {}
+    if command_uuid is not None and command_uuid in state.injected_commands:
+        reason = "followup"
+    elif state.turn_notifications:
+        reason = "task_finished"
+        detail["tasks"] = list(state.turn_notifications)
+        ids = list(state.turn_notification_ids)
+        detail.update(_task_attribution(state, ids))
+        if ids and all(tid in state.announced_task_ids for tid in ids):
+            # #785: the second wake turn for one finish (the first opened as
+            # ``unknown`` and was attributed to it) — the bridge won't push.
+            detail["already_announced"] = True
+        _mark_announced(state, ids)
+    elif command_uuid is not None:
+        reason = "scheduled_wakeup"
+    elif monitors := [
+        task
+        for task in _live_native_tasks(state)
+        if task.is_live_background and _is_native_monitor(state, task)
+    ]:
+        reason = "monitor_event"
+        detail["tasks"] = [t.description or "Monitor" for t in monitors]
+        detail.update(_task_attribution(state, [t.task_id for t in monitors]))
+    if reason == "scheduled_wakeup":
+        state.pending_wakeup_until = None
+    if reason == "followup" and command_uuid is not None:
+        state.awaiting_injected.pop(command_uuid, None)
+    state.turn += 1
+    state.turn_open = True
+    state.turn_reason = reason
+    state.turn_command_uuid = command_uuid if reason == "followup" else None
+    state.pending_command_uuid = None
+    state.turn_notifications = []
+    state.turn_notification_ids = []
+    state.turn_ended_tasks = []
+    state.turn_detail = detail
+    state.unattributed_turn_completed_at = None
+    # Per-turn scalars (see their field docs) start fresh for the new turn.
+    state.last_assistant_text = None
+    state.last_exitplanmode_plan = None
+    state.last_schedule_wakeup_arm_delay = None
+    state.last_bg_bash_launched_at = None
+    # Not idle any more: the stall / post-result logic keys off this.
+    state.result_received_at = None
+    logger.info(
+        "claude.turn.started",
+        session_id=factory.resume.value if factory.resume else None,
+        turn=state.turn,
+        reason=reason,
+        command_uuid=state.turn_command_uuid,
+    )
+    return factory.turn_started(
+        turn=state.turn,
+        reason=reason,  # type: ignore[arg-type]
+        command_uuid=state.turn_command_uuid,
+        detail=detail,
+    )
+
+
+_STEER_SNIPPET_CHARS = 80
+
+
+def _absorb_injected(
+    state: ClaudeStreamState, factory: EventFactory, command_uuid: str
+) -> list[UntetherEvent]:
+    """#775: an injected line the CLI picked up while a turn was already open
+    — it was folded into that turn (F5) instead of starting its own.
+
+    Clears the awaiting marker (so the idle close and the next queued
+    follow-up aren't held for a turn that will never open) and surfaces a
+    "steer received" row in the running turn's progress. The bridge pops the
+    line's reply anchor on seeing ``detail["absorbed_command_uuid"]`` — its
+    answer is this turn's answer, so no separate reply is owed.
+    """
+    state.absorbed_commands.add(command_uuid)
+    state.awaiting_injected.pop(command_uuid, None)
+    steer_text = state.steered_commands.get(command_uuid)
+    label = "steer" if steer_text is not None else "follow-up"
+    title = f"\N{RIGHTWARDS ARROW WITH HOOK}\N{VARIATION SELECTOR-16} {label} received"
+    if steer_text:
+        snippet = " ".join(steer_text.split())
+        if len(snippet) > _STEER_SNIPPET_CHARS:
+            snippet = snippet[: _STEER_SNIPPET_CHARS - 1] + "…"
+        title = f"{title}: {snippet}"
+    logger.info(
+        "claude.live_session.injected_absorbed",
+        session_id=factory.resume.value if factory.resume else None,
+        command_uuid=command_uuid,
+        steer=steer_text is not None,
+        turn=state.turn,
+    )
+    state.note_seq += 1
+    action_id = f"claude.steer.{state.note_seq}"
+    detail = {"absorbed_command_uuid": command_uuid, "steer": steer_text is not None}
+    return [
+        factory.action_started(
+            action_id=action_id, kind="note", title=title, detail=detail
+        ),
+        factory.action_completed(
+            action_id=action_id,
+            kind="note",
+            title=title,
+            ok=True,
+            level="info",
+            detail=detail,
+        ),
+    ]
+
+
 def translate_claude_event(
+    event: claude_schema.StreamJsonMessage,
+    *,
+    title: str,
+    state: ClaudeStreamState,
+    factory: EventFactory,
+) -> list[UntetherEvent]:
+    """Translate one CLI line, adding #776 turn segmentation around
+    :func:`_translate_claude_event_base`."""
+    if (
+        isinstance(event, claude_schema.StreamCommandLifecycleMessage)
+        and event.state == "started"
+        and state.turn_open
+        and event.command_uuid is not None
+        and event.command_uuid in state.injected_commands
+        and event.command_uuid not in state.absorbed_commands
+    ):
+        # #775: started while a turn is open → folded into it (probed on CLI
+        # 2.1.284: queued at write, started after the running tool's result).
+        return _absorb_injected(state, factory, event.command_uuid)
+    if (
+        isinstance(event, claude_schema.StreamSystemMessage)
+        and event.subtype == "task_notification"
+        and event.status == "stopped"
+        and state.completed_turns == 0
+        and not state.saw_assistant_output
+    ):
+        state.stopped_notification_pre_output = True
+    if isinstance(
+        event, claude_schema.StreamResultMessage
+    ) and _should_absorb_resume_result(event, state):
+        state.absorbed_results += 1
+        state.absorbed_cost_baseline = event.total_cost_usd
+        logger.info(
+            "claude.resume_guard.absorbed",
+            session_id=event.session_id,
+            total_cost_usd=event.total_cost_usd,
+        )
+        return []
+
+    if not state.live_mode or state.completed_turns == 0:
+        if isinstance(event, claude_schema.StreamAssistantMessage):
+            state.saw_assistant_output = True
+        events = _translate_claude_event_base(
+            event, title=title, state=state, factory=factory
+        )
+        if any(isinstance(evt, CompletedEvent) for evt in events):
+            state.completed_turns = 1
+            state.turn_open = False
+            if state.absorbed_cost_baseline is not None:
+                # #778: the absorbed result carried the previous process's
+                # session total — hand it to the cost ledger as a baseline.
+                events = [
+                    dataclasses.replace(
+                        evt,
+                        usage={
+                            **(evt.usage or {}),
+                            "session_cost_baseline": state.absorbed_cost_baseline,
+                        },
+                    )
+                    if isinstance(evt, CompletedEvent)
+                    else evt
+                    for evt in events
+                ]
+        return events
+
+    # ── live session, after the run's own result (#776) ──────────────────
+    match event:
+        case claude_schema.StreamCommandLifecycleMessage(state=cmd_state):
+            if cmd_state == "started" and not state.turn_open:
+                state.pending_command_uuid = event.command_uuid
+            return []
+        case claude_schema.StreamSystemMessage(subtype=subtype):
+            if subtype == "task_notification" and not state.turn_open:
+                task = state.tasks.get(event.task_id or "")
+                if _notification_labels_turn(event, task):
+                    label = event.summary or event.description
+                    if task is not None and task.description:
+                        # Prefer the registered top-level description (#785).
+                        label = task.description
+                    state.turn_notifications.append(label or "background task")
+                    if task is not None:
+                        state.turn_notification_ids.append(task.task_id)
+                else:
+                    logger.info(
+                        "claude.turn.notification_ignored",
+                        task_id=event.task_id,
+                        owned_by_subagent=(
+                            task.owned_by_subagent
+                            if task is not None
+                            else event.owned_by_subagent
+                        ),
+                        is_backgrounded=(
+                            task.is_backgrounded
+                            if task is not None
+                            else event.is_backgrounded
+                        ),
+                    )
+            out: list[UntetherEvent] = []
+            if subtype == "init" and not state.turn_open:
+                out.append(_open_followup_turn(state, factory))
+            # Keep the base side effects (task map, MCP catalog capture) but
+            # never re-emit a StartedEvent inside a live session.
+            out.extend(
+                evt
+                for evt in _translate_claude_event_base(
+                    event, title=title, state=state, factory=factory
+                )
+                if not isinstance(evt, (StartedEvent, CompletedEvent))
+            )
+            return out
+        case claude_schema.StreamResultMessage():
+            out = []
+            if not state.turn_open:
+                out.append(_open_followup_turn(state, factory))
+            base = _translate_claude_event_base(
+                event, title=title, state=state, factory=factory
+            )
+            completed = next(
+                (evt for evt in base if isinstance(evt, CompletedEvent)), None
+            )
+            state.turn_open = False
+            state.completed_turns += 1
+            detail = dict(state.turn_detail)
+            if state.turn_reason == "unknown" and state.turn_ended_tasks:
+                # #785: the turn opened before any task event named what it
+                # answered; the task(s) ended during it — attribute it now so
+                # its final gets the real header.
+                detail["tasks"] = [label for _, label in state.turn_ended_tasks]
+                detail["retro_attributed"] = True
+                detail.update(
+                    _task_attribution(state, [tid for tid, _ in state.turn_ended_tasks])
+                )
+                _mark_announced(state, (tid for tid, _ in state.turn_ended_tasks))
+                state.turn_reason = "task_finished"
+                logger.info(
+                    "claude.turn.retro_attributed",
+                    session_id=event.session_id,
+                    turn=state.turn,
+                    task_ids=[tid for tid, _ in state.turn_ended_tasks],
+                )
+            state.turn_ended_tasks = []
+            state.unattributed_turn_completed_at = (
+                time.monotonic() if state.turn_reason == "unknown" else None
+            )
+            if completed is not None:
+                logger.info(
+                    "claude.turn.completed",
+                    session_id=event.session_id,
+                    turn=state.turn,
+                    reason=state.turn_reason,
+                    ok=completed.ok,
+                    num_turns=event.num_turns,
+                )
+                out.append(
+                    factory.turn_completed(
+                        turn=state.turn,
+                        ok=completed.ok,
+                        answer=completed.answer,
+                        reason=state.turn_reason,  # type: ignore[arg-type]
+                        error=completed.error,
+                        usage=completed.usage,
+                        command_uuid=state.turn_command_uuid,
+                        detail=detail,
+                    )
+                )
+            return out
+        case claude_schema.StreamAssistantMessage() | claude_schema.StreamUserMessage():
+            out = []
+            if not state.turn_open and event.parent_tool_use_id is not None:
+                # A background subagent streams its own assistant/tool events
+                # on stdout while the parent is idle (F2). They are not the
+                # parent starting a turn — keep their side effects (pending
+                # actions, task bookkeeping) but surface nothing; the wake
+                # turn comes after its task_notification. #777 renders
+                # background progress.
+                _translate_claude_event_base(
+                    event, title=title, state=state, factory=factory
+                )
+                return []
+            if not state.turn_open and not _is_tool_result_only(event):
+                out.append(_open_followup_turn(state, factory))
+            out.extend(
+                evt
+                for evt in _translate_claude_event_base(
+                    event, title=title, state=state, factory=factory
+                )
+                if not isinstance(evt, (StartedEvent, CompletedEvent))
+            )
+            return out
+        case _:
+            return [
+                evt
+                for evt in _translate_claude_event_base(
+                    event, title=title, state=state, factory=factory
+                )
+                if not isinstance(evt, (StartedEvent, CompletedEvent))
+            ]
+
+
+def _is_tool_result_only(event: claude_schema.StreamJsonMessage) -> bool:
+    if not isinstance(event, claude_schema.StreamUserMessage):
+        return False
+    content = event.message.content
+    return isinstance(content, list) and all(
+        isinstance(
+            block,
+            (
+                claude_schema.StreamToolResultBlock,
+                claude_schema.StreamAdvisorToolResultBlock,
+            ),
+        )
+        for block in content
+    )
+
+
+def _translate_claude_event_base(
     event: claude_schema.StreamJsonMessage,
     *,
     title: str,
@@ -1969,6 +3950,11 @@ def translate_claude_event(
 ) -> list[UntetherEvent]:
     match event:
         case claude_schema.StreamSystemMessage(subtype=subtype):
+            if subtype.startswith("task_") or subtype == "background_tasks_changed":
+                _apply_task_event(state, event)
+                return []
+            if subtype == "api_retry":
+                return _translate_api_retry(event, state=state, factory=factory)
             if subtype != "init":
                 logger.debug(
                     "claude.system_event.non_init",
@@ -2022,6 +4008,8 @@ def translate_claude_event(
                             content,
                             parent_tool_use_id=parent_tool_use_id,
                         )
+                        if parent_tool_use_id and content.id:
+                            state.tool_parents[content.id] = parent_tool_use_id
                         state.pending_actions[action.id] = action
                         state.last_tool_use_id = content.id
                         # #347 track long-running primitives that outlive
@@ -2032,19 +4020,15 @@ def translate_claude_event(
                         # (master toggle gate inside).  Sibling of, not
                         # replacement for, _register_background_handle.
                         _observe_loop_tool_use(state, content)
-                        # #508 capture ExitPlanMode plan body so the bridge
-                        # can re-emit it in the final answer when the
-                        # post-approval result is brief/empty (research
-                        # tasks).  Only captures from the regular Approve
-                        # flow — Pause-and-Outline outlines go via
-                        # state.outline_text and a different code path.
-                        if str(content.name or "") == "ExitPlanMode":
-                            _epm_input = (
-                                content.input if isinstance(content.input, dict) else {}
+                        # #508/#793: the ExitPlanMode plan body is recorded
+                        # from its control_request (keyed by request_id) and
+                        # kept only if that request is approved — not here,
+                        # where the user hasn't decided yet. The parent's
+                        # plan-file writes are tracked as its source of truth.
+                        if parent_tool_use_id is None:
+                            _observe_plan_file_write(
+                                state, str(content.name or ""), content.input
                             )
-                            _plan_body = _epm_input.get("plan")
-                            if isinstance(_plan_body, str) and _plan_body.strip():
-                                state.last_exitplanmode_plan = _plan_body
                         out.append(
                             factory.action_started(
                                 action_id=action.id,
@@ -2116,6 +4100,8 @@ def translate_claude_event(
                     continue
                 saw_tool_result = True
                 tool_use_id = content.tool_use_id
+                if tool_use_id in state.live_wakeups:
+                    _note_pending_wakeup(state, tool_use_id, content.content)
                 # #347/#374 clear a background-task entry only on a *terminal*
                 # tool_result — interim Monitor results keep the handle so the
                 # stall-suppression branch keeps firing while it runs.
@@ -2211,7 +4197,7 @@ def translate_claude_event(
             if not ok:
                 # #692: the subscription-cap reset time lives only in the
                 # raw result-error text — harvest it for this run's stall
-                # context and for subsequent runs' bare rate_limit_events.
+                # context and for subsequent runs' reset-less rejections.
                 _maybe_latch_rate_limit_reset(event.result, state=state)
                 # #701: the other cap class — no time to harvest, but a
                 # remedy to name.
@@ -2246,7 +4232,7 @@ def translate_claude_event(
                     factory.started(
                         resume,
                         title=None,
-                        meta={"complete": "✓ turn complete"},
+                        meta={"complete": TURN_COMPLETE_MARKER},
                     )
                 )
             events_out.append(
@@ -2320,12 +4306,42 @@ def translate_claude_event(
                 state.auto_approve_queue.append(request_id)
                 return []
 
+            # #793: record every ExitPlanMode plan body against its request;
+            # the approval paths below (and write_control_response) promote
+            # it, every denial path drops it.
+            if (
+                isinstance(request, claude_schema.ControlCanUseToolRequest)
+                and getattr(request, "tool_name", "") == "ExitPlanMode"
+            ):
+                # Recorded even without an input body: the plan file may
+                # still supply one at decision time.
+                state.exitplanmode_plans[request_id] = (
+                    _exitplanmode_plan_input(getattr(request, "input", {})) or ""
+                )
+
             # Auto-approve tool requests that don't need user interaction.
             # _DIFF_PREVIEW_TOOLS is module-scoped — see top of file.
+            #
+            # #749: in a prompting mode (`default`/`manual`/`acceptEdits`) the
+            # user was promised an approval prompt, so NOTHING is auto-approved
+            # here — a stage-6 request is unresolved permission work by
+            # definition (decisions.md D-1).  Autonomous modes retain the
+            # historical two-tool set: `DEFAULT_ALLOWED_TOOLS` only pre-approves
+            # Bash/Read/Edit/Write, so Glob/Grep/WebFetch/Task already arrive
+            # here in plan mode, and gating them would raise a button per tool
+            # in the fleet's most-used mode for no safety gain (probes G/H/I).
+            #
+            # Known gap, carried to v0.35.6: an explicit `ask` rule reaches
+            # stage 6 even under `bypassPermissions`, and this branch still
+            # approves it.  Closing that needs a stage-5 change (the allowlist),
+            # not a wider handler gate.
             _TOOLS_REQUIRING_APPROVAL = {"ExitPlanMode", "AskUserQuestion"}
             if isinstance(request, claude_schema.ControlCanUseToolRequest):
                 tool_name = getattr(request, "tool_name", "unknown")
-                if tool_name not in _TOOLS_REQUIRING_APPROVAL:
+                if (
+                    not state.prompting_mode
+                    and tool_name not in _TOOLS_REQUIRING_APPROVAL
+                ):
                     # When diff_preview is enabled, route previewable tools
                     # through interactive approval so users see the diff.
                     # Bypass after ExitPlanMode approval — the user already
@@ -2392,6 +4408,9 @@ def translate_claude_event(
                     auto_session = factory.resume.value if factory.resume else None
                     if auto_session is not None:
                         _PLAN_EXIT_APPROVED.add(auto_session)
+                    _approve_exitplanmode_plan(
+                        state, request_id, session_id=auto_session, source="plan_auto"
+                    )
                     _REQUEST_TO_INPUT[request_id] = getattr(request, "input", {})
                     state.auto_approve_queue.append(request_id)
                     return []
@@ -2411,6 +4430,12 @@ def translate_claude_event(
                             "control_request.discuss_approved",
                             request_id=request_id,
                             session_id=session_id,
+                        )
+                        _approve_exitplanmode_plan(
+                            state,
+                            request_id,
+                            session_id=session_id,
+                            source="discuss_approved",
                         )
                         _REQUEST_TO_INPUT[request_id] = getattr(request, "input", {})
                         state.auto_approve_queue.append(request_id)
@@ -2497,6 +4522,12 @@ def translate_claude_event(
                                 "control_request.outline_guard_deny",
                                 request_id=request_id,
                                 session_id=session_id,
+                            )
+                            _drop_exitplanmode_plan(
+                                state,
+                                request_id,
+                                rejected=False,
+                                reason="outline_guard",
                             )
                             _REQUEST_TO_INPUT.pop(request_id, None)
                             _REQUEST_TO_TOOL_NAME.pop(request_id, None)
@@ -2687,6 +4718,7 @@ def translate_claude_event(
             ]
             for rid in expired:
                 del state.pending_control_requests[rid]
+                _drop_exitplanmode_plan(state, rid, rejected=False, reason="timeout")
                 _REQUEST_TO_INPUT.pop(rid, None)
                 _REQUEST_TO_TOOL_NAME.pop(rid, None)
                 state.request_to_action.pop(rid, None)
@@ -2853,137 +4885,7 @@ def translate_claude_event(
                 ),
             ]
         case claude_schema.StreamRateLimitMessage(rate_limit_info=info):
-            # #349: surface rate_limit_event as a visible "waiting for API" note
-            # so the user sees a clear "Anthropic is throttling us, we're waiting"
-            # status instead of silent inactivity + eventual mystery cancel.
-            retry_ms = info.retry_after_ms if info is not None else None
-            retry_s = retry_ms / 1000.0 if retry_ms is not None else None
-            # #518: when retry_after_ms is missing, derive retry_after_s from
-            # the requests_reset / tokens_reset ISO timestamps so subscription-
-            # cap throttles (which the rc13 audit showed always emit "bare"
-            # rate_limit_events) still surface an actionable wait time and
-            # accumulate into cumulative_s.
-            retry_s_source = "retry_after_ms"
-            reset_display: str | None = None
-            action_display: str | None = None
-            if retry_s is None:
-                derived = _derive_retry_after_s(info)
-                if derived is not None:
-                    retry_s = derived
-                    retry_s_source = "reset_ts"
-                else:
-                    # #692: a reset deadline harvested from an earlier
-                    # result error ("resets 5:30pm (…)") beats guessing —
-                    # subscription caps emit bare events every time, and a
-                    # ~60s estimate against a ~33min reality makes users
-                    # re-send into a closed window.
-                    latched = _latched_rate_limit_reset()
-                    if latched is not None:
-                        retry_s, reset_display = latched
-                        retry_s_source = "result_error"
-                    elif (action_model := _latched_action_required()) is not None:
-                        # #701: an action-required cap carries no reset time,
-                        # so we still need SOME deadline for the stall
-                        # detector — but the user must not be shown a
-                        # countdown for a cap that a countdown won't clear.
-                        # Same 60s window as #657, different answer on screen.
-                        retry_s = DEFAULT_BARE_RATE_LIMIT_WAIT_S
-                        retry_s_source = "action_required"
-                        action_display = action_model
-                    else:
-                        # #657: no timing anywhere — latch a conservative
-                        # default so awaiting_rate_limit_retry() is
-                        # directionally correct. Source stays distinct so
-                        # audits can tell derived waits from guessed ones.
-                        retry_s = DEFAULT_BARE_RATE_LIMIT_WAIT_S
-                        retry_s_source = "default"
-            now_mono = time.monotonic()
-            if retry_s_source == "result_error":
-                # #692: repeated bare events share ONE latched deadline —
-                # accumulate only the extension beyond the existing wait,
-                # not the full remaining window per event.
-                prev_deadline = max(state.rate_limit_wait_until, now_mono)
-                state.rate_limit_total_s += max(
-                    0.0, (now_mono + retry_s) - prev_deadline
-                )
-            else:
-                state.rate_limit_total_s += retry_s
-            # #495/#499/#500: latch a deadline so the stall detector can
-            # tell "throttled upstream, will resume by itself" apart from
-            # "hung". Without this only a cumulative total existed, which
-            # says nothing about whether we are waiting *right now*.
-            state.rate_limit_wait_until = now_mono + retry_s
-            state.rate_limit_count += 1
-            state.note_seq += 1
-            action_id = f"rate_limit_{state.note_seq}"
-            # Round to nearest second for display but show fractional when < 1s
-            display_s = int(retry_s) if retry_s >= 1 else f"{retry_s:.1f}"
-            if retry_s_source == "result_error":
-                title = (
-                    f"⏳ Rate limited until {reset_display} "
-                    f"({_format_wait_approx(retry_s)})"
-                )
-            elif retry_s_source == "action_required":
-                # #701: no countdown at all — this cap wants an action.
-                title = _format_action_required_title(action_display or "")
-            elif retry_s_source == "default":
-                # A guessed window is shown as an estimate, not as fact
-                title = f"⏳ Rate limited — waiting to retry (~{display_s}s)"
-            else:
-                title = f"⏳ Rate limited — retrying in {display_s}s"
-            detail: dict[str, Any] = {}
-            if info is not None:
-                if info.tokens_remaining is not None:
-                    detail["tokens_remaining"] = info.tokens_remaining
-                if info.requests_remaining is not None:
-                    detail["requests_remaining"] = info.requests_remaining
-                if retry_ms is not None:
-                    detail["retry_after_ms"] = retry_ms
-            # #518: log all RateLimitInfo fields when present so future audits
-            # can see what upstream actually sent, instead of having to back-
-            # infer from the single-field log line that was here before.
-            info_payload: dict[str, Any] = {}
-            if info is not None:
-                for field_name in (
-                    "requests_limit",
-                    "requests_remaining",
-                    "requests_reset",
-                    "tokens_limit",
-                    "tokens_remaining",
-                    "tokens_reset",
-                    "retry_after_ms",
-                ):
-                    value = getattr(info, field_name, None)
-                    if value is not None:
-                        info_payload[field_name] = value
-            logger.info(
-                "claude.rate_limit_event",
-                retry_after_s=retry_s,
-                retry_after_source=retry_s_source,
-                count=state.rate_limit_count,
-                cumulative_s=state.rate_limit_total_s,
-                info=info_payload or None,
-                # #701: greppable the way `result_error` now is — a window of
-                # `retry_after_source=action_required` says the wait was never
-                # going to help, which `default` could not distinguish.
-                action_model=action_display or None,
-            )
-            return [
-                factory.action_started(
-                    action_id=action_id,
-                    kind="note",
-                    title=title,
-                    detail=detail,
-                ),
-                factory.action_completed(
-                    action_id=action_id,
-                    kind="note",
-                    title=title,
-                    ok=True,
-                    level="info",
-                    detail=detail,
-                ),
-            ]
+            return _translate_rate_limit_event(info, state=state, factory=factory)
         case _:
             logger.debug(
                 "claude.event.unrecognised",
@@ -3001,6 +4903,12 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     model: str | None = None
     permission_mode: str | None = None
     allowed_tools: list[str] | None = None
+    # #749 True when `allowed_tools` came from an explicit
+    # `[engines.claude] allowed_tools` key rather than DEFAULT_ALLOWED_TOOLS.
+    # `build_runner` collapses both into `allowed_tools`, so without this flag
+    # a prompting-mode run cannot tell a deliberate user choice (which must be
+    # honoured) from inherited plumbing (which must be dropped).
+    allowed_tools_explicit: bool = False
     extra_args: list[str] = field(default_factory=list)
     dangerously_skip_permissions: bool = False
     use_api_billing: bool = False
@@ -3054,13 +4962,39 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         ) or self.permission_mode
 
     async def write_control_response(
-        self, request_id: str, approved: bool, *, deny_message: str | None = None
+        self,
+        request_id: str,
+        approved: bool,
+        *,
+        deny_message: str | None = None,
+        rejects_plan: bool = True,
     ) -> bool:
         """Write a control response to the Claude Code process via PIPE or PTY.
 
         Uses _SESSION_STDIN to find the correct stdin for the session,
         supporting concurrent sessions on the same runner instance.
+
+        ``rejects_plan`` (#793): whether a denial of an ExitPlanMode request
+        is the user rejecting the plan (❌ Deny) rather than a procedural
+        denial (Pause & Outline, Let's discuss).
         """
+        # #793: settle the request's recorded plan body on the run's own
+        # state (per-session, never the shared runner attributes).
+        plan_session = _REQUEST_TO_SESSION.get(request_id)
+        plan_state = _SESSION_BG_STATE.get(plan_session) if plan_session else None
+        if plan_state is not None:
+            if approved:
+                _approve_exitplanmode_plan(
+                    plan_state, request_id, session_id=plan_session, source="telegram"
+                )
+            else:
+                _drop_exitplanmode_plan(
+                    plan_state,
+                    request_id,
+                    rejected=rejects_plan,
+                    reason="telegram_deny" if rejects_plan else "telegram_procedural",
+                    session_id=plan_session,
+                )
         if approved:
             inner: dict[str, Any] = {"behavior": "allow"}
             # Claude Code CLI requires updatedInput for can_use_tool responses
@@ -3101,7 +5035,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         stdin_to_use = session_stdin or self._proc_stdin
         if stdin_to_use is not None:
             try:
-                await stdin_to_use.send(jsonl_line.encode())
+                await _locked_send(stdin_to_use, jsonl_line.encode())
                 logger.info(
                     "control_response.sent",
                     request_id=request_id,
@@ -3220,7 +5154,29 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             reasoning = run_options.reasoning
         if reasoning is not None:
             args.extend(["--effort", reasoning])
+        # #749 stage 5 sits BEFORE the stage-6 prompt, so an allowlist covering
+        # Bash/Read/Edit/Write pre-approves exactly the tools a prompting mode
+        # exists to ask about — phase 01's gate would never see them.  Drop it
+        # for those modes unless the user asked for it by name.
         allowed_tools = _coerce_comma_list(self.allowed_tools)
+        if allowed_tools is not None and is_claude_prompting_mode(effective_mode):
+            if self.allowed_tools_explicit:
+                # An explicit choice is honoured, but the interaction is
+                # surprising enough to deserve one line in the log.
+                if effective_mode not in _PROMPTING_MODE_ALLOWLIST_LOGGED:
+                    _PROMPTING_MODE_ALLOWLIST_LOGGED.add(effective_mode)
+                    logger.info(
+                        "claude.allowed_tools.prompting_mode_override",
+                        permission_mode=effective_mode,
+                        allowed_tools=allowed_tools,
+                        detail=(
+                            "explicit [engines.claude] allowed_tools pre-approves "
+                            "these tools at stage 5, so they will not raise a "
+                            "Telegram approval in this mode (#749)"
+                        ),
+                    )
+            else:
+                allowed_tools = None
         if allowed_tools is not None:
             args.extend(["--allowedTools", allowed_tools])
         if self.dangerously_skip_permissions is True:
@@ -3336,6 +5292,14 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     def new_state(self, prompt: str, resume: ResumeToken | None) -> ClaudeStreamState:
         state = ClaudeStreamState()
         state.auto_approve_exit_plan_mode = is_claude_plan_auto(
+            self._effective_permission_mode()
+        )
+        # #749 arm the stage-6 gate from the same resolved mode.  This must
+        # read `_effective_permission_mode()` (per-chat override → engine
+        # config), not `self.permission_mode`: `translate_claude_event` is a
+        # module-level function with no access to the runner, so the decision
+        # has to be made here and carried on the state.
+        state.prompting_mode = is_claude_prompting_mode(
             self._effective_permission_mode()
         )
         state.resumed = resume is not None
@@ -3466,10 +5430,37 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     # bridge's handoff wait. Cleared with the other
                     # registries in _cleanup_session_registries.
                     _SESSION_BG_STATE[registered_session_id] = state
+                    if state.live_mode and session_stdin is not None:
+                        _LIVE_SESSIONS[registered_session_id] = LiveSession(
+                            session_id=registered_session_id,
+                            state=state,
+                            stdin=session_stdin,
+                            pid=pid,
+                        )
                     logger.info(
                         "session_stdin.registered",
                         session_id=registered_session_id,
                         pid=pid,
+                    )
+                if (
+                    isinstance(evt, CompletedEvent)
+                    and state.live_mode
+                    and not _completed_keeps_session_live(evt)
+                ):
+                    # Review finding (#776): an errored or empty first result
+                    # must not leave a live session behind — the bridge only
+                    # delivers ok results early, so the error (and #596/#572
+                    # recovery) would wait for the idle close, and follow-ups
+                    # could be injected into a broken session. Close it now:
+                    # the CLI exits, the reader hits EOF, the run ends and the
+                    # error is delivered straight away.
+                    sid = evt.resume.value if evt.resume else registered_session_id
+                    if sid is not None:
+                        await close_live_session(sid, "error")
+                    logger.info(
+                        "claude.live_session.closed_after_result",
+                        session_id=sid,
+                        ok=evt.ok,
                     )
                 yield evt
             # Drain auto-approve and auto-deny queues after EVERY line, even if no events
@@ -3485,7 +5476,9 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             # Claude Code's MCP server child processes may inherit the stdout pipe FD,
             # keeping it open even after Claude Code exits. Without this break,
             # we'd block forever waiting for EOF that never comes.
-            if stream.did_emit_completed:
+            # #776: a live session keeps reading; `_subprocess_watchdog`
+            # carries the #505 protection instead (post-exit drain + close).
+            if stream.did_emit_completed and not stream.followup_turns:
                 break
 
     async def _drain_auto_approve(
@@ -3512,7 +5505,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             payload = (json.dumps(response) + "\n").encode()
             try:
                 if pipe is not None:
-                    await pipe.send(payload)
+                    await _locked_send(pipe, payload)
                     logger.info(
                         "control_response.auto_approved",
                         request_id=req_id,
@@ -3557,7 +5550,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             payload = (json.dumps(response) + "\n").encode()
             try:
                 if pipe is not None:
-                    await pipe.send(payload)
+                    await _locked_send(pipe, payload)
                     logger.info(
                         "control_response.auto_denied",
                         request_id=req_id,
@@ -3608,7 +5601,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             payload = (json.dumps(request) + "\n").encode()
             try:
                 if pipe is not None:
-                    await pipe.send(payload)
+                    await _locked_send(pipe, payload)
                     logger.info(
                         "catalog.refresh_sent",
                         request_id=req_id,
@@ -3729,6 +5722,204 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             signal_pid_group(proc.pid, signal.SIGKILL)
         return True
 
+    # #776 live-session lifecycle knobs (class attrs so tests can shrink them).
+    _live_poll_s: float = 1.0
+    _live_close_grace_s: float = 15.0
+    # #791: after the close grace, SIGINT (the CLI's Ctrl-C path) gets this
+    # long before the SIGTERM escalation.
+    _live_close_sigint_grace_s: float = 5.0
+
+    async def _live_session_lifecycle(
+        self,
+        *,
+        state: ClaudeStreamState,
+        reader_done: anyio.Event,
+        run_logger: Any,
+        proc: Any,
+        stream: Any,
+        idle_grace_s: float,
+        max_hold_s: float,
+        abs_cap_s: float,
+    ) -> None:
+        """Decide when a live session's stdin closes (#776, phase 03).
+
+        TURN_ACTIVE → IDLE on each result. While IDLE:
+        - pending approvals / asks pause every timer;
+        - nothing live (no native bg task, no pending ScheduleWakeup) for
+          ``idle_grace_s`` → graceful close (``idle_no_tasks``);
+        - work still live ``max_hold_s`` after the last turn ended → notice +
+          graceful close (``max_hold``; re-armed by every turn);
+        - ``abs_cap_s`` from spawn → notice + close (``abs_cap``).
+        Closing stdin makes the CLI stop its tasks and exit rc=0 (F3/F4). Only
+        if it doesn't exit within ``_live_close_grace_s`` does
+        ``_await_live_exit_or_force`` log ``close_grace_expired`` and escalate
+        (SIGINT, then SIGTERM/SIGKILL); a clean idle close is not quarantined
+        (#791).
+        """
+        exit_reason = "reader_done"
+        try:
+            while not reader_done.is_set():
+                await anyio.sleep(self._live_poll_s)
+                if reader_done.is_set():
+                    return
+                sid = (
+                    state.factory.resume.value
+                    if state.factory.resume is not None
+                    else None
+                )
+                live = _LIVE_SESSIONS.get(sid) if sid else None
+                if live is None:
+                    continue
+                if live.closing:
+                    exit_reason = await self._await_live_exit_or_force(
+                        live=live,
+                        proc=proc,
+                        stream=stream,
+                        run_logger=run_logger,
+                        reader_done=reader_done,
+                    )
+                    return
+                now = time.monotonic()
+                live_work = has_live_background_work(state) or _has_pending_wakeup(
+                    state
+                )
+                if abs_cap_s > 0 and now - live.spawned_at >= abs_cap_s:
+                    await close_live_session(sid, "abs_cap", notice=live_work)
+                    continue
+                if not live.idle:
+                    live.idle_since = None
+                    live.hold_started = None
+                    continue
+                if _awaiting_injected(state):
+                    # A follow-up was written; its turn hasn't opened yet.
+                    live.idle_since = now
+                    live.hold_started = now
+                    continue
+                if any(v == sid for v in _REQUEST_TO_SESSION.values()):
+                    # A pending approval / ask pauses every timer.
+                    live.idle_since = now
+                    live.hold_started = now
+                    continue
+                if live.idle_since is None:
+                    live.idle_since = now
+                    live.hold_started = now
+                elif live.had_live_work and not live_work:
+                    # Work just ended without a wake turn: fresh idle grace.
+                    live.idle_since = now
+                live.had_live_work = live_work
+                if live_work:
+                    if (
+                        max_hold_s > 0
+                        and live.hold_started is not None
+                        and now - live.hold_started >= max_hold_s
+                    ):
+                        await close_live_session(
+                            sid, "max_hold", notice=True, only_if_idle=True
+                        )
+                    continue
+                if now - live.idle_since >= idle_grace_s:
+                    await close_live_session(sid, "idle_no_tasks", only_if_idle=True)
+        except (anyio.get_cancelled_exc_class(), KeyboardInterrupt):
+            exit_reason = "cancelled"
+            raise
+        finally:
+            run_logger.info(
+                "claude.live_session.lifecycle_exited",
+                session_id=(
+                    state.factory.resume.value
+                    if state.factory.resume is not None
+                    else None
+                ),
+                reason=exit_reason,
+            )
+
+    async def _await_live_exit_or_force(
+        self,
+        *,
+        live: LiveSession,
+        proc: Any,
+        stream: Any,
+        run_logger: Any,
+        reader_done: anyio.Event,
+    ) -> str:
+        from ..utils.proc_diag import collect_proc_diag
+
+        grace_start_diag = None
+        if proc is not None and isinstance(getattr(proc, "pid", None), int):
+            with contextlib.suppress(Exception):
+                grace_start_diag = collect_proc_diag(proc.pid)
+        with anyio.move_on_after(self._live_close_grace_s):
+            await reader_done.wait()
+        if reader_done.is_set() or proc is None or proc.returncode is not None:
+            return "exited_after_close"
+        sid = live.session_id
+        live_tasks = len(live_task_descriptions(live.state))
+        # #791: a clean idle close (turn closed, nothing live, set when stdin
+        # was closed and still true now) left a complete transcript — the CLI
+        # is merely slow to exit (MCP shutdown, transcript flush, exit hook).
+        # Quarantining it would cost the user their context on the next
+        # message; #631 empty-resume recovery stays the backstop.
+        idle_clean = live.closed_idle_clean and _is_clean_idle(live)
+        # #791 (a): record what the CLI was doing before any signal changes it.
+        run_logger.warning(
+            "claude.live_session.close_grace_expired",
+            session_id=sid,
+            pid=proc.pid,
+            close_reason=live.close_reason,
+            grace_s=self._live_close_grace_s,
+            live_tasks=live_tasks,
+            idle_clean=idle_clean,
+            **_close_grace_diag(proc.pid, grace_start_diag),
+        )
+        quarantined = False
+        if (
+            not idle_clean
+            and stream is not None
+            and stream.did_emit_completed
+            and _load_quarantine_on_forced_teardown()
+        ):
+            try:
+                get_quarantine_store().quarantine(
+                    self.engine, sid, reason="forced_teardown_after_result"
+                )
+                quarantined = True
+            except Exception:  # noqa: BLE001 — never break teardown
+                run_logger.debug("session.quarantine_record_failed", exc_info=True)
+        # #791 (c): SIGINT first — the CLI's own Ctrl-C shutdown path (the
+        # whole process group, as a terminal Ctrl-C would) — then SIGTERM.
+        signal_pid_group(proc.pid, signal.SIGINT)
+        with anyio.move_on_after(self._live_close_sigint_grace_s):
+            await reader_done.wait()
+        if reader_done.is_set() or proc.returncode is not None:
+            run_logger.info(
+                "claude.live_session.exited_after_sigint",
+                session_id=sid,
+                pid=proc.pid,
+                close_reason=live.close_reason,
+                quarantined=quarantined,
+            )
+            return "sigint"
+        run_logger.warning(
+            "claude.live_session.forced_teardown",
+            session_id=sid,
+            pid=proc.pid,
+            close_reason=live.close_reason,
+            live_tasks=live_tasks,
+            idle_clean=idle_clean,
+            quarantined=quarantined,
+        )
+        if stream is not None:
+            stream.sigterm_sent = True
+        signal_pid_group(proc.pid, signal.SIGTERM)
+        deadline = time.monotonic() + self._subcountdown_sigterm_grace_s
+        while time.monotonic() < deadline:
+            await anyio.sleep(self._subcountdown_sigterm_grace_poll_s)
+            if proc.returncode is not None:
+                return "sigterm"
+        if proc.returncode is None:
+            signal_pid_group(proc.pid, signal.SIGKILL)
+        return "sigkill"
+
     async def _post_result_idle_watchdog(
         self,
         state: ClaudeStreamState,
@@ -3779,7 +5970,9 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         # started. Without entry/exit/tick logs we can't discriminate
         # them. These logs are intentionally verbose for rc17 — at 30 s
         # poll x hours of session = O(120) lines, trivial; rate-limiting
-        # now would create ambiguity in the next reproduction.
+        # now would create ambiguity in the next reproduction. #799: that
+        # held per session but not per fleet — unarmed ticks are now DEBUG,
+        # with one INFO ``armed`` edge; armed ticks stay INFO.
         #
         # Exception strategy mirrors ``_subprocess_watchdog``
         # (src/untether/runner.py:1010-1079) and
@@ -3799,6 +5992,9 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             poll_interval_s=poll_interval,
         )
         exit_reason = "loop_exited"
+        # #799: edge-triggered INFO for the idle timer arming, so the
+        # per-tick log can drop to DEBUG while nothing is armed.
+        was_armed = False
         try:
             # #333 Tier 1 entry check: if ``reader_done`` is already set
             # before the first poll (e.g. the JSONL reader finished
@@ -3859,6 +6055,20 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                         exit_reason = "reader_done"
                         return
                     armed_at = state.result_received_at
+                    # A live session's post-result idle belongs to
+                    # `_live_session_lifecycle` (#776), so it never arms here.
+                    armed_now = armed_at is not None and not state.live_mode
+                    if armed_now and not was_armed:
+                        run_logger.info(
+                            "claude.post_result_idle.armed",
+                            session_id=(
+                                state.factory.resume.value
+                                if state.factory.resume is not None
+                                else None
+                            ),
+                            timeout_s=timeout_s,
+                        )
+                    was_armed = armed_now
                     if armed_at is None:
                         # Pre-result: tick log still useful so we can
                         # confirm the watchdog is alive even before the
@@ -3896,7 +6106,17 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                             if pre_sid
                             else []
                         )
-                        run_logger.info(
+                        # #799: an unarmed tick is a no-op heartbeat — every
+                        # session, every 30 s, for the whole turn (a quarter
+                        # of nsd's journal on rc12). DEBUG, unless it carries
+                        # the #696 "waiting on the user" signal, which stays
+                        # greppable at INFO.
+                        tick_log = (
+                            run_logger.info
+                            if pre_pending_requests or pre_pending_asks
+                            else run_logger.debug
+                        )
+                        tick_log(
                             "claude.post_result_idle.tick",
                             session_id=pre_sid,
                             armed=False,
@@ -3925,6 +6145,11 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                         if killed:
                             exit_reason = "pre_result_silence_cancelled"
                             return
+                        continue
+                    if state.live_mode:
+                        # #776: after a result a live session belongs to
+                        # `_live_session_lifecycle`; this watchdog keeps only
+                        # the pre-result silence cap above.
                         continue
                     elapsed = time.monotonic() - armed_at
 
@@ -4788,13 +7013,14 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 # #361 stash PID so the env audit in translate_claude_event
                 # can sample /proc/<pid>/environ on system.init.
                 state.pid = proc.pid
-                # #593: the base runner sets last_pid but this override never
-                # did — the bridge's thread_pid() early-poll returned None for
-                # Claude, so stall diagnostics ran blind (pid=None
-                # process_alive=None) exactly when a run never emitted a
-                # StartedEvent (the only other PID source).
+                # #593/#510: hand the bridge THIS run's pid + stream through
+                # the per-run handle. ``last_pid`` / ``current_stream`` stay
+                # as diagnostics-only attributes — the runner instance is
+                # shared across chats, so they describe the latest spawn in
+                # ANY chat and must never feed per-run monitoring.
                 self.last_pid = proc.pid
                 self.current_stream = stream
+                publish_run_stream(stream, proc.pid)
                 reader_done = anyio.Event()
 
                 # #333: load post-result idle settings before the task group
@@ -4805,6 +7031,8 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 post_result_limbo_grace_s = self._post_result_limbo_grace_s
                 pre_result_silence_timeout_s = 3600.0
                 post_result_bg_max_hold_s = self._post_result_bg_max_hold_s
+                live_sessions_enabled = True
+                live_session_max_s = 14400.0
                 try:
                     result = load_settings_if_exists()
                     if result is not None:
@@ -4824,10 +7052,24 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                         post_result_bg_max_hold_s = float(
                             settings_obj.watchdog.post_result_bg_max_hold
                         )
+                        live_sessions_enabled = bool(
+                            settings_obj.watchdog.live_sessions
+                        )
+                        live_session_max_s = float(
+                            settings_obj.watchdog.live_session_max_s
+                        )
                 except Exception:  # noqa: BLE001 — settings errors must not block a run
                     run_logger.debug(
                         "post_result_idle.settings_load_failed", exc_info=True
                     )
+
+                # #776: live-session model — keep reading after the result so
+                # background-wake / follow-up turns reach the bridge.
+                if use_control_channel and live_sessions_enabled:
+                    state.live_mode = True
+                    stream.followup_turns = True
+                    state.spawn_run_options = get_run_options()
+                state.live_session_max_s = live_session_max_s
 
                 async with anyio.create_task_group() as tg:
                     tg.start_soon(
@@ -4862,6 +7104,20 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                             post_result_limbo_grace_s,
                             pre_result_silence_timeout_s,
                             post_result_bg_max_hold_s,
+                        )
+                    if state.live_mode:
+                        tg.start_soon(
+                            functools.partial(
+                                self._live_session_lifecycle,
+                                state=state,
+                                reader_done=reader_done,
+                                run_logger=run_logger,
+                                proc=proc,
+                                stream=stream,
+                                idle_grace_s=post_result_limbo_grace_s,
+                                max_hold_s=post_result_bg_max_hold_s,
+                                abs_cap_s=live_session_max_s,
+                            )
                         )
                     async for evt in self._iter_jsonl_events(
                         stdout=proc.stdout,
@@ -4899,6 +7155,12 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     # `proc.wait()` below is never reached.
                     with contextlib.suppress(Exception):
                         await proc.stderr.aclose()
+                    # #776: a live session's reader only ends at process exit
+                    # (EOF, or the post-exit drain closed stdout), so there is
+                    # no linger left for the post-result watchdog to police —
+                    # don't let the run wait out its next poll tick.
+                    if state.live_mode:
+                        tg.cancel_scope.cancel()
 
                 rc = await proc.wait()
                 # #640: mirror the base runner (runner.py:1362). ClaudeRunner
@@ -5061,7 +7323,10 @@ def build_runner(config: EngineConfig, config_path: Path) -> Runner:
     claude_cmd = shutil.which("claude") or "claude"
 
     model = config.get("model")
-    if "allowed_tools" in config:
+    # #749 remember which branch this came from: an explicit user choice
+    # survives into prompting modes, the inherited default does not.
+    allowed_tools_explicit = "allowed_tools" in config
+    if allowed_tools_explicit:
         allowed_tools = config.get("allowed_tools")
     else:
         allowed_tools = DEFAULT_ALLOWED_TOOLS
@@ -5106,6 +7371,7 @@ def build_runner(config: EngineConfig, config_path: Path) -> Runner:
         model=model,
         permission_mode=permission_mode,
         allowed_tools=allowed_tools,
+        allowed_tools_explicit=allowed_tools_explicit,
         extra_args=extra_args,
         dangerously_skip_permissions=dangerously_skip_permissions,
         use_api_billing=use_api_billing,
@@ -5122,7 +7388,11 @@ BACKEND = EngineBackend(
 
 # Phase 2: Public API for sending control responses
 async def send_claude_control_response(
-    request_id: str, approved: bool, *, deny_message: str | None = None
+    request_id: str,
+    approved: bool,
+    *,
+    deny_message: str | None = None,
+    rejects_plan: bool = True,
 ) -> bool:
     """Send a control response to an active Claude Code session.
 
@@ -5130,6 +7400,8 @@ async def send_claude_control_response(
         request_id: The control request ID
         approved: Whether to approve (True) or deny (False) the request
         deny_message: Custom denial message (used when approved=False)
+        rejects_plan: For an ExitPlanMode denial, whether it rejects the plan
+            (❌ Deny) or is procedural (Pause & Outline / Let's discuss) — #793
 
     Returns:
         True if the response was sent successfully, False if the request is not found
@@ -5162,7 +7434,7 @@ async def send_claude_control_response(
 
     runner, _ = _ACTIVE_RUNNERS[session_id]
     success = await runner.write_control_response(
-        request_id, approved, deny_message=deny_message
+        request_id, approved, deny_message=deny_message, rejects_plan=rejects_plan
     )
 
     # Clean up the mapping after use
@@ -5217,6 +7489,8 @@ def _cleanup_session_registries(session_id: str) -> None:
         cleaned.append("session_stdin")
     if _SESSION_BG_STATE.pop(session_id, None) is not None:
         cleaned.append("session_bg_state")
+    if _LIVE_SESSIONS.pop(session_id, None) is not None:
+        cleaned.append("live_session")
     if session_id in _DISCUSS_APPROVED:
         cleaned.append("discuss_approved")
     _DISCUSS_APPROVED.discard(session_id)

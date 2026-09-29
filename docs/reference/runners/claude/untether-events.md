@@ -87,9 +87,24 @@ Claude Code emits a system init event early in the stream:
 **Mapping:**
 - Emit a Untether `started` event as soon as `session_id` is known.
 - Populate `meta` from `system.init` fields: `cwd`, `model`, `tools`, `permissionMode`, `output_style`. The `model` and `permissionMode` fields are used by the bridge to render the `🏷` footer line on final messages.
-- Assume only one `system.init` per run; if more appear, ignore the subsequent
-  ones to avoid re-locking.
+- The first `system.init` per run produces the `started` event. In a live
+  session (#776) every later turn begins with another `system.init`: it opens a
+  follow-up turn (see 4.5) and never re-emits `started`.
+- Background-task subtypes (`task_started`, `task_progress`, `task_updated`,
+  `task_notification`, `background_tasks_changed`) emit no Untether events;
+  they maintain the native task map (`ClaudeStreamState.tasks`).
+- `system/api_retry` (#792) emits one `note` action per retry sequence,
+  updated in place (`🔁 API error 529 (overloaded) — retrying in 8s (attempt
+  2/10)`; level `warning` on the final attempt) and latches an expected wait
+  so the stall monitor stays quiet during the back-off.
 - Optional: emit a `note` action summarizing tools/MCP servers (debug-only).
+
+The top-level `rate_limit_event` line (#790) is a quota snapshot, not a
+throttle notice: `allowed` emits nothing; `allowed_warning` emits at most one
+`note` per window (`⚠️ 5h limit N% used — resets HH:MM`); only `rejected` not
+covered by overage emits a `⏳ Rate limited until …` note and latches the wait
+until `resetsAt`. Bare events emit nothing. Decision table:
+[stream-json cheatsheet](stream-json-cheatsheet.md#rate_limit_event).
 
 ### 4.2 `assistant` / `user` message events
 
@@ -148,12 +163,21 @@ The terminal event looks like:
 - `error = event.error` (if present)
 - `resume = ResumeToken(engine="claude", value=event.session_id)`
 - `usage = event.usage` (pass through)
-- Emit exactly one `completed` event; ignore any trailing JSON lines afterward.
-  No idle-timeout completion is used.
+- Emit exactly one `completed` event per run. With live sessions off (or in
+  legacy `-p` mode) trailing lines are ignored; with live sessions on (#776)
+  reading continues and later results close follow-up turns (4.5).
+- `total_cost_usd` is cumulative per session, across `--resume` too; the bridge
+  derives per-run/per-turn deltas (#778).
+- **Resume guard:** on a resumed run, a 0-turn result (`num_turns == 0`,
+  `duration_api_ms == 0`) that follows a replayed `task_notification{stopped}`
+  before any assistant output is absorbed — no `completed`; the next result is
+  the answer.
 
 #### Supplementary `started` event after `result` (`✓ turn complete`)
 
 Every successful `result` (i.e. `is_error=false`) MAY also emit a supplementary `started` event carrying late-arriving meta — `meta={"complete": "✓ turn complete"}` ([#333](https://github.com/littlebearapps/untether/issues/333)). This is the supported pattern for late-arriving meta documented in `runner-development.md`: `ProgressTracker.note_event` merges meta idempotently so the marker shows up in the footer (`format_meta_line`) alongside model / effort / permission / trigger without duplicating the StartedEvent. Errored results do **not** emit the marker — no false "complete" tag on a failure.
+
+The runner emits this supplementary event only for the result that closes the run. Later turns of a live session ([#776](https://github.com/littlebearapps/untether/issues/776)) end in a `TurnEvent(phase="completed")` instead, so the bridge adds the marker itself: `handle_message`'s `_deliver_final` adds `meta["complete"]` (the shared `untether.model.TURN_COMPLETE_MARKER`) to the final's snapshot for every `ok=True` turn, whatever started it (follow-up, queued follow-up, background-task wake, Monitor tick, scheduled wake-up). The turn's tracker is left alone, so the turn's in-flight progress message never shows the marker; failed and interrupted turns don't get it ([#798](https://github.com/littlebearapps/untether/issues/798)).
 
 #### Permission denials
 
@@ -161,6 +185,33 @@ Every successful `result` (i.e. `is_error=false`) MAY also emit a supplementary 
 > `result.permission_denials` with blocked tool calls, but Untether's
 > `StreamResultMessage` schema does not capture this field and the runner does
 > not emit warning actions for denials. This is a candidate for future work.
+
+### 4.5 Follow-up turns in a live session (#776)
+
+After the run's `completed`, each later turn in the same process is emitted as
+
+```
+TurnEvent(phase="started", turn=N, reason=…) → ActionEvent* → TurnEvent(phase="completed", turn=N, ok, answer, usage)
+```
+
+built with `EventFactory.turn_started` / `turn_completed`. The turn opens on the
+first post-result `system.init`, assistant message, or non-tool-result user
+message; `reason` comes from what preceded it: an injected line's
+`command_lifecycle.command_uuid` (`followup`), a `task_notification`
+(`task_finished`), a `command_lifecycle(started)` with an unknown uuid
+(`scheduled_wakeup`), or a live Monitor task (`monitor_event`). Assistant/user
+events tagged `parent_tool_use_id` (a background subagent) never open a turn.
+`command_lifecycle` lines themselves emit nothing.
+
+Attribution (#785): a `task_notification` only labels the next turn when the
+task is top-level background work (`is_backgrounded` and not
+`owned_by_subagent`); others are logged `claude.turn.notification_ignored`.
+A turn that opened `unknown` (the CLI often starts it on a background agent's
+result before any task event) completes as `task_finished` if a top-level task
+ends during it (`detail.retro_attributed`), or is paired with a task ending
+within 30 s after it. The task's own notification turn that follows carries
+`detail.already_announced` and the bridge delivers it without a push.
+`TurnEvent(completed)` carries the turn's `detail`.
 
 ### 4.4 Error handling / malformed lines
 

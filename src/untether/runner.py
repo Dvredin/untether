@@ -9,7 +9,8 @@ import signal
 import subprocess
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, cast
 from weakref import WeakValueDictionary
@@ -396,6 +397,14 @@ class JsonlStreamState:
     # records — set-only, so it states a fact about the run rather than
     # about frame ordering.
     saw_result: bool = False
+    # #776: set by runners that keep their process live after the first
+    # result (Claude control-channel mode). The base line handler then keeps
+    # translating after CompletedEvent instead of dropping lines, and later
+    # turns surface as TurnEvent segments.
+    followup_turns: bool = False
+    # #776 / #505: set when the post-exit drain had to close stdout because a
+    # grandchild still held the inherited fd.
+    stdout_held_after_exit: bool = False
     event_count: int = 0
     recent_events: deque[tuple[float, str]] = field(
         default_factory=lambda: deque(maxlen=10)
@@ -450,8 +459,75 @@ class JsonlStreamState:
     stall_suppression_counts: dict[str, int] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class RunStreamHandle:
+    """Per-run binding of a spawn's ``JsonlStreamState`` and PID (#510).
+
+    Runner instances are shared across chats, so anything stored on the
+    runner (``current_stream`` / ``last_pid``) describes *the most recent
+    spawn in any chat*. The bridge instead creates one handle per
+    ``run_runner_with_cancel`` call and exposes it through ``_RUN_STREAM``;
+    the runner's ``run_impl`` — which executes in the task iterating the run
+    generator, so it inherits the bridge's context — publishes its own
+    stream and PID into it via :func:`publish_run_stream`.
+    """
+
+    stream: JsonlStreamState | None = None
+    pid: int | None = None
+    ready: anyio.Event = field(default_factory=anyio.Event)
+
+
+_RUN_STREAM: ContextVar[RunStreamHandle | None] = ContextVar(
+    "untether.run_stream", default=None
+)
+
+
+def current_run_stream_handle() -> RunStreamHandle | None:
+    return _RUN_STREAM.get()
+
+
+def set_run_stream_handle(handle: RunStreamHandle | None) -> Token:
+    """Bind ``handle`` as the current run's stream handle for this context.
+
+    Must be called BEFORE the task that iterates the runner is started:
+    anyio child tasks copy the context at spawn time.
+    """
+    return _RUN_STREAM.set(handle)
+
+
+def reset_run_stream_handle(token: Token) -> None:
+    _RUN_STREAM.reset(token)
+
+
+@contextlib.contextmanager
+def bind_run_stream_handle(handle: RunStreamHandle) -> Iterator[RunStreamHandle]:
+    """Context-manager form of :func:`set_run_stream_handle`."""
+    token = set_run_stream_handle(handle)
+    try:
+        yield handle
+    finally:
+        reset_run_stream_handle(token)
+
+
+def publish_run_stream(stream: JsonlStreamState, pid: int | None) -> None:
+    """Publish this run's stream + PID (together) to the bridge's handle.
+
+    No-op when no handle is bound (e.g. a runner driven directly by a test
+    or a CLI path that doesn't go through the bridge). Re-publishing (a
+    second spawn inside one run) overwrites — it is still this run's process.
+    """
+    handle = _RUN_STREAM.get()
+    if handle is None:
+        return
+    handle.stream = stream
+    handle.pid = pid
+    handle.ready.set()
+
+
 class JsonlSubprocessRunner(BaseRunner):
-    # Exposed for diagnostics — set during run_impl, cleared on exit
+    # Diagnostics only: the most recent spawn on this (shared) runner
+    # instance, in ANY chat. Never cleared, and never read by the bridge —
+    # per-run binding goes through ``publish_run_stream`` (#510).
     current_stream: JsonlStreamState | None = None
     last_pid: int | None = None
 
@@ -930,7 +1006,7 @@ class JsonlSubprocessRunner(BaseRunner):
         logger: Any,
         pid: int,
     ) -> list[UntetherEvent]:
-        if stream.did_emit_completed:
+        if stream.did_emit_completed and not stream.followup_turns:
             if not stream.ignored_after_completed:
                 log_pipeline(
                     logger,
@@ -1037,6 +1113,10 @@ class JsonlSubprocessRunner(BaseRunner):
                     jsonl_seq=seq,
                 )
                 output.append(evt)
+                # #776: a live runner keeps translating after completion —
+                # later turns arrive as TurnEvent segments in later batches.
+                if stream.followup_turns:
+                    continue
                 break
             output.append(evt)
         return output
@@ -1072,6 +1152,8 @@ class JsonlSubprocessRunner(BaseRunner):
                 break
 
     _WATCHDOG_GRACE_SECONDS: float = 5.0
+    # #776: post-exit stdout drain for runners that read past the result.
+    _POST_EXIT_DRAIN_SECONDS: float = 2.0
 
     _WATCHDOG_POLL_SECONDS: float = 0.5
 
@@ -1329,7 +1411,26 @@ class JsonlSubprocessRunner(BaseRunner):
                         prev_diag = diag
 
             await anyio.sleep(self._WATCHDOG_POLL_SECONDS)
-        if stream.did_emit_completed or reader_done.is_set():
+        if reader_done.is_set():
+            return
+        if stream.did_emit_completed and stream.followup_turns:
+            # #776 / #505: a live runner keeps reading after the result, so
+            # the old "stop at the first result" protection no longer
+            # applies. Once the process is gone, give the reader a short
+            # drain for the final lines, then close our read end so a
+            # grandchild holding the inherited stdout fd can't block it.
+            with anyio.move_on_after(self._POST_EXIT_DRAIN_SECONDS):
+                await reader_done.wait()
+            if reader_done.is_set():
+                return
+            stream.stdout_held_after_exit = True
+            logger.warning("subprocess.stdout_held_after_exit", pid=pid)
+            stdout = getattr(proc, "stdout", None)
+            if stdout is not None:
+                with contextlib.suppress(Exception):
+                    await stdout.aclose()
+            return
+        if stream.did_emit_completed:
             return
         # Process is dead but reader hasn't finished — wait grace period.
         with anyio.move_on_after(self._WATCHDOG_GRACE_SECONDS):
@@ -1413,7 +1514,6 @@ class JsonlSubprocessRunner(BaseRunner):
                 )
                 raise RuntimeError(self.pipes_error_message())
 
-            self.last_pid = proc.pid
             logger.info(
                 "subprocess.spawn",
                 cmd=cmd[0] if cmd else None,
@@ -1421,10 +1521,16 @@ class JsonlSubprocessRunner(BaseRunner):
                 pid=proc.pid,
             )
 
+            # #510: create the stream before sending the payload and publish
+            # pid + stream together, so nobody ever sees this spawn's pid
+            # paired with a previous spawn's stream.
+            stream = JsonlStreamState(expected_session=resume)
+            self.last_pid = proc.pid
+            self.current_stream = stream
+            publish_run_stream(stream, proc.pid)
+
             await self._send_payload(proc, payload, logger=logger, resume=resume)
 
-            stream = JsonlStreamState(expected_session=resume)
-            self.current_stream = stream
             reader_done = anyio.Event()
 
             async with anyio.create_task_group() as tg:

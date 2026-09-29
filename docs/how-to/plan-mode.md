@@ -9,7 +9,7 @@ When you're away from the terminal, you need confidence that your agent won't go
 | **Plan** | `/planmode on` | `--permission-mode plan` | All tool calls and plan transitions require Telegram approval |
 | **Plan-auto** | `/planmode plan-auto` | `--permission-mode plan` | Tools are auto-approved; ExitPlanMode is also auto-approved (no buttons) |
 | **Auto** | `/planmode auto` | `--permission-mode auto` | Claude Code's own auto mode — a classifier approves routine work and blocks risky actions. No plan phase |
-| **Accept edits** | `/planmode off` | `--permission-mode acceptEdits` | No approval buttons — Claude Code runs without interruption |
+| **Accept edits** | `/planmode off` | `--permission-mode acceptEdits` | No plan phase; file edits run freely, other actions ask for approval |
 
 **Plan** is the most interactive mode. You see every file edit, shell command, and plan transition as inline buttons.
 
@@ -17,7 +17,7 @@ When you're away from the terminal, you need confidence that your agent won't go
 
 **Auto** hands the decision to Claude Code's own classifier rather than to Untether. Routine work — local edits, installing declared dependencies, read-only requests — runs without prompting, while risky actions are blocked: sending sensitive data to external endpoints, production deploys, force pushes, `rm -rf` on unresolvable targets. There's no plan phase at all. Questions the agent asks you still arrive as option buttons, and if the classifier blocks the same action repeatedly, Claude Code falls back to prompting you in Telegram.
 
-**Accept edits** skips permission control entirely. Use this when you trust the agent to make changes autonomously.
+**Accept edits** has no plan phase. Reads, file edits inside the project and common filesystem commands run without buttons; anything else (most shell commands, web fetches, MCP tools) shows Approve / Deny buttons unless your Claude Code `permissions.allow` rules already allow it. Before v0.35.5, Untether pre-approved `Bash`, `Read`, `Edit` and `Write` and approved everything else silently, so this mode never prompted ([#749](https://github.com/littlebearapps/untether/issues/749)). To keep the old hands-off behaviour, use **Plan-auto** or **Auto**, or add allow rules to your Claude Code settings.
 
 !!! note "Renamed in v0.35.5"
     **Plan-auto** was called **auto** before v0.35.5. Claude Code introduced its own `auto` mode, and the two names collided — Untether's version shadowed it, so the real one was unreachable. Per-chat settings you made through `/planmode` or `/config` are migrated for you the first time v0.35.5 starts. If you set `permission_mode = "auto"` in `untether.toml` and want the old behaviour, change it to `"plan-auto"`; Untether logs a warning at startup when it sees the ambiguous value.
@@ -137,6 +137,14 @@ Either way, **Approve Plan / Let's discuss / Deny buttons** appear in Telegram s
 Once you approve a plan outline (via "Approve Plan"), subsequent tool calls in the same session — Edit, Write, Bash — are auto-approved without showing individual diff preview buttons. You have already reviewed the plan, so per-tool approval is skipped.
 
 This applies whether you approve via "Approve Plan" after an outline or by directly approving an ExitPlanMode request. Starting a new session (via `/new` or a new message) restores normal approval behaviour.
+
+## The plan in the final message
+
+Untether deletes the plan messages once you tap a button. If Claude Code then finishes with only a short reply, Untether adds the plan to the top of the final message under **📋 Plan (approved):** so you still have it on your phone.
+
+Only a plan you actually approved gets that header. That means you tapped Approve, `plan-auto` approved it for you, or you tapped Approve Plan after an outline. A plan you denied is never shown there, and neither is one that timed out. **Pause & Outline Plan** and **Let's discuss** don't reject the plan, so if you approve the same plan after the outline or the discussion, it is shown as usual.
+
+Claude Code keeps the plan in a plan file and also sends a copy with its plan request. When it writes the file and asks for approval in the same step, that copy can still hold the *previous* plan. Untether takes the plan from the file instead, so the plan under the header is the one you approved. If Claude Code doesn't use a plan file and the copy matches a plan you denied, Untether leaves the plan out rather than label the denied text as approved ([#793](https://github.com/littlebearapps/untether/issues/793)).
 
 ## Per-cron override (scheduled runs) {#cron-override}
 

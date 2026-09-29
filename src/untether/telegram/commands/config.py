@@ -5,6 +5,7 @@ from __future__ import annotations
 from ...commands import CommandBackend, CommandContext, CommandResult
 from ...ids import DEPRECATED_ENGINES
 from ...logging import get_logger
+from ...runners.run_options import CLAUDE_PLAN_AUTO_MODE
 from ...transport import RenderedMessage
 
 logger = get_logger(__name__)
@@ -111,7 +112,8 @@ _HOME_HINTS: dict[str, dict[str, str]] = {
     "pm": {
         "on": "approve actions",
         "off": "run freely",
-        "auto": "auto-approve actions",
+        "plan-auto": "auto-approve plans",
+        "auto": "classifier-gated",
         "default": "agent decides",
         "full auto": "all tools approved",
         "safe": "untrusted tools blocked",
@@ -132,6 +134,7 @@ _HOME_HINTS: dict[str, dict[str, str]] = {
         "off": "compact progress",
     },
     "tr": {"all": "respond to everything", "mentions": "@mention only"},
+    "fu": {"queue": "wait for the run", "steer": "fold into the run"},
     "md": {"default": "from CLI settings"},
     "rs": {"default": "from CLI settings"},
 }
@@ -203,6 +206,7 @@ async def _page_home(ctx: CommandContext) -> None:
 
     pm_label = "—"
     listen_label = "all"
+    followup_label = _followup_default()
     model_label = "default"
     reasoning_label = "default"
     aq_label = "default"
@@ -219,6 +223,8 @@ async def _page_home(ctx: CommandContext) -> None:
         if current_engine == "claude":
             if pm == "plan":
                 pm_label = "on"
+            elif pm == CLAUDE_PLAN_AUTO_MODE:
+                pm_label = "plan-auto"
             elif pm == "auto":
                 pm_label = "auto"
             elif pm is not None:
@@ -237,6 +243,10 @@ async def _page_home(ctx: CommandContext) -> None:
 
         listen = await prefs.get_listen_mode(chat_id)
         listen_label = listen or "all"
+
+        followup_chat = await prefs.get_followup_mode(chat_id)
+        if followup_chat is not None:
+            followup_label = followup_chat
 
         # Model override for current engine
         if engine_override and engine_override.model:
@@ -312,7 +322,9 @@ async def _page_home(ctx: CommandContext) -> None:
     if show_plan_mode:
         if current_engine == "claude":
             lines.append("<b>Agent controls</b> <i>(Claude Code)</i>")
-            lines.append(f"Plan mode: <b>{pm_label}</b>{_home_hint('pm', pm_label)}")
+            lines.append(
+                f"Permission mode: <b>{pm_label}</b>{_home_hint('pm', pm_label)}"
+            )
             if show_ask_questions:
                 lines.append(
                     f"Ask mode: <b>{aq_display}</b>{_home_hint('aq', aq_label)}"
@@ -366,6 +378,10 @@ async def _page_home(ctx: CommandContext) -> None:
         model_hint = f"  · {engine_hint}"
     lines.append(f"Model: <b>{model_label}</b>{model_hint}")
     lines.append(f"Listen: <b>{listen_label}</b>{_home_hint('tr', listen_label)}")
+    if current_engine == "claude":
+        lines.append(
+            f"Follow-up: <b>{followup_label}</b>{_home_hint('fu', followup_label)}"
+        )
     # #294: master trigger pause indicator on the home page when there's a
     # trigger manager with configured crons/webhooks. Sits below the chat
     # "Listen" line to keep the two senses of "trigger" visually distinct
@@ -411,7 +427,7 @@ async def _page_home(ctx: CommandContext) -> None:
         # Claude Code layout
         buttons.append(
             [
-                {"text": "📋 Plan mode", "callback_data": "config:pm"},
+                {"text": "📋 Permission mode", "callback_data": "config:pm"},
                 {"text": "❓ Ask mode", "callback_data": "config:aq"},
             ]
         )
@@ -441,6 +457,7 @@ async def _page_home(ctx: CommandContext) -> None:
         )
         buttons.append(
             [
+                {"text": "↪️ Follow-up", "callback_data": "config:fu"},
                 {"text": "ℹ️ About", "callback_data": "config:ab"},
             ]
         )
@@ -527,7 +544,14 @@ async def _page_home(ctx: CommandContext) -> None:
 # Plan mode
 # ---------------------------------------------------------------------------
 
-_PM_MODES: dict[str, str] = {"on": "plan", "auto": "auto", "off": "acceptEdits"}
+# #741 `pa` is Untether's plan-gate sugar (CLI plan + auto-approved
+# ExitPlanMode); `auto` is now Claude Code's own classifier-gated auto mode.
+_PM_MODES: dict[str, str] = {
+    "on": "plan",
+    "pa": CLAUDE_PLAN_AUTO_MODE,
+    "auto": "auto",
+    "off": "acceptEdits",
+}
 
 _CODEX_PM_MODES: dict[str, str] = {"fa": "auto", "safe": "safe"}
 
@@ -684,6 +708,8 @@ async def _page_planmode(ctx: CommandContext, action: str | None = None) -> None
     if engine == "claude":
         if pm == "plan":
             current_label = "on"
+        elif pm == CLAUDE_PLAN_AUTO_MODE:
+            current_label = "plan-auto"
         elif pm == "auto":
             current_label = "auto"
         elif pm is not None:
@@ -692,13 +718,15 @@ async def _page_planmode(ctx: CommandContext, action: str | None = None) -> None
             current_label = "default"
 
         lines = [
-            "<b>📋 Plan mode</b>",
+            "<b>📋 Permission mode</b>",
             "",
-            "Review and approve each action before it runs.",
+            "How much Claude checks with you before acting.",
             "",
             "• <b>off</b> — run freely, no approval needed",
-            "• <b>on</b> — ask before every action (safest)",
-            "• <b>auto</b> — approve actions, ask before finalising plans",
+            "• <b>on</b> — plan mode; approve the plan before edits",
+            "• <b>plan-auto</b> — plan mode, plan approved automatically",
+            "• <b>auto</b> — Claude Code's own auto mode: a classifier"
+            " approves routine work and blocks risky actions",
             "",
             "ℹ️ <i>Default: uses Claude Code's own permission mode</i>",
             "",
@@ -720,9 +748,15 @@ async def _page_planmode(ctx: CommandContext, action: str | None = None) -> None
             ],
             [
                 {
+                    "text": _check("Plan-auto", active=current_label == "plan-auto"),
+                    "callback_data": "config:pm:pa",
+                },
+                {
                     "text": _check("Auto", active=current_label == "auto"),
                     "callback_data": "config:pm:auto",
                 },
+            ],
+            [
                 {"text": "Clear override", "callback_data": "config:pm:clr"},
             ],
             [{"text": "← Back", "callback_data": "config:home"}],
@@ -1185,6 +1219,100 @@ async def _page_trigger(ctx: CommandContext, action: str | None = None) -> None:
         ],
         [
             {"text": "Clear override", "callback_data": "config:tr:clr"},
+            {"text": "← Back", "callback_data": "config:home"},
+        ],
+    ]
+
+    await _respond(ctx, "\n".join(lines), buttons)
+
+
+# ---------------------------------------------------------------------------
+# Follow-up mode (#775): queue vs steer for messages sent during a live run
+# ---------------------------------------------------------------------------
+
+
+def _followup_default() -> str:
+    """The ``[transports.telegram] followup_mode`` default (``queue``)."""
+    try:
+        from ...settings import load_settings_if_exists
+
+        result = load_settings_if_exists()
+        if result is not None:
+            return result[0].transports.telegram.followup_mode
+    except (OSError, ValueError, KeyError, AttributeError):
+        pass
+    return "queue"
+
+
+async def _page_followup(ctx: CommandContext, action: str | None = None) -> None:
+    from ..chat_prefs import ChatPrefsStore, resolve_prefs_path
+
+    config_path = ctx.config_path
+    if config_path is None:
+        await _respond(
+            ctx,
+            "<b>↪️ Follow-up mode</b>\n\nUnavailable (no config path).",
+            [[{"text": "← Back", "callback_data": "config:home"}]],
+        )
+        return
+
+    prefs = ChatPrefsStore(resolve_prefs_path(config_path))
+    chat_id = ctx.message.channel_id
+
+    if action in {"q", "s"}:
+        mode = "steer" if action == "s" else "queue"
+        await prefs.set_followup_mode(chat_id, mode)
+        logger.info("config.followup.set", chat_id=chat_id, mode=mode)
+        await _page_home(ctx)
+        return
+    if action == "clr":
+        await prefs.clear_followup_mode(chat_id)
+        logger.info("config.followup.cleared", chat_id=chat_id)
+        await _page_home(ctx)
+        return
+
+    current = await prefs.get_followup_mode(chat_id)
+    default = _followup_default()
+    effective = current or default
+    source = "chat" if current is not None else "default"
+    current_engine, _label = await _resolve_effective_engine(ctx)
+
+    lines = [
+        "<b>↪️ Follow-up mode</b>",
+        "",
+        "What a message sent while Claude is working does.",
+        "",
+        "• <b>queue</b> — waits for the current turn to finish, then runs (default)",
+        "• <b>steer</b> — goes straight into the running turn; Claude picks it "
+        "up at its next step",
+        "",
+        "One-off: <code>/steer &lt;text&gt;</code> or "
+        "<code>/queue &lt;text&gt;</code>. Files, albums and forwards always "
+        "queue.",
+        "",
+        f"Current: <b>{effective}</b> ({source})",
+    ]
+    if current_engine != "claude":
+        lines += [
+            "",
+            f"⚠️ Steer is Claude Code only — <b>{current_engine}</b> runs "
+            "always queue follow-ups.",
+        ]
+    lines += ["", f'📖 <a href="{_DOCS_BASE}steer-follow-ups/">Learn more</a>']
+
+    buttons = [
+        [
+            {
+                "text": _check("Queue", active=effective == "queue"),
+                "callback_data": "config:fu:q",
+            },
+            {
+                "text": _check("Steer", active=effective == "steer"),
+                "callback_data": "config:fu:s",
+            },
+        ],
+        [
+            {"text": "Clear override", "callback_data": "config:fu:clr"},
             {"text": "← Back", "callback_data": "config:home"},
         ],
     ]
@@ -2199,6 +2327,7 @@ _PAGES: dict[str, object] = {
     "vb": _page_verbose,
     "ag": _page_engine,
     "tr": _page_trigger,
+    "fu": _page_followup,
     "tg": _page_triggers,
     "md": _page_model,
     "rs": _page_reasoning,
@@ -2238,7 +2367,8 @@ class ConfigCommand:
             "pm": {
                 "on": "Plan mode: on",
                 "off": "Plan mode: off",
-                "auto": "Plan mode: auto",
+                "pa": "Plan mode: plan-auto",
+                "auto": "Permission mode: auto",
                 "clr": "Permission mode: cleared",
                 "fa": "Approval policy: full auto",
                 "ya": "Approval mode: full access",
@@ -2256,6 +2386,11 @@ class ConfigCommand:
                 "all": "Listen: all",
                 "men": "Listen: mentions",
                 "clr": "Listen: cleared",
+            },
+            "fu": {
+                "q": "Follow-up: queue",
+                "s": "Follow-up: steer",
+                "clr": "Follow-up: cleared",
             },
             "tg": {
                 "pause": "⏸ Triggers paused",

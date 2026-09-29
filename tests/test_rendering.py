@@ -235,3 +235,402 @@ def test_render_markdown_keeps_valid_link() -> None:
     link_entities = [e for e in entities if e.get("type") == "text_link"]
     assert len(link_entities) == 1
     assert link_entities[0]["url"] == "https://docs.example.com"
+
+
+# ---------------------------------------------------------------------------
+# #786 — model-emitted <br> renders as a line break, not literally
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tag", ["<br>", "<br/>", "<br />", "<BR>", "<Br />"])
+def test_render_markdown_inline_br_becomes_newline(tag: str) -> None:
+    text, entities = render_markdown(f"line one{tag}line two")
+
+    assert text == "line one\nline two"
+    assert entities == []
+
+
+def test_render_markdown_br_inside_bold_keeps_entity() -> None:
+    text, entities = render_markdown("**a<br>b**")
+
+    assert text == "a\nb"
+    assert entities == [{"type": "bold", "offset": 0, "length": 3}]
+
+
+def test_render_markdown_br_only_paragraph_is_dropped() -> None:
+    """The observed #786 shape: a `<br>` spacer paragraph between the
+    answer and the footer."""
+    text, _ = render_markdown("The agents are still running.\n\n<br>\n\n🏷 footer")
+
+    assert "<br>" not in text
+    assert text == "The agents are still running.\n\n🏷 footer"
+
+
+def test_render_markdown_trailing_br_only_paragraph_dropped() -> None:
+    text, _ = render_markdown("answer\n\n<br>")
+
+    assert text == "answer"
+
+
+def test_render_markdown_br_in_pipe_table_row_becomes_space() -> None:
+    """commonmark renders no tables, so a pipe row stays one line of text —
+    a space keeps the row readable where a newline would split the cell."""
+    text, _ = render_markdown("| a<br>b | c |\n|---|---|\n| d | e |")
+
+    assert "<br>" not in text
+    assert "| a b | c |" in text
+
+
+def test_render_markdown_br_in_code_span_preserved() -> None:
+    text, entities = render_markdown("use `a<br>b` here")
+
+    assert text == "use a<br>b here"
+    assert {"type": "code", "offset": 4, "length": 6} in entities
+
+
+def test_render_markdown_br_in_fenced_block_preserved() -> None:
+    text, _ = render_markdown("```html\n<p>a<br>b</p>\n```")
+
+    assert text == "<p>a<br>b</p>"
+
+
+def test_render_markdown_br_in_indented_code_block_preserved() -> None:
+    text, _ = render_markdown("para\n\n    a<br>b\n")
+
+    assert text.endswith("a<br>b")
+
+
+def test_render_markdown_other_html_still_literal() -> None:
+    """#713 posture: only a bare <br> is normalised; every other tag —
+    including <br> look-alikes and <br> with attributes — stays text."""
+    text, _ = render_markdown('x <b>bold</b> <svg onload=1> <brx> <br class="c"> <br>y')
+
+    assert "<b>bold</b>" in text
+    assert "<svg onload=1>" in text
+    assert "<brx>" in text
+    assert '<br class="c">' in text
+    assert text.endswith("\ny")
+
+
+# ---------------------------------------------------------------------------
+# #788 — bare filenames whose extension is a TLD (.md/.sh/.py) are rendered
+# as inline code, so neither our linkify nor Telegram turns them into links
+# ---------------------------------------------------------------------------
+
+
+def _code_spans(text: str, entities: list[dict]) -> list[str]:
+    """Return the text covered by each `code` entity (UTF-16 offsets are
+    safe here because the test strings are ASCII)."""
+    return [
+        text[e["offset"] : e["offset"] + e["length"]]
+        for e in entities
+        if e.get("type") == "code"
+    ]
+
+
+def _link_urls(entities: list[dict]) -> list[str]:
+    return [e["url"] for e in entities if e.get("type") == "text_link"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CLAUDE.md",
+        "AGENTS.md",
+        "README.md",
+        "setup.sh",
+        "main.py",
+        "src/untether/telegram/render.py",
+        "~/.claude/CLAUDE.md",
+        "docs/how-to/troubleshooting.md",
+        "NOTES.MD",
+    ],
+)
+def test_render_markdown_bare_filename_becomes_code(name: str) -> None:
+    text, entities = render_markdown(f"Update {name} now")
+
+    assert text == f"Update {name} now"
+    assert _code_spans(text, entities) == [name]
+    assert _link_urls(entities) == []
+
+
+def test_render_markdown_filename_at_sentence_end_excludes_period() -> None:
+    text, entities = render_markdown("Read CLAUDE.md. Then AGENTS.md, then run.sh!")
+
+    assert _code_spans(text, entities) == ["CLAUDE.md", "AGENTS.md", "run.sh"]
+    assert _link_urls(entities) == []
+
+
+@pytest.mark.parametrize(
+    ("md", "expected"),
+    [
+        ("see render.py:86 for it", ["render.py:86"]),
+        ("see src/a.py:12:4 now", ["src/a.py:12:4"]),
+        ("Edit CLAUDE.md: add a rule", ["CLAUDE.md"]),
+        ("run ./scripts/staging.sh install", ["./scripts/staging.sh"]),
+        ("(CLAUDE.md) and 'setup.sh'", ["CLAUDE.md", "setup.sh"]),
+    ],
+)
+def test_render_markdown_filename_edge_shapes(md: str, expected: list[str]) -> None:
+    text, entities = render_markdown(md)
+
+    assert text == md
+    assert _code_spans(text, entities) == expected
+    assert _link_urls(entities) == []
+
+
+def test_render_markdown_filename_in_bold_is_code_not_link() -> None:
+    text, entities = render_markdown("**CLAUDE.md** changed")
+
+    assert text == "CLAUDE.md changed"
+    assert _code_spans(text, entities) == ["CLAUDE.md"]
+    assert _link_urls(entities) == []
+
+
+def test_render_markdown_filename_already_in_code_span_not_double_wrapped() -> None:
+    text, entities = render_markdown("see `CLAUDE.md` here")
+
+    assert text == "see CLAUDE.md here"
+    assert entities == [{"type": "code", "offset": 4, "length": 9}]
+
+
+def test_render_markdown_filename_in_fenced_block_untouched() -> None:
+    text, entities = render_markdown("```\ncat CLAUDE.md\n```")
+
+    assert text == "cat CLAUDE.md"
+    assert [e["type"] for e in entities] == ["code", "pre"]
+
+
+def test_render_markdown_raw_url_ending_in_md_stays_link() -> None:
+    text, entities = render_markdown("see https://example.com/docs/a.md for more")
+
+    assert text == "see https://example.com/docs/a.md for more"
+    assert _link_urls(entities) == ["https://example.com/docs/a.md"]
+    assert _code_spans(text, entities) == []
+
+
+def test_render_markdown_markdown_link_to_md_file_left_alone() -> None:
+    text, entities = render_markdown(
+        "[CLAUDE.md](https://github.com/o/r/blob/main/CLAUDE.md)"
+    )
+
+    assert text == "CLAUDE.md"
+    assert _link_urls(entities) == ["https://github.com/o/r/blob/main/CLAUDE.md"]
+    assert _code_spans(text, entities) == []
+
+
+def test_render_markdown_www_host_with_md_tld_stays_link() -> None:
+    """An explicit `www.` host is a deliberate web address, not a file."""
+    _, entities = render_markdown("visit www.example.md today")
+
+    assert _link_urls(entities) == ["http://www.example.md"]
+
+
+@pytest.mark.parametrize(
+    "md",
+    [
+        "example.com is a domain",
+        "docs.rs hosts crate docs",
+        "foo.mdx and a.md5 and archive.md.bak",
+    ],
+)
+def test_render_markdown_non_target_names_unchanged(md: str) -> None:
+    text, entities = render_markdown(md)
+
+    assert text == md
+    assert _code_spans(text, entities) == []
+
+
+# ---------------------------------------------------------------------------
+# #797 — markdown pipe tables keep one row per line (commonmark has no table
+# rule, so rows used to collapse into one run-on line of pipes)
+# ---------------------------------------------------------------------------
+
+
+def _bold_spans(text: str, entities: list[dict]) -> list[str]:
+    return [
+        text[e["offset"] : e["offset"] + e["length"]]
+        for e in entities
+        if e.get("type") == "bold"
+    ]
+
+
+def test_render_markdown_pipe_table_rows_stay_on_own_lines() -> None:
+    """The issue's local repro."""
+    text, entities = render_markdown(
+        "Intro line.\n\n| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\nAfter."
+    )
+
+    assert text == "Intro line.\n\n| A | B |\n| 1 | 2 |\n| 3 | 4 |\n\nAfter."
+    # The separator row carries no content; the header is bolded instead.
+    assert _bold_spans(text, entities) == ["| A | B |"]
+
+
+def test_render_markdown_pipe_table_live_example_research() -> None:
+    """nsd-research msg 7736 (#797): a 3-column comparison table."""
+    md = (
+        "| What the report says | With Search Console + DataForSEO "
+        "| DataForSEO only |\n"
+        "|---|---|---|\n"
+        "| Where you show up today | High: Google's own record "
+        "| Directional: estimates |\n"
+        "| Pages to build (demand with no page) | High | Medium: modelled |\n"
+        "| Pages to improve (ranking but not well) | High: exact | Low: sampled |\n"
+        "| Measuring results after changes | Possible | Not possible |"
+    )
+    text, _ = render_markdown(md)
+
+    lines = text.split("\n")
+    assert lines == [
+        "| What the report says | With Search Console + DataForSEO | DataForSEO only |",
+        "| Where you show up today | High: Google's own record "
+        "| Directional: estimates |",
+        "| Pages to build (demand with no page) | High | Medium: modelled |",
+        "| Pages to improve (ranking but not well) | High: exact | Low: sampled |",
+        "| Measuring results after changes | Possible | Not possible |",
+    ]
+    assert "---" not in text
+
+
+def test_render_markdown_pipe_table_live_example_answers() -> None:
+    """nsd-main msg 10234 (#797): 2 columns, underscores/parens in cells."""
+    md = (
+        "The four answers:\n\n"
+        "| Answer | Meaning |\n"
+        "|---|---|\n"
+        "| Found them (VERIFIED_RELEVANT_PERSON) | A named person in a deciding role |\n"
+        "| Role unclear (ROLE_UNRESOLVED) | Someone found, role not confirmed |\n"
+        "| Looked, nobody listed (NOT_FOUND) | Searched, no one listed |\n"
+        "| Never looked (NOT_CHECKED, now also NOT_RUN) | Not searched yet |\n\n"
+        "Pick one."
+    )
+    text, entities = render_markdown(md)
+
+    assert text == (
+        "The four answers:\n\n"
+        "| Answer | Meaning |\n"
+        "| Found them (VERIFIED_RELEVANT_PERSON) | A named person in a deciding role |\n"
+        "| Role unclear (ROLE_UNRESOLVED) | Someone found, role not confirmed |\n"
+        "| Looked, nobody listed (NOT_FOUND) | Searched, no one listed |\n"
+        "| Never looked (NOT_CHECKED, now also NOT_RUN) | Not searched yet |\n\n"
+        "Pick one."
+    )
+    assert _bold_spans(text, entities) == ["| Answer | Meaning |"]
+
+
+def test_render_markdown_pipe_table_inline_code_and_formatting_kept() -> None:
+    md = "| Cmd | Effect |\n|:--|--:|\n| `a|b` | **bold** and CLAUDE.md |\n| `x` | y |"
+    text, entities = render_markdown(md)
+
+    assert text.split("\n") == [
+        "| Cmd | Effect |",
+        "| a|b | bold and CLAUDE.md |",
+        "| x | y |",
+    ]
+    assert _code_spans(text, entities) == ["a|b", "CLAUDE.md", "x"]
+    assert "bold" in _bold_spans(text, entities)
+
+
+def test_render_markdown_pipe_table_header_already_bold_not_double_wrapped() -> None:
+    text, entities = render_markdown("| **A** | B |\n|---|---|\n| 1 | 2 |")
+
+    assert text == "| A | B |\n| 1 | 2 |"
+    assert _bold_spans(text, entities) == ["A"]
+
+
+def test_render_markdown_pipe_table_br_in_cell_stays_space() -> None:
+    """#786 kept: a `<br>` in a cell is a space so the row isn't split."""
+    text, _ = render_markdown("| a<br>b | c |\n|---|---|\n| d<br/>e | f |")
+
+    assert text == "| a b | c |\n| d e | f |"
+
+
+def test_render_markdown_pipe_table_directly_after_paragraph() -> None:
+    """No blank line: commonmark folds the table into the paragraph."""
+    text, _ = render_markdown(
+        "Here is the comparison:\n| A | B |\n|---|---|\n| 1 | 2 |\nThat's it."
+    )
+
+    assert text == "Here is the comparison:\n| A | B |\n| 1 | 2 |\nThat's it."
+
+
+def test_render_markdown_br_before_table_in_same_paragraph_single_break() -> None:
+    text, _ = render_markdown("Intro<br>\n| A | B |\n|---|---|\n| 1 | 2 |")
+
+    assert text == "Intro\n| A | B |\n| 1 | 2 |"
+
+
+def test_render_markdown_pipe_table_without_outer_pipes() -> None:
+    text, _ = render_markdown("A | B\n--- | ---\n1 | 2\n3 | 4")
+
+    assert text == "A | B\n1 | 2\n3 | 4"
+
+
+@pytest.mark.parametrize(
+    "md",
+    [
+        # A pipe in prose: no delimiter row, so not a table.
+        "Use a | b to pipe\nand then stop.",
+        # A lone pipe-led line.
+        "| not a table\nnext line",
+        # Pipe-led rows with no delimiter row stay as they always were.
+        "| a | b |\n| c | d |",
+    ],
+)
+def test_render_markdown_pipe_lines_without_delimiter_not_a_table(md: str) -> None:
+    text, entities = render_markdown(md)
+
+    assert text == md.replace("\n", " ")
+    assert _bold_spans(text, entities) == []
+
+
+def test_render_markdown_pipe_table_in_fenced_block_untouched() -> None:
+    md = "```\n| A | B |\n|---|---|\n| 1 | 2 |\n```"
+    text, entities = render_markdown(md)
+
+    assert text == "| A | B |\n|---|---|\n| 1 | 2 |"
+    assert _bold_spans(text, entities) == []
+
+
+def test_render_markdown_pipe_table_html_stays_escaped() -> None:
+    """#713 posture: only `<br>` is normalised, even inside a table."""
+    text, _ = render_markdown("| <b>x</b> | <svg onload=1> |\n|---|---|\n| 1 | 2 |")
+
+    assert text.split("\n")[0] == "| <b>x</b> | <svg onload=1> |"
+
+
+def test_split_markdown_body_keeps_small_table_in_one_chunk() -> None:
+    table = "| A | B |\n|---|---|\n" + "".join(f"| r{i} | v{i} |\n" for i in range(5))
+    body = ("x" * 60) + "\n\n" + table + "\nafter"
+
+    chunks = split_markdown_body(body, max_chars=len(table) + 10)
+
+    assert any(table.rstrip("\n") in chunk for chunk in chunks)
+
+
+def test_split_markdown_body_repeats_table_header_when_table_is_split() -> None:
+    header = "| Key | Value |\n|---|---|\n"
+    rows = "".join(f"| row{i:02d} | value{i:02d} |\n" for i in range(20))
+    chunks = split_markdown_body(header + rows, max_chars=120)
+
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert chunk.startswith(header)
+    # No row lost or duplicated across chunks.
+    seen = [line for chunk in chunks for line in chunk.splitlines() if "row" in line]
+    assert seen == rows.splitlines()
+    # And each chunk renders as a table.
+    for chunk in chunks:
+        text, _ = render_markdown(chunk)
+        assert "---" not in text
+        assert all(line.startswith("|") for line in text.split("\n"))
+
+
+def test_split_markdown_body_table_in_fence_not_given_header() -> None:
+    body = "```\n| A | B |\n|---|---|\n" + "| x | y |\n" * 20 + "```"
+
+    chunks = split_markdown_body(body, max_chars=80)
+
+    assert len(chunks) > 1
+    # Continuations reopen the fence but never gain a repeated table header.
+    assert sum(chunk.count("| A | B |") for chunk in chunks) == 1

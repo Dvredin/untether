@@ -1,0 +1,724 @@
+"""#776: bridge-side behaviour for live Claude sessions."""
+
+from __future__ import annotations
+
+import anyio
+import pytest
+
+from tests.telegram_fakes import FakeTransport
+from tests.test_exec_bridge import (
+    _FakeClock,
+    _KeyboardPresenter,
+    _make_edits,
+    _make_engine_state,
+    _make_stream,
+)
+
+pytestmark = pytest.mark.anyio
+
+
+async def test_stall_monitor_no_autocancel_or_warning_while_live_idle() -> None:
+    """A live session idling between turns (holding for a background task)
+    emits task/command_lifecycle lines, so last_event_type is not "result",
+    and its ring buffer stays frozen for minutes. Neither may trip a stall
+    warning, frozen-ring escalation or the max_warnings auto-cancel."""
+    transport = FakeTransport()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, _KeyboardPresenter(), clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 10.0
+    edits._stall_repeat_seconds = 0.0  # every tick may warn
+    edits._STALL_MAX_WARNINGS = 2
+    cancel_event = anyio.Event()
+    edits.cancel_event = cancel_event
+    edits.stream = _make_stream(
+        last_event_type="system",
+        engine_state=_make_engine_state(
+            result_received_at=None,
+            live_mode=True,
+            completed_turns=1,
+            turn_open=False,
+        ),
+    )
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            for step in range(1, 30):
+                clock.set(100.0 + step * 700.0)  # far past the 660 s limbo mark
+                await anyio.sleep(0.02)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    assert not cancel_event.is_set()
+    assert edits._frozen_ring_count == 0
+    stall_msgs = [c for c in transport.send_calls if "min" in c["message"].text]
+    assert stall_msgs == []
+
+
+@pytest.mark.parametrize("run_level", [True, False])
+async def test_live_idle_hold_with_children_is_silent_and_not_peak_idle(
+    run_level: bool,
+) -> None:
+    """#787: a live session held between turns — result delivered, several
+    short wake turns done, only a pending ScheduleWakeup keeping it open,
+    its MCP servers showing up as 8 CPU-ticking children — must not emit a
+    "⏳ Waiting for child processes … /cancel to stop" warning, must not log
+    ``progress_edits.stall_detected`` or count a stall warning, and must not
+    report the hold as ``peak_idle`` (it goes to ``peak_live_idle`` instead)."""
+    from unittest.mock import patch
+
+    from structlog.testing import capture_logs
+
+    from untether.utils.proc_diag import ProcessDiag
+
+    transport = FakeTransport()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, _KeyboardPresenter(), clock=clock)
+    edits.run_level = run_level
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_SUBAGENT = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 10.0
+    edits._stall_repeat_seconds = 0.0
+    edits.pid = 4242
+    edits.event_seq = 123
+    cancel_event = anyio.Event()
+    edits.cancel_event = cancel_event
+    edits.stream = _make_stream(
+        last_event_type="user",
+        engine_state=_make_engine_state(
+            live_mode=True,
+            completed_turns=6,
+            turn_open=False,
+            live_wakeups={"wk1": 0.0},
+        ),
+    )
+    ticks = {"n": 0}
+
+    def busy_children(pid: int) -> ProcessDiag:
+        ticks["n"] += 1
+        n = ticks["n"]
+        return ProcessDiag(
+            pid=pid,
+            alive=True,
+            state="S",
+            cpu_utime=1000,
+            cpu_stime=200,
+            child_pids=[5001 + i for i in range(8)],
+            tree_cpu_utime=3000 + n * 50,
+            tree_cpu_stime=600 + n * 10,
+        )
+
+    with (
+        patch("untether.utils.proc_diag.collect_proc_diag", side_effect=busy_children),
+        capture_logs() as logs,
+    ):
+        async with anyio.create_task_group() as tg:
+
+            async def drive() -> None:
+                for step in range(1, 20):
+                    clock.set(100.0 + step * 120.0)  # a 38-minute hold
+                    await anyio.sleep(0.02)
+                edits.signal_send.close()
+
+            tg.start_soon(edits.run)
+            tg.start_soon(drive)
+
+    assert not cancel_event.is_set()
+    stall_msgs = [c for c in transport.send_calls if "min" in c["message"].text]
+    assert stall_msgs == []
+    for noisy in (
+        "progress_edits.stall_detected",
+        "progress_edits.stall_threshold_selected",
+    ):
+        assert [e for e in logs if e.get("event") == noisy] == []
+    suppressed = [
+        e for e in logs if e.get("event") == "progress_edits.stall_live_idle_suppressed"
+    ]
+    assert len(suppressed) == 1  # once per live-idle episode, not per tick
+    assert edits._total_stall_warn_count == 0
+    assert edits._peak_idle == 0.0
+    assert edits._peak_live_idle > 1000.0
+
+
+async def test_live_turn_active_is_not_post_result_idle() -> None:
+    transport = FakeTransport()
+    edits = _make_edits(transport, _KeyboardPresenter(), clock=_FakeClock(start=0.0))
+    edits.stream = _make_stream(
+        last_event_type="assistant",
+        engine_state=_make_engine_state(
+            live_mode=True, completed_turns=1, turn_open=True
+        ),
+    )
+    assert edits._is_live_session_idle() is False
+    assert edits._is_post_result_idle() is False
+
+
+# ── FollowupTurnRouter (phase 04) ───────────────────────────────────────────
+
+from untether import runner_bridge as rb  # noqa: E402
+from untether.model import Action, ActionEvent, TurnEvent  # noqa: E402
+from untether.progress import ProgressTracker  # noqa: E402
+from untether.transport import MessageRef  # noqa: E402
+
+USER_REF = MessageRef(channel_id=1, message_id=10)
+
+
+class _Recorder:
+    def __init__(self) -> None:
+        self.created: list[int] = []
+        self.closed: list[int] = []
+        self.delivered: list[tuple[int, bool, str, str | None, bool, int]] = []
+
+    async def create(self, ctx: rb._TurnCtx) -> None:
+        self.created.append(ctx.turn)
+
+        class _Edits:
+            def __init__(self) -> None:
+                self.events: list = []
+
+            async def on_event(self, evt) -> None:
+                self.events.append(evt)
+
+        ctx.edits = _Edits()  # type: ignore[assignment]
+        ctx.progress_ref = MessageRef(channel_id=1, message_id=100 + ctx.turn)
+
+    async def close(self, ctx: rb._TurnCtx) -> None:
+        self.closed.append(ctx.turn)
+
+    async def deliver(self, completed, ctx: rb._TurnCtx) -> None:
+        ctx.delivery["sent"] = True
+        self.delivered.append(
+            (
+                ctx.turn,
+                completed.ok,
+                completed.answer,
+                ctx.header,
+                ctx.notify,
+                ctx.reply_to.message_id,
+            )
+        )
+
+
+def _router(
+    rec: _Recorder,
+    anchors: dict[str, tuple[MessageRef, MessageRef | None]] | None = None,
+):
+    return rb.FollowupTurnRouter(
+        new_tracker=lambda: ProgressTracker(engine="claude"),
+        create_progress=rec.create,
+        close_progress=rec.close,
+        deliver=rec.deliver,
+        default_reply_to=USER_REF,
+        followup_notify=False,
+        anchor_for=(anchors or {}).get,
+    )
+
+
+def _turn(phase: str, turn: int = 2, reason: str = "task_finished", **kw):
+    return TurnEvent(engine="claude", phase=phase, turn=turn, reason=reason, **kw)
+
+
+def _action() -> ActionEvent:
+    return ActionEvent(
+        engine="claude",
+        action=Action(id="toolu_1", kind="command", title="ls"),
+        phase="started",
+    )
+
+
+async def test_router_creates_progress_on_first_action_and_routes_events() -> None:
+    """Approvals raised inside a wake turn are ActionEvents: the first one
+    forces the turn's progress message into existence, so the keyboard has
+    somewhere to render."""
+    rec = _Recorder()
+    router = _router(rec)
+    await router.on_turn(_turn("started", detail={"tasks": ["build"]}))
+    assert rec.created == []
+    await router.on_event(_action())
+    assert rec.created == [2]
+    assert router.current is not None and len(router.current.edits.events) == 1
+    await router.on_turn(_turn("completed", ok=True, answer="done"))
+    assert rec.delivered == [
+        (2, True, "done", "\N{BELL} Background task finished — build", True, 10)
+    ]
+    assert rec.closed == [2]
+    assert router.active is False
+
+
+async def test_router_retro_attributed_turn_gets_the_task_header() -> None:
+    """#785: a wake turn that opened ``unknown`` and completed attributed to
+    the task that ended during it is delivered with that task's header."""
+    rec = _Recorder()
+    router = _router(rec)
+    await router.on_turn(_turn("started", reason="unknown"))
+    assert router.current is not None
+    assert router.current.header == "\N{BELL} Claude continued"
+    await router.on_turn(
+        _turn(
+            "completed",
+            reason="task_finished",
+            ok=True,
+            answer="report",
+            detail={"tasks": ["Stale sweep: Trello"], "retro_attributed": True},
+        )
+    )
+    assert rec.delivered == [
+        (
+            2,
+            True,
+            "report",
+            "\N{BELL} Background task finished — Stale sweep: Trello",
+            True,
+            10,
+        )
+    ]
+
+
+async def test_router_already_announced_turn_is_not_pushed() -> None:
+    """#785: the second wake turn for one background-task finish arrives
+    without a push (still delivered, with its header)."""
+    rec = _Recorder()
+    router = _router(rec)
+    detail = {"tasks": ["Stale sweep: Trello"], "already_announced": True}
+    await router.on_turn(_turn("started", detail=detail))
+    await router.on_turn(_turn("completed", ok=True, answer="again", detail=detail))
+    _turn_no, _ok, _answer, header, notify, _reply = rec.delivered[0]
+    assert header == "\N{BELL} Background task finished — Stale sweep: Trello"
+    assert notify is False
+
+
+async def test_router_completed_without_detail_keeps_open_header() -> None:
+    rec = _Recorder()
+    router = _router(rec)
+    await router.on_turn(_turn("started", detail={"tasks": ["build"]}))
+    await router.on_turn(_turn("completed", ok=True, answer="done"))
+    assert rec.delivered[0][3] == "\N{BELL} Background task finished — build"
+
+
+async def test_router_short_turn_without_actions_never_creates_progress() -> None:
+    rec = _Recorder()
+    router = _router(rec)
+    await router.on_turn(_turn("started", reason="monitor_event"))
+    await router.on_turn(
+        _turn("completed", reason="monitor_event", ok=True, answer="t")
+    )
+    assert rec.created == []
+    assert rec.delivered[0][4] is False  # Monitor ticks are silent
+
+
+async def test_router_lazy_progress_after_delay(monkeypatch) -> None:
+    monkeypatch.setattr(rb, "_TURN_LAZY_PROGRESS_S", 0.05)
+    rec = _Recorder()
+    router = _router(rec)
+    async with anyio.create_task_group() as tg:
+        router.bind_task_group(tg)
+        await router.on_turn(_turn("started"))
+        await anyio.sleep(0.2)
+        assert rec.created == [2]
+        await router.on_turn(_turn("completed", ok=True, answer="x"))
+
+
+async def test_router_interrupted_turn_delivers_error_on_aclose() -> None:
+    rec = _Recorder()
+    router = _router(rec)
+    await router.on_turn(_turn("started"))
+    await router.on_event(_action())
+    await router.aclose()
+    assert len(rec.delivered) == 1
+    turn, ok, _answer, _header, _notify, _reply = rec.delivered[0]
+    assert (turn, ok) == (2, False)
+    assert rec.closed == [2]
+
+
+async def test_router_followup_turn_anchors_to_its_message() -> None:
+    rec = _Recorder()
+    anchor = MessageRef(channel_id=1, message_id=55)
+    router = _router(rec, anchors={"cmd-1": (anchor, None)})
+    await router.on_turn(_turn("started", reason="followup", command_uuid="cmd-1"))
+    await router.on_turn(
+        _turn("completed", reason="followup", command_uuid="cmd-1", ok=True, answer="a")
+    )
+    turn, ok, answer, header, notify, reply = rec.delivered[0]
+    assert header is None and reply == 55 and notify is False
+
+
+@pytest.mark.parametrize(
+    ("reason", "detail", "expected"),
+    [
+        ("scheduled_wakeup", {}, "\N{ALARM CLOCK} Scheduled wake-up"),
+        (
+            "monitor_event",
+            {"tasks": ["deploy log"]},
+            "\N{SATELLITE ANTENNA} Monitor — deploy log",
+        ),
+        ("monitor_event", {}, "\N{SATELLITE ANTENNA} Monitor"),
+        ("unknown", {}, "\N{BELL} Claude continued"),
+        (
+            "task_finished",
+            {"tasks": ["a", "b"]},
+            "\N{BELL} 2 background tasks finished",
+        ),
+        ("followup", {}, None),
+    ],
+)
+def test_turn_headers(reason: str, detail: dict, expected: str | None) -> None:
+    assert rb._turn_header(_turn("started", reason=reason, detail=detail)) == expected
+
+
+@pytest.mark.parametrize(
+    ("reason", "tasks", "expected"),
+    [
+        (
+            "cancel",
+            ["a"],
+            "\N{BLACK SQUARE FOR STOP} Stopped 1 background task: a. Reply to continue.",
+        ),
+        (
+            "drain",
+            ["a", "b"],
+            "\N{HOURGLASS WITH FLOWING SAND} Untether is restarting — stopping 2 background tasks: a, b. Reply to continue.",
+        ),
+        (
+            "max_hold",
+            ["a"],
+            "\N{HOURGLASS WITH FLOWING SAND} Closing session — 1 background task still running at the background hold limit: a. Stopping it; reply to continue.",
+        ),
+    ],
+)
+def test_live_closing_notice_wording(
+    reason: str, tasks: list[str], expected: str
+) -> None:
+    assert rb._live_closing_notice(reason, tasks) == expected
+
+
+async def test_router_tracks_last_reply_anchor_for_notices() -> None:
+    rec = _Recorder()
+    anchor = MessageRef(channel_id=1, message_id=77)
+    router = _router(rec, anchors={"cmd-9": (anchor, None)})
+    assert router.last_reply_to == USER_REF
+    await router.on_turn(_turn("started", reason="followup", command_uuid="cmd-9"))
+    assert router.last_reply_to == anchor
+
+
+async def test_router_creates_progress_once_under_concurrent_requests(
+    monkeypatch,
+) -> None:
+    """Review finding: the lazy timer and the first action could both create
+    a progress message (the first orphaned, its alias leaked)."""
+    monkeypatch.setattr(rb, "_TURN_LAZY_PROGRESS_S", 0.0)
+    rec = _Recorder()
+    real_create = rec.create
+
+    async def slow_create(ctx):
+        await anyio.sleep(0.05)  # a send in flight
+        await real_create(ctx)
+
+    rec.create = slow_create  # type: ignore[method-assign]
+    router = rb.FollowupTurnRouter(
+        new_tracker=lambda: ProgressTracker(engine="claude"),
+        create_progress=slow_create,
+        close_progress=rec.close,
+        deliver=rec.deliver,
+        default_reply_to=USER_REF,
+        followup_notify=False,
+    )
+    async with anyio.create_task_group() as tg:
+        router.bind_task_group(tg)
+        await router.on_turn(_turn("started"))
+        await anyio.sleep(0.01)  # lazy task now mid-create
+        await router.on_event(_action())
+        await router.on_turn(_turn("completed", ok=True, answer="x"))
+    assert rec.created == [2]
+    assert len(rec.delivered) == 1
+
+
+def test_run_level_edits_stand_down_during_followup_turns() -> None:
+    """Review finding: the run's own stall monitor saw a wake turn as a stall
+    (it no longer receives the turn's events) and could auto-cancel it."""
+    transport = FakeTransport()
+    edits = _make_edits(transport, _KeyboardPresenter(), clock=_FakeClock(start=0.0))
+    edits.stream = _make_stream(
+        last_event_type="assistant",
+        engine_state=_make_engine_state(
+            live_mode=True, completed_turns=1, turn_open=True
+        ),
+    )
+    assert edits._is_live_session_idle() is False  # a turn's own edits
+    edits.run_level = True
+    assert edits._is_live_session_idle() is True  # the run's edits stand down
+
+
+# ── #798: "✓ turn complete" on live follow-up / wake turn finals ────────────
+#
+# Driven through the real handle_message → FollowupTurnRouter → _deliver_final
+# path: ScriptRunner's TurnEvents reach the router exactly like a live
+# ClaudeRunner's do.
+
+from untether.markdown import MarkdownPresenter  # noqa: E402
+from untether.model import (  # noqa: E402
+    TURN_COMPLETE_MARKER,
+    CompletedEvent,
+    ResumeToken,
+    StartedEvent,
+)
+from untether.runner_bridge import (  # noqa: E402
+    ExecBridgeConfig,
+    IncomingMessage,
+    handle_message,
+)
+from untether.runners.mock import Emit, Return, ScriptRunner  # noqa: E402
+
+_TOKEN = ResumeToken(engine="claude", value="sess-798")
+
+
+def _no_usage_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _raise() -> dict:
+        raise RuntimeError("no usage API in tests")
+
+    monkeypatch.setattr("untether.utils.usage_cache.fetch_claude_usage_cached", _raise)
+
+
+async def _run_with_turn(
+    *turn_steps: Emit, end_mid_turn: bool = False
+) -> tuple[FakeTransport, MessageRef]:
+    """A run whose first result carried the #333 marker (as the Claude runner
+    sends it), then one live turn. ``end_mid_turn``: the run's result comes
+    first (the real live order) and the stream ends with the turn still open.
+    Returns the transport and the run's own progress ref."""
+    first = CompletedEvent(engine="claude", resume=_TOKEN, ok=True, answer="FIRST")
+    transport = FakeTransport()
+    runner = ScriptRunner(
+        [
+            Emit(StartedEvent(engine="claude", resume=_TOKEN, meta={"model": "opus"})),
+            Emit(
+                StartedEvent(
+                    engine="claude",
+                    resume=_TOKEN,
+                    meta={"complete": TURN_COMPLETE_MARKER},
+                )
+            ),
+            *([Emit(first)] if end_mid_turn else []),
+            *turn_steps,
+            # (end_mid_turn: ScriptRunner's closing CompletedEvent lands in
+            # the still-open turn, as any late event would.)
+            *([] if end_mid_turn else [Return(answer="FIRST")]),
+        ],
+        engine="claude",
+        resume_value=_TOKEN.value,
+    )
+    cfg = ExecBridgeConfig(
+        transport=transport, presenter=MarkdownPresenter(), final_notify=True
+    )
+    await handle_message(
+        cfg,
+        runner=runner,
+        incoming=IncomingMessage(channel_id=1, message_id=10, text="go"),
+        resume_token=None,
+    )
+    return transport, transport.send_calls[0]["ref"]
+
+
+def _turn_texts(
+    transport: FakeTransport, run_progress: MessageRef, answer: str
+) -> tuple[str, list[str]]:
+    """(the turn's final text, every text its progress message showed before
+    it). A pushed final is a new message; a silent one (Monitor tick) edits
+    the progress message in place."""
+    calls = [*transport.send_calls, *transport.edit_calls]
+    finals = [c["message"].text for c in calls if answer in c["message"].text]
+    assert len(finals) == 1
+    progress_refs = {
+        c["ref"]
+        for c in transport.send_calls
+        if c["ref"] != run_progress
+        and answer not in c["message"].text
+        and "FIRST" not in c["message"].text
+    }
+    assert progress_refs, "the turn never showed a progress message"
+    progress = [
+        c["message"].text
+        for c in calls
+        if c["ref"] in progress_refs and answer not in c["message"].text
+    ]
+    return finals[0], progress
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["followup", "task_finished", "scheduled_wakeup", "monitor_event", "unknown"],
+)
+async def test_turn_final_carries_turn_complete_marker(
+    reason: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#798: every successful live turn final shows the #333 marker, whatever
+    started the turn; the turn's in-flight progress never does (the run's
+    marker is stripped from the turn tracker and the final adds its own to
+    the snapshot only)."""
+    _no_usage_fetch(monkeypatch)
+    transport, run_progress = await _run_with_turn(
+        Emit(_turn("started", reason=reason)),
+        Emit(_action()),
+        Emit(_turn("completed", reason=reason, ok=True, answer="TURN-2-ANSWER")),
+    )
+    final, progress = _turn_texts(transport, run_progress, "TURN-2-ANSWER")
+    assert final.count(TURN_COMPLETE_MARKER) == 1
+    assert "opus" in final  # the run's meta is kept alongside the marker
+    assert all(TURN_COMPLETE_MARKER not in t for t in progress)
+
+
+async def test_failed_turn_final_has_no_turn_complete_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_usage_fetch(monkeypatch)
+    transport, run_progress = await _run_with_turn(
+        Emit(_turn("started", reason="followup")),
+        Emit(_action()),
+        Emit(
+            _turn(
+                "completed",
+                reason="followup",
+                ok=False,
+                answer="TURN-2-ANSWER",
+                error="API Error: overloaded",
+            )
+        ),
+    )
+    final, progress = _turn_texts(transport, run_progress, "TURN-2-ANSWER")
+    assert TURN_COMPLETE_MARKER not in final
+    assert all(TURN_COMPLETE_MARKER not in t for t in progress)
+
+
+async def test_interrupted_turn_final_has_no_turn_complete_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn the session ended under (router.aclose) is not "complete"."""
+    _no_usage_fetch(monkeypatch)
+    transport, run_progress = await _run_with_turn(
+        Emit(_turn("started", reason="task_finished", detail={"tasks": ["b1"]})),
+        Emit(_action()),
+        end_mid_turn=True,
+    )
+    final, progress = _turn_texts(
+        transport, run_progress, "the session ended before this turn finished"
+    )
+    assert TURN_COMPLETE_MARKER not in final
+    assert all(TURN_COMPLETE_MARKER not in t for t in progress)
+
+
+# ── #795 wake-turn reply anchor ──────────────────────────────────────────────
+
+FOLLOWUP_REF = MessageRef(channel_id=1, message_id=20)
+
+
+async def _followup_turn(router, turn: int = 2) -> None:
+    await router.on_turn(
+        _turn("started", turn=turn, reason="followup", command_uuid="u1")
+    )
+    await router.on_turn(
+        _turn(
+            "completed",
+            turn=turn,
+            reason="followup",
+            ok=True,
+            answer="ok",
+            command_uuid="u1",
+        )
+    )
+
+
+async def test_795_wake_turn_replies_to_the_turn_that_launched_its_task() -> None:
+    rec = _Recorder()
+    router = _router(rec, anchors={"u1": (FOLLOWUP_REF, None)})
+    await _followup_turn(router)
+    detail = {"tasks": ["bg b2"], "task_ids": ["b2"], "origin_turn": 2}
+    await router.on_turn(_turn("started", turn=3, detail=detail))
+    await router.on_turn(
+        _turn("completed", turn=3, ok=True, answer="done", detail=detail)
+    )
+    assert rec.delivered[-1][5] == 20
+    assert router.anchor_for_turn(3) == FOLLOWUP_REF
+    assert router.last_reply_to == FOLLOWUP_REF
+
+
+async def test_795_task_from_the_run_itself_replies_to_the_run_prompt() -> None:
+    rec = _Recorder()
+    router = _router(rec, anchors={"u1": (FOLLOWUP_REF, None)})
+    await _followup_turn(router)
+    detail = {"tasks": ["bg b1"], "task_ids": ["b1"], "origin_turn": 1}
+    await router.on_turn(_turn("started", turn=3, detail=detail))
+    await router.on_turn(
+        _turn("completed", turn=3, ok=True, answer="done", detail=detail)
+    )
+    assert rec.delivered[-1][5] == 10
+
+
+async def test_795_retro_attributed_turn_moves_its_reply_to_the_origin() -> None:
+    """An ``unknown`` wake turn only learns its task at completion; its final
+    (not yet sent) then replies to the launching follow-up."""
+    rec = _Recorder()
+    router = _router(rec, anchors={"u1": (FOLLOWUP_REF, None)})
+    await _followup_turn(router)
+    await router.on_turn(_turn("started", turn=3, reason="unknown"))
+    assert router.current is not None and router.current.reply_to == USER_REF
+    await router.on_turn(
+        _turn(
+            "completed",
+            turn=3,
+            reason="task_finished",
+            ok=True,
+            answer="report",
+            detail={
+                "tasks": ["bg b2"],
+                "task_ids": ["b2"],
+                "origin_turn": 2,
+                "retro_attributed": True,
+            },
+        )
+    )
+    assert rec.delivered[-1][5] == 20
+
+
+@pytest.mark.parametrize("detail", [{}, {"origin_turn": 9}, {"origin_turn": True}])
+async def test_795_unknown_origin_falls_back_to_the_default(detail: dict) -> None:
+    rec = _Recorder()
+    router = _router(rec)
+    await router.on_turn(_turn("started", turn=2, detail=detail))
+    await router.on_turn(_turn("completed", turn=2, ok=True, answer="x", detail=detail))
+    assert rec.delivered[-1][5] == 10
+
+
+async def test_785_thinking_note_alone_opens_no_progress_when_filtered() -> None:
+    """#785 part 2: with consolidation on, a wake turn's thinking note must
+    not open a progress message (it may fold into the status message); a
+    tool call still does."""
+    rec = _Recorder()
+    router = rb.FollowupTurnRouter(
+        new_tracker=lambda: ProgressTracker(engine="claude"),
+        create_progress=rec.create,
+        close_progress=rec.close,
+        deliver=rec.deliver,
+        default_reply_to=USER_REF,
+        followup_notify=False,
+        anchor_for=None,
+        progress_for=lambda evt: evt.action.kind != "note",
+    )
+    await router.on_turn(_turn("started", detail={"tasks": ["build"]}))
+    note = ActionEvent(
+        engine="claude",
+        action=Action(id="claude.thinking.1", kind="note", title="hmm"),
+        phase="completed",
+        ok=True,
+    )
+    await router.on_event(note)
+    assert rec.created == []
+    assert router.current is not None
+    assert router.current.tracker.action_count == 1  # still tracked
+    await router.on_event(_action())
+    assert rec.created == [2]

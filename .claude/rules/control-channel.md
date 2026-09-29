@@ -36,6 +36,30 @@ Non-interactive requests are auto-approved without showing buttons:
 - `ExitPlanMode`: NEVER auto-approved — always show Telegram buttons
 - `AskUserQuestion`: NEVER auto-approved — shown in Telegram for user to reply with text
 
+## Permission modes (#741)
+
+Untether values map onto `--permission-mode` via
+`runners/run_options.claude_cli_permission_mode()`. Only **`plan-auto`** is
+translated (→ CLI `plan`); every genuine CLI mode — `default`, `manual`,
+`plan`, `auto`, `acceptEdits`, `dontAsk`, `bypassPermissions` — passes through
+verbatim.
+
+- `plan-auto` is Untether's sugar: CLI plan mode **plus** the `ExitPlanMode`
+  rubber stamp (`state.auto_approve_exit_plan_mode`, armed by
+  `is_claude_plan_auto()`). It was spelled `auto` until 0.35.5rc8, shadowing
+  the CLI's own mode.
+- `auto` is Claude Code's classifier-gated mode. It must **never** arm
+  `auto_approve_exit_plan_mode` — that would re-create the blanket downstream
+  bypass tracked by #383 on a mode that has no plan gate.
+- The control channel survives `auto`: `AskUserQuestion` still raises a
+  `can_use_tool` control_request (probed on CLI 2.1.228), and classifier
+  fallback after repeated blocks routes through `--permission-prompt-tool
+  stdio` as a normal Telegram approval.
+- Never re-introduce an inline `"plan" if mode == "auto"` remap. Add new modes
+  to `CLAUDE_CLI_PERMISSION_MODES`; the drift test in
+  `tests/test_claude_permission_modes.py` re-derives that set from the
+  installed CLI and fails when it rots.
+
 ## AskUserQuestion flow
 
 When Claude calls `AskUserQuestion`:
@@ -99,6 +123,10 @@ Denial with message:
 ```json
 {"type":"control_response","request_id":"req_1","approved":false,"denial_message":"..."}
 ```
+
+## Stdin writers and live sessions (#776)
+
+Stdin is written from several tasks (control responses, the auto-approve/deny/catalog drains, follow-up injection, the live-session close), so every write goes through `_locked_send` (a per-pipe `anyio.Lock`). `write_user_message(session_id, text, command_uuid=…)` writes a stream-json `user` line with `uuid` — the CLI echoes it as `command_lifecycle.command_uuid`, which attributes the turn. Never write a follow-up mid-turn outside steer mode: `inject_when_idle` waits until the session is idle (a mid-turn write is folded into the running turn). `LiveSession.lock` serialises injection against `close_live_session` (the race guard). Closing a live session closes stdin; if the CLI hasn't exited `_live_close_grace_s` (15 s) later, `_await_live_exit_or_force` logs `claude.live_session.close_grace_expired` with a proc snapshot, sends SIGINT, then SIGTERM/SIGKILL after `_live_close_sigint_grace_s` (5 s). `forced_teardown_after_result` quarantine is skipped when `LiveSession.closed_idle_clean` still holds (#791). `_SESSION_STDIN` still means "a process owns this session"; use `is_session_accepting()` to ask "can I write a follow-up into it".
 
 ## Parent-initiated control_requests (Untether → Claude)
 

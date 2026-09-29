@@ -2,7 +2,7 @@
 name = "untether"
 authors = [{name = "Little Bear Apps", email = "hello@littlebearapps.com"}]
 maintainers = [{name = "Little Bear Apps", email = "hello@littlebearapps.com"}]
-version = "0.35.5rc7"
+version = "0.35.5rc13"
 keywords = ["telegram", "claude-code", "codex", "opencode", "pi", "gemini-cli", "amp", "ai-agents", "coding-assistant", "remote-control", "cli-bridge"]
 description = "Run AI coding agents from your phone. Bridges Claude Code, Codex, OpenCode, and Pi to Telegram with interactive permissions, voice input, cost tracking, and live progress."
 readme = {file = "README.md", content-type = "text/markdown"}
@@ -12,7 +12,7 @@ requires-python = ">=3.12"
 dependencies = [
   "aiohttp>=3.9.0",
   "anyio>=4.12.0",
-  "httpx>=0.28.1",
+  "httpx>=0.28.1,<1",  # #782: httpx 1.x drops AsyncClient
   "markdown-it-py[linkify]",
   "msgspec>=0.20.0",
   "openai>=2.15.0",
@@ -80,6 +80,8 @@ auth = "untether.telegram.commands.auth:BACKEND"
 threads = "untether.telegram.commands.threads:BACKEND"
 at = "untether.telegram.commands.at:BACKEND"
 health = "untether.telegram.commands.health:BACKEND"
+steer = "untether.telegram.commands.followup:STEER_BACKEND"
+queue = "untether.telegram.commands.followup:QUEUE_BACKEND"
 
 [build-system]
 requires = ["uv_build>=0.9.18,<0.12.0"]

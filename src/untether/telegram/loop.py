@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -60,6 +60,7 @@ from .context import _merge_topic_context, _usage_ctx_set, _usage_topic
 from .engine_defaults import resolve_engine_for_message
 from .engine_overrides import merge_overrides
 from .listen_mode import resolve_listen_mode, should_trigger_run
+from .steer import FOLLOWUP_COMMAND_IDS, maybe_steer, split_followup_command
 from .topic_state import TopicStateStore, resolve_state_path
 from .topics import (
     _maybe_rename_topic,
@@ -102,10 +103,30 @@ def _format_answered_echo(text: str) -> str:
 def _chat_session_key(
     msg: TelegramIncomingMessage, *, store: ChatSessionStore | None
 ) -> tuple[int, int | None] | None:
-    if store is None or msg.thread_id is not None:
+    """Resolve the ``(chat_id, owner)`` key chat-mode sessions persist under.
+
+    The second slot is a per-chat-type scope, not a single identity:
+
+    * private chat, main thread — ``None`` (one session for the whole chat)
+    * private chat, topic — the ``thread_id``, so each topic resumes
+      independently (#734).  Telegram's private-chat topics carry a
+      ``message_thread_id`` but are not forum topics, so ``TopicStateStore``
+      never claims them; returning ``None`` here dropped their resume token
+      entirely and every follow-up started a fresh agent session.
+    * group / supergroup, topic — ``None``, because ``TopicStateStore`` owns
+      forum topics (and wins on read, see ``ResumeResolver``)
+    * group / supergroup, no topic — the ``sender_id``
+
+    The slots can't collide: a chat is either private or a group, so a given
+    ``chat_id`` only ever uses one of the thread-scoped and sender-scoped
+    forms.
+    """
+    if store is None:
         return None
     if msg.chat_type == "private":
-        return (msg.chat_id, None)
+        return (msg.chat_id, msg.thread_id)
+    if msg.thread_id is not None:
+        return None
     if msg.sender_id is None:
         return None
     return (msg.chat_id, msg.sender_id)
@@ -471,6 +492,24 @@ def _dispatch_builtin_command(
         task_group.start_soon(handler)
         return True
 
+    if command_id in FOLLOWUP_COMMAND_IDS and not args_text.strip():
+        # #775: bare /steer or /queue sets the default (the `<text>` form is
+        # split off in route_message and runs as a prompt).
+        from .commands.followup import handle_followup_default_command
+
+        handler = partial(
+            handle_followup_default_command,
+            cfg,
+            msg,
+            command_id,
+            ambient_context,
+            topic_store,
+            chat_prefs,
+            scope_chat_ids=scope_chat_ids,
+        )
+        task_group.start_soon(handler)
+        return True
+
     if command_id in {"listen", "trigger"}:
         # #297: /trigger is a deprecated alias for /listen. The handler
         # prepends a deprecation notice when invoked_as="trigger".
@@ -656,6 +695,10 @@ class _PendingPrompt:
     is_voice_transcribed: bool
     forwards: list[tuple[int, str]]
     cancel_scope: anyio.CancelScope | None = None
+    # #794: ids of earlier prompt messages whose text was merged into this one.
+    merged_message_ids: list[int] = field(default_factory=list)
+    # #775: "steer"/"queue" from `/steer <text>` / `/queue <text>`.
+    followup_override: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -770,13 +813,43 @@ def _forward_key(msg: TelegramIncomingMessage) -> ForwardKey:
 def _is_forwarded(raw: dict[str, object] | None) -> bool:
     if not isinstance(raw, dict):
         return False
-    return any(raw.get(field) is not None for field in _FORWARD_FIELDS)
+    return any(raw.get(name) is not None for name in _FORWARD_FIELDS)
 
 
 def _forward_fields_present(raw: dict[str, object] | None) -> list[str]:
     if not isinstance(raw, dict):
         return []
-    return [field for field in _FORWARD_FIELDS if raw.get(field) is not None]
+    return [name for name in _FORWARD_FIELDS if raw.get(name) is not None]
+
+
+def _merge_block_reason(existing: _PendingPrompt, new: _PendingPrompt) -> str | None:
+    """Why ``existing`` can't be folded into ``new`` (None when it can, #794).
+
+    Prompts are merged only when they would have run the same way on their
+    own: same reply target (a reply carries its own resume token), same
+    topic / session / context, same voice-transcript status. A later prompt
+    led by a directive (``/engine``, ``/project``, ``@branch``) is kept apart
+    too — merged behind the earlier text its directive would no longer lead
+    the prompt and would be silently ignored.
+    """
+    if existing.reply_id != new.reply_id:
+        return "reply_target"
+    if (
+        existing.topic_key != new.topic_key
+        or existing.chat_session_key != new.chat_session_key
+        or existing.chat_project != new.chat_project
+        or existing.ambient_context != new.ambient_context
+    ):
+        return "context"
+    if existing.is_voice_transcribed != new.is_voice_transcribed:
+        return "voice"
+    if existing.followup_override != new.followup_override:
+        # #775: a `/steer <text>` and a plain (or `/queue`) prompt must not
+        # share a run — the override would apply to both texts.
+        return "followup_mode"
+    if new.text.lstrip().startswith(("/", "@")):
+        return "directive"
+    return None
 
 
 def _format_forwarded_prompt(forwarded: list[str], prompt: str) -> str:
@@ -846,19 +919,14 @@ class ForwardCoalescer:
         key = _forward_key(pending.msg)
         existing = self._pending.get(key)
         if existing is not None:
-            if existing.cancel_scope is not None:
-                existing.cancel_scope.cancel()
-            if existing.forwards:
-                pending.forwards = list(existing.forwards)
-            logger.debug(
-                "forward.prompt.replace",
-                chat_id=pending.msg.chat_id,
-                thread_id=pending.msg.thread_id,
-                sender_id=pending.msg.sender_id,
-                old_message_id=existing.msg.message_id,
-                new_message_id=pending.msg.message_id,
-                forward_count=len(pending.forwards),
-            )
+            # #794: a newer prompt inside the window used to *replace* the
+            # pending one, silently dropping its text. Merge it instead, or,
+            # when the two can't share a run, send the earlier one now.
+            reason = _merge_block_reason(existing, pending)
+            if reason is None:
+                self._merge(existing, pending)
+            else:
+                self._flush(key, existing, reason=reason)
         self._pending[key] = pending
         logger.debug(
             "forward.prompt.schedule",
@@ -869,6 +937,49 @@ class ForwardCoalescer:
             debounce_s=self._debounce_s,
         )
         self._reschedule(key, pending)
+
+    def _merge(self, existing: _PendingPrompt, pending: _PendingPrompt) -> None:
+        """Fold ``existing`` into ``pending``: its text goes first, its
+        forwards are kept. The run anchors on the newer message."""
+        if existing.cancel_scope is not None:
+            existing.cancel_scope.cancel()
+        parts = [text for text in (existing.text, pending.text) if text.strip()]
+        pending.text = "\n\n".join(parts)
+        pending.forwards = [*existing.forwards, *pending.forwards]
+        pending.merged_message_ids = [
+            *existing.merged_message_ids,
+            existing.msg.message_id,
+            *pending.merged_message_ids,
+        ]
+        logger.info(
+            "forward.prompt.merged",
+            chat_id=pending.msg.chat_id,
+            thread_id=pending.msg.thread_id,
+            sender_id=pending.msg.sender_id,
+            message_id=pending.msg.message_id,
+            merged_message_ids=pending.merged_message_ids,
+            merged_count=len(pending.merged_message_ids) + 1,
+            forward_count=len(pending.forwards),
+            text_len=len(pending.text),
+        )
+
+    def _flush(self, key: ForwardKey, pending: _PendingPrompt, *, reason: str) -> None:
+        """Dispatch a pending prompt now, without waiting out its window."""
+        if self._pending.get(key) is pending:
+            self._pending.pop(key, None)
+        if pending.cancel_scope is not None:
+            pending.cancel_scope.cancel()
+        logger.info(
+            "forward.prompt.flushed",
+            chat_id=pending.msg.chat_id,
+            thread_id=pending.msg.thread_id,
+            sender_id=pending.msg.sender_id,
+            message_id=pending.msg.message_id,
+            merged_count=len(pending.merged_message_ids) + 1,
+            forward_count=len(pending.forwards),
+            reason=reason,
+        )
+        self._task_group.start_soon(self._dispatch, pending)
 
     def attach_forward(self, msg: TelegramIncomingMessage) -> None:
         if msg.sender_id is None:
@@ -947,6 +1058,7 @@ class ForwardCoalescer:
             sender_id=pending.msg.sender_id,
             message_id=pending.msg.message_id,
             forward_count=len(pending.forwards),
+            merged_count=len(pending.merged_message_ids) + 1,
             debounce_s=self._debounce_s,
         )
         await self._dispatch(pending)
@@ -1022,6 +1134,21 @@ class ResumeResolver:
                     prompt_text,
                 )
                 return ResumeDecision(resume_token=None, handled_by_running_task=True)
+        resume_token = await self.stored_token(
+            chat_session_key=chat_session_key,
+            topic_key=topic_key,
+            engine_for_session=engine_for_session,
+        )
+        return ResumeDecision(resume_token=resume_token, handled_by_running_task=False)
+
+    async def stored_token(
+        self,
+        *,
+        chat_session_key: tuple[int, int | None] | None,
+        topic_key: tuple[int, int] | None,
+        engine_for_session: EngineId,
+    ) -> ResumeToken | None:
+        """The topic's (else the chat's) stored session for this engine."""
         if self._topic_store is not None and topic_key is not None:
             stored = await self._topic_store.get_session_resume(
                 topic_key[0],
@@ -1029,20 +1156,14 @@ class ResumeResolver:
                 engine_for_session,
             )
             if stored is not None:
-                resume_token = stored
-        if (
-            resume_token is None
-            and self._chat_session_store is not None
-            and chat_session_key is not None
-        ):
-            stored = await self._chat_session_store.get_session_resume(
+                return stored
+        if self._chat_session_store is not None and chat_session_key is not None:
+            return await self._chat_session_store.get_session_resume(
                 chat_session_key[0],
                 chat_session_key[1],
                 engine_for_session,
             )
-            if stored is not None:
-                resume_token = stored
-        return ResumeDecision(resume_token=resume_token, handled_by_running_task=False)
+        return None
 
 
 class MediaGroupBuffer:
@@ -1198,13 +1319,24 @@ def _queued_wait_note(resume_token: ResumeToken) -> str | None:
     user why, or that /cancel was available. Returns ``None`` for non-Claude
     engines, unknown sessions, and normal mid-run queues (where the active
     progress message above already explains itself).
+
+    #781: with live sessions (#776) a follow-up to a session that is live
+    and accepting input is written into that same process as soon as its
+    current turn ends — background tasks keep running and are NOT waited
+    for, so the note says that instead. The background-wait wording is kept
+    for ``[watchdog] live_sessions = false`` and for live sessions that are
+    already closing, where the follow-up really does resume after the
+    process exits. The live note omits "/cancel to drop it": once the
+    scheduler hands the job to the injector it is no longer in the
+    cancellable queue.
     """
     if resume_token.engine != "claude":
         return None
     try:
-        from ..runners.claude import session_linger_info
+        from ..runners.claude import is_session_accepting, session_linger_info
 
         info = session_linger_info(resume_token.value)
+        live = info is not None and is_session_accepting(resume_token.value)
     except Exception:  # noqa: BLE001 — the note is best-effort decoration;
         # a registry hiccup must never break the queued send itself.
         logger.debug("queued_note.linger_info_failed", exc_info=True)
@@ -1214,6 +1346,13 @@ def _queued_wait_note(resume_token: ResumeToken) -> str | None:
     post_result, bg_count = info
     if not post_result:
         return None
+    if live:
+        if bg_count > 0:
+            return (
+                "⏳ Queued — sent as soon as Claude's current turn ends "
+                "(background tasks keep running)."
+            )
+        return "⏳ Queued — sent as soon as Claude's current turn ends."
     if bg_count > 0:
         plural = "s" if bg_count != 1 else ""
         return (
@@ -1700,7 +1839,21 @@ async def run_main_loop(
                 if sdnotify.notify("STOPPING=1"):
                     logger.debug("sdnotify.stopping")
 
-                active = len(state.running_tasks)
+                from ..runner_bridge import (
+                    close_idle_live_sessions,
+                    unique_running_tasks,
+                )
+
+                # #776: live Claude sessions that are only holding between
+                # turns are closed gracefully now (the CLI stops their
+                # background tasks and exits in seconds) instead of holding
+                # the drain for up to their 30 min background hold.
+                closed_live = await close_idle_live_sessions(
+                    state.running_tasks, "drain"
+                )
+                if closed_live:
+                    logger.info("shutdown.live_sessions_closed", count=closed_live)
+                active = len(unique_running_tasks(state.running_tasks))
                 pending_at = at_scheduler.active_count()
                 # #289: include loop fires in the shutdown summary so ops
                 # can see how many were pending at drain time.  Pending
@@ -1731,7 +1884,8 @@ async def run_main_loop(
                     sole_task = None
                     if active == 1:
                         sole_ref, sole_task = next(
-                            iter(state.running_tasks.items()), (None, None)
+                            iter(unique_running_tasks(state.running_tasks)),
+                            (None, None),
                         )
                     sole_chat = sole_ref.channel_id if sole_ref is not None else None
                     origin_matches = (
@@ -1764,8 +1918,16 @@ async def run_main_loop(
                     # Bounded so a hanging transport send can't eat the 30s
                     # margin between DRAIN_TIMEOUT_S and TimeoutStopSec=150.
                     with anyio.move_on_after(10.0):
+                        from ..runner_bridge import running_task_is_live_idle
+
+                        # Idle live sessions get their own "closing" notice.
                         await _notify_drain_start(
-                            cfg.exec_cfg.transport, state.running_tasks
+                            cfg.exec_cfg.transport,
+                            {
+                                ref: task
+                                for ref, task in state.running_tasks.items()
+                                if not running_task_is_live_idle(task)
+                            },
                         )
 
                     # Wait for all runs to complete (up to drain timeout).
@@ -1775,14 +1937,19 @@ async def run_main_loop(
                     with anyio.move_on_after(drain_timeout):
                         while state.running_tasks:
                             await sleep(1.0)
+                            # A run mid-turn at drain start goes idle when its
+                            # turn ends — close it then too (review finding).
+                            await close_idle_live_sessions(state.running_tasks, "drain")
                             _drain_tick += 1
                             if _drain_tick % 10 == 0:
                                 logger.info(
                                     "shutdown.drain.progress",
-                                    remaining=len(state.running_tasks),
+                                    remaining=len(
+                                        unique_running_tasks(state.running_tasks)
+                                    ),
                                 )
 
-                    remaining = len(state.running_tasks)
+                    remaining = len(unique_running_tasks(state.running_tasks))
                     if remaining > 0:
                         logger.warning(
                             "shutdown.drain_timeout",
@@ -1941,7 +2108,37 @@ async def run_main_loop(
                     job.progress_ref,
                 )
 
-            scheduler = ThreadScheduler(task_group=tg, run_job=run_thread_job)
+            from ..live_followup import inject_live_followup
+
+            async def _job_run_options(job: ThreadJob) -> object:
+                # Same resolution as run_job (#776): a live process only
+                # takes a follow-up while the chat's options still match.
+                job_chat_id = cast(int, job.chat_id)
+                job_topic_key = (
+                    (job_chat_id, job.thread_id)
+                    if state.topic_store is not None
+                    and job.thread_id is not None
+                    and _topics_chat_allowed(
+                        cfg, job_chat_id, scope_chat_ids=state.topics_chat_ids
+                    )
+                    else None
+                )
+                options = await _resolve_engine_run_options(
+                    job_chat_id,
+                    job_topic_key[1] if job_topic_key is not None else None,
+                    job.resume_token.engine,
+                    chat_prefs=state.chat_prefs,
+                    topic_store=state.topic_store,
+                )
+                return _apply_trigger_permission_override(
+                    options, job.context, engine=job.resume_token.engine
+                )
+
+            scheduler = ThreadScheduler(
+                task_group=tg,
+                run_job=run_thread_job,
+                inject_job=partial(inject_live_followup, options_for=_job_run_options),
+            )
 
             # --- /at one-shot delayed runs (#288) ---
             from . import at_scheduler
@@ -1966,8 +2163,13 @@ async def run_main_loop(
             def _is_chat_busy(chat_id_in: int) -> bool:
                 """Drop a loop fire if the chat already has a run in flight
                 — mirrors upstream's "no catch-up" semantic."""
-                for ref in state.running_tasks:
-                    if getattr(ref, "channel_id", None) == chat_id_in:
+                from ..runner_bridge import running_task_is_live_idle
+
+                for ref, task in state.running_tasks.items():
+                    # #776: a live session idling between turns isn't busy.
+                    if getattr(
+                        ref, "channel_id", None
+                    ) == chat_id_in and not running_task_is_live_idle(task):
                         return True
                 return False
 
@@ -2156,6 +2358,8 @@ async def run_main_loop(
                 chat_session_key: tuple[int, int | None] | None,
                 reply_ref: MessageRef | None,
                 reply_id: int | None,
+                steerable: bool = False,
+                followup_override: str | None = None,
             ) -> None:
                 chat_id = msg.chat_id
                 user_msg_id = msg.message_id
@@ -2167,6 +2371,17 @@ async def run_main_loop(
                     topic_key=topic_key,
                 )
                 engine_override = engine_resolution.engine
+                if steerable and await _try_steer(
+                    msg=msg,
+                    prompt_text=prompt_text,
+                    resolved=resolved,
+                    engine=engine_override,
+                    topic_key=topic_key,
+                    chat_session_key=chat_session_key,
+                    reply_id=reply_id,
+                    followup_override=followup_override,
+                ):
+                    return
                 resume_decision = await resume_resolver.resolve(
                     resume_token=resolved.resume_token,
                     reply_id=reply_id,
@@ -2212,6 +2427,67 @@ async def run_main_loop(
                     msg.thread_id,
                     chat_session_key,
                     progress_ref,
+                )
+
+            async def _try_steer(
+                *,
+                msg: TelegramIncomingMessage,
+                prompt_text: str,
+                resolved: ResolvedMessage,
+                engine: EngineId,
+                topic_key: tuple[int, int] | None,
+                chat_session_key: tuple[int, int | None] | None,
+                reply_id: int | None,
+                followup_override: str | None,
+            ) -> bool:
+                """#775: steer a plain-text/voice prompt into the chat's live
+                Claude session when the follow-up mode says so. The target is
+                the session this prompt would otherwise queue behind."""
+
+                async def steer_target() -> ResumeToken | None:
+                    token = resolved.resume_token
+                    if token is None and reply_id is not None:
+                        running = state.running_tasks.get(
+                            MessageRef(channel_id=msg.chat_id, message_id=reply_id)
+                        )
+                        token = running.resume if running is not None else None
+                    if token is None:
+                        token = await resume_resolver.stored_token(
+                            chat_session_key=chat_session_key,
+                            topic_key=topic_key,
+                            engine_for_session=engine,
+                        )
+                    return token
+
+                topic_thread_id = topic_key[1] if topic_key is not None else None
+
+                async def run_options_for(target: ResumeToken) -> object:
+                    options = await _resolve_engine_run_options(
+                        msg.chat_id,
+                        topic_thread_id,
+                        target.engine,
+                        chat_prefs=state.chat_prefs,
+                        topic_store=state.topic_store,
+                    )
+                    return _apply_trigger_permission_override(
+                        options, resolved.context, engine=target.engine
+                    )
+
+                return await maybe_steer(
+                    cfg,
+                    chat_id=msg.chat_id,
+                    user_msg_id=msg.message_id,
+                    thread_id=msg.thread_id,
+                    topic_thread_id=topic_thread_id,
+                    prompt_text=prompt_text,
+                    engine=engine,
+                    resume_token=None,
+                    resolve_token=steer_target,
+                    override=followup_override,
+                    running_tasks=state.running_tasks,
+                    chat_prefs=state.chat_prefs,
+                    topic_store=state.topic_store,
+                    run_options=run_options_for,
                 )
 
             async def run_prompt_from_upload(
@@ -2296,6 +2572,10 @@ async def run_main_loop(
                     chat_session_key=pending.chat_session_key,
                     reply_ref=pending.reply_ref,
                     reply_id=pending.reply_id,
+                    # #775: plain text / voice transcripts may steer;
+                    # anything carrying forwards always queues.
+                    steerable=not pending.forwards,
+                    followup_override=pending.followup_override,
                 )
 
             forward_coalescer = ForwardCoalescer(
@@ -2425,6 +2705,14 @@ async def run_main_loop(
 
                 command_id = classification.command_id
                 args_text = classification.args_text
+                # #775: `/steer <text>` / `/queue <text>` — the text runs as a
+                # prompt with a one-message follow-up mode override.
+                followup_override: str | None = None
+                followup_split = split_followup_command(command_id, args_text)
+                if followup_split is not None:
+                    followup_override, text = followup_split
+                    command_id = None
+                    args_text = ""
                 if command_id == "continue":
                     forward_coalescer.cancel(forward_key)
                     prompt_text = args_text.strip() if args_text else ""
@@ -2705,6 +2993,7 @@ async def run_main_loop(
                     reply_id=reply_id,
                     is_voice_transcribed=is_voice_transcribed,
                     forwards=[],
+                    followup_override=followup_override,
                 )
                 if reply_id is not None and state.running_tasks.get(
                     MessageRef(channel_id=chat_id, message_id=reply_id)
@@ -2858,7 +3147,9 @@ async def run_main_loop(
             # dispatch → resolve → run_engine) register in
             # running_tasks, then wait for them to complete before
             # triggering shutdown so _drain_and_exit() can exit.
-            for _ in range(10):
+            # #775: 50, not 10 — the dispatch chain now also resolves the
+            # follow-up mode (chat/topic prefs reads) before queueing.
+            for _ in range(50):
                 await anyio.lowlevel.checkpoint()
             while state.running_tasks:
                 await sleep(0.1)

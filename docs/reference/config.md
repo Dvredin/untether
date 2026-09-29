@@ -45,7 +45,7 @@ restart.
 
 | Section | Restart-required fields | Hot-reload |
 |---|---|---|
-| `transports.telegram` | `bot_token`, `chat_id`, `session_mode`, `topics`, `message_overflow` | everything else (`voice_*`, `show_resume_line`, `forward_coalesce_s`, `media_group_debounce_s`, `allowed_user_ids`, `files.*`) |
+| `transports.telegram` | `bot_token`, `chat_id`, `session_mode`, `topics`, `message_overflow` | everything else (`voice_*`, `show_resume_line`, `followup_mode`, `forward_coalesce_s`, `media_group_debounce_s`, `allowed_user_ids`, `files.*`) |
 | `transports.telegram.topics` | whole section (treated as one unit) | — |
 | top-level `transport` | changing transport id | — |
 | `triggers` | `enabled` (master switch initialises the cron scheduler + webhook server at startup); `server.host`, `server.port` (socket bind at startup) | cron add/remove/edit, webhook add/remove/edit, `rate_limit`, `max_body_bytes`, `default_timezone`, per-cron `timezone`/`run_once`/`permission_mode` |
@@ -81,7 +81,7 @@ systemctl --user restart untether-dev    # dev
 | `allowed_user_ids` | int[] | (required, non-empty) | Allowed sender user ids. **Required for security as of v0.35.3** ([#377](https://github.com/littlebearapps/untether/issues/377)) — set to a non-empty list of Telegram user IDs (your own user id is the typical minimum). An empty list now triggers a hard `ConfigError` at startup unless you opt in to `allow_any_user = true` (see below). |
 | `allow_any_user` | bool | `false` | **Dev/demo escape hatch** ([#377](https://github.com/littlebearapps/untether/issues/377)). Set to `true` to keep the prior insecure-default behaviour where any Telegram user who knows the bot username can send commands. Logged at INFO on every boot (`security.allow_any_user`) so the deviation is visible in `journalctl`. Use only for hackathons, demos, or local dev. |
 | `message_overflow` | `"trim"`\|`"split"` | `"split"` | 🔄 How to handle long final responses. Restart-required. |
-| `forward_coalesce_s` | float | `1.0` | Quiet window for combining a prompt with immediately-following forwarded messages; set `0` to disable. |
+| `forward_coalesce_s` | float | `1.0` | Quiet window for combining a prompt with immediately-following forwarded messages, and for merging rapid back-to-back prompts into one run (#794); set `0` to disable. |
 | `voice_transcription` | bool | `false` | Enable voice note transcription. |
 | `voice_max_bytes` | int | `10485760` | Max voice note size (bytes). |
 | `voice_transcription_model` | string | `"gpt-4o-mini-transcribe"` | OpenAI transcription model name. |
@@ -92,6 +92,7 @@ systemctl --user restart untether-dev    # dev
 | `voice_transcription_prompt` | string\|null | `null` (→ built-in) | ([#691](https://github.com/littlebearapps/untether/issues/691), [#703](https://github.com/littlebearapps/untether/issues/703)) Vocabulary-bias prompt (≤1000 chars) passed to the transcription `prompt` param — steers the decoder toward domain proper nouns (`"Trello, Untether, Claude Code"`). Effect is model-dependent; keep it to high-frequency nouns (overstuffing can induce hallucinated terms). **Unset = a shipped product-generic default** (engine + tool names, plus `CLAUDE.md` / `AGENTS.md` since [#789](https://github.com/littlebearapps/untether/issues/789)); a value **replaces** that default; `""` disables the bias and omits the parameter. Hot-reloadable. |
 | `session_mode` | `"stateless"`\|`"chat"` | `"stateless"` | 🔄 Auto-resume mode. See [workflow modes](modes.md) — `"chat"` for assistant/workspace, `"stateless"` for handoff. Restart-required. |
 | `show_resume_line` | bool | `true` | Show resume line in message footer. See [workflow modes](modes.md) — `false` for assistant/workspace, `true` for handoff. |
+| `followup_mode` | `"queue"`\|`"steer"` | `"queue"` | ([#775](https://github.com/littlebearapps/untether/issues/775)) Default for messages sent while a Claude Code run is working: `queue` waits for the turn to end; `steer` writes the message into the running turn. Overridden per chat (`/config` → Follow-up, bare `/steer` / `/queue`), per forum topic (bare `/steer` / `/queue` in the topic) and per message (`/steer <text>`, `/queue <text>`). Claude Code only — other engines always queue. Hot-reloadable. See [steer follow-ups](../how-to/steer-follow-ups.md). |
 
 When `allowed_user_ids` is set, updates without a sender id (for example, some channel posts) are ignored.
 
@@ -239,11 +240,14 @@ Controls progress message rendering during agent runs.
 | `verbosity` | `"compact"` \| `"verbose"` | `"compact"` | `compact` shows status + title only. `verbose` adds tool detail lines (file paths, commands, patterns). |
 | `max_actions` | int (0–50) | `5` | Maximum action lines shown in the progress message. |
 | `heartbeat_interval` | int (5–120) | `30` | Heartbeat tick that re-renders progress messages so long-running tools surface an elapsed-time tail (e.g. `▸ Bash · 3m 47s · npm run build`) without waiting for the next JSONL event ([#481](https://github.com/littlebearapps/untether/issues/481)). |
+| `show_background_tasks` | bool | `true` | Claude only. Show live background tasks (background agents, background Bash, Monitors): a `⏳ background (N)` block in the progress message, then one silent status message after the answer, edited in place and finalised when the tasks end ([#777](https://github.com/littlebearapps/untether/issues/777)). |
+| `background_tasks_max_rows` | int (1–20) | `5` | Row cap for the background block and status message; extra tasks collapse into `+N more`. |
+| `consolidate_wake_turns` | bool | `true` | Claude only. A background-task wake turn that runs no tools, raises no approval or question and answers in ≤300 characters is folded into that status message (an edit — no new message, no push) instead of arriving as its own `🔔` message. Tool use, a longer answer, an error, or the turn that finishes the last task (the report) still arrive as normal pushed messages. `false` restores one message per wake turn ([#785](https://github.com/littlebearapps/untether/issues/785)). Needs `show_background_tasks`. |
 
 Per-chat override: `/verbose on` and `/verbose off` override the config default for the current chat without editing the TOML file. `/verbose clear` removes the override.
 
 !!! tip "Hot-reload"
-    Editing `[progress]` in `untether.toml` applies on the next run without restart ([#269](https://github.com/littlebearapps/untether/issues/269)). The default presenter and per-chat `/verbose` overrides both pick up the new values.
+    Editing `[progress]` in `untether.toml` applies on the next run without restart ([#269](https://github.com/littlebearapps/untether/issues/269)). The default presenter and per-chat `/verbose` overrides both pick up the new values. The background-task keys are re-read at each turn of a live session and on each status-message refresh.
 
 ## `cost_budget`
 

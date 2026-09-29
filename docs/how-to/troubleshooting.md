@@ -307,7 +307,7 @@ post_result_idle_enabled = false
 post_result_idle_timeout = 60   # 1 minute
 ```
 
-If a button-click `control_response` is mid-flight when the deadline arrives, the timer re-arms instead of closing — preventing orphaned approvals. Look for `claude.post_result_idle.deferred` and `claude.post_result_idle.closing_stdin` in the logs to confirm the watchdog's behaviour.
+If a button-click `control_response` is mid-flight when the deadline arrives, the timer re-arms instead of closing — preventing orphaned approvals. Look for `claude.post_result_idle.armed`, `claude.post_result_idle.deferred` and `claude.post_result_idle.closing_stdin` in the logs to confirm the watchdog's behaviour. The every-30-s `claude.post_result_idle.tick` heartbeat is INFO only while the timer is armed or an approval is pending; otherwise it is DEBUG (start with `untether --debug` to see it).
 
 When the watchdog actually closes stdin, Untether also sends one (and only one) Telegram closing message: `✓ turn complete · session closed after Nm idle`. While the watchdog is running, stall warnings are suppressed (`progress_edits.stall_post_result_suppressed`) so you don't get noise during the legitimate idle window — genuinely-frozen post-result sessions still warn via the frozen-ring escalation.
 
@@ -590,7 +590,7 @@ Look for `handle.worker_failed`, `handle.runner_failed`, or `config.read.toml_er
 
 All logs include `session_id` once a session starts, enabling per-session filtering with `grep` or `jq`.
 
-Telegram bot tokens, OpenAI API keys (`sk-...`), and GitHub tokens (`ghp_`, `ghs_`, `github_pat_`) are automatically redacted in all log output.
+Telegram bot tokens, OpenAI API keys (`sk-...`), GitHub tokens (`ghp_`, `ghs_`, `github_pat_`), `Authorization:`/`Bearer` credentials, JWTs, and `api_key=`/`token=`/`secret=`/`password=` values are automatically redacted in all log output. Token *counts* such as `total_tokens=52000` are left alone.
 
 ## Error hints
 

@@ -31,6 +31,9 @@ WAKE_S = float(os.environ.get("FAKE_CLAUDE_WAKE_S", "0.3"))
 # #510: hold the first turn's result so a concurrent spawn lands in between.
 RESULT_DELAY_S = float(os.environ.get("FAKE_CLAUDE_RESULT_DELAY_S", "0"))
 
+# #775: how long the steer scenarios wait for a steered user line.
+STEER_WAIT_S = float(os.environ.get("FAKE_CLAUDE_STEER_WAIT_S", "5"))
+
 _cost = 0.0
 _lines: queue.Queue[dict | None] = queue.Queue()
 _live_tasks: dict[str, str] = {}  # task_id -> tool_use_id
@@ -235,6 +238,16 @@ def shutdown() -> None:
     # Stdin closed: stop live background work, as the real CLI does (F3).
     for task_id in list(_live_tasks):
         end_bg(task_id, status="killed")
+    for task_id in list(_orphans):  # a subagent's bg task dies too (#801)
+        _orphans.discard(task_id)
+        emit(
+            {
+                "type": "system",
+                "subtype": "task_updated",
+                "task_id": task_id,
+                "patch": {"status": "killed", "end_time": int(time.time() * 1000)},
+            }
+        )
     sys.exit(0)
 
 
@@ -398,6 +411,93 @@ def scenario_agent_wake_unknown_first(first: dict) -> None:
     serve_followups()
 
 
+def scenario_agent_resumed(first: dict) -> None:
+    """#801: a background agent finishes, the wake turn sends it back to
+    re-check (SendMessage) — the CLI reuses the SAME task_id with a fresh
+    snapshot + task_started — and the parent goes idle while it works. The
+    re-check finishes ``FAKE_CLAUDE_WAKE_S`` later and wakes a third turn."""
+    init()
+    tool_use("Agent", "toolu_ag", {"description": "verify", "prompt": "go"})
+    start_bg("a1", "toolu_ag", task_type="local_agent")
+    tool_result("toolu_ag", "Async agent launched successfully.")
+    result("agent started", turns=2)
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    end_bg("a1")
+    init()
+    tool_use("SendMessage", "toolu_sm", {"to": "a1", "message": "re-check 5b"})
+    start_bg("a1", "toolu_ag", task_type="local_agent")
+    tool_result("toolu_sm", "Message sent; agent a1 resumed in the background.")
+    text("I've sent it back to re-check, it's running now")
+    result("I've sent it back to re-check, it's running now", turns=2)
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    end_bg("a1")
+    init()
+    text("RECHECK DONE")
+    result("RECHECK DONE")
+    serve_followups()
+
+
+_orphans: set[str] = set()  # subagent-owned bg tasks (not in the snapshot)
+
+
+def scenario_agent_orphans_bg_task(first: dict) -> None:
+    """#801 follow-up (dev bot 2026-09-29): a background agent backgrounds a
+    ``sleep`` of its own (``owned_by_subagent`` + ``is_backgrounded``) and
+    ends; the parent's wake turn says the re-check is still running and goes
+    idle. The orphaned task finishes ``FAKE_CLAUDE_WAKE_S`` later — only if
+    stdin is still open; on EOF it is killed like any live task (F3)."""
+    init()
+    tool_use("Agent", "toolu_ag", {"description": "recheck", "prompt": "go"})
+    start_bg("a1", "toolu_ag", task_type="local_agent")
+    tool_result("toolu_ag", "Async agent launched successfully.")
+    result("agent started", turns=2)
+    _orphans.add("bz1")
+    emit(
+        {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "bz1",
+            "tool_use_id": "toolu_sub_sleep",
+            "description": 'Wait 75 seconds then print "recheck"',
+            "owned_by_subagent": True,
+            "is_backgrounded": True,
+            "task_type": "local_bash",
+        }
+    )
+    end_bg("a1")  # the agent ends; its backgrounded sleep carries on
+    init()
+    text("The re-check is still running, I'll report when it finishes")
+    result("The re-check is still running, I'll report when it finishes")
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    _orphans.discard("bz1")
+    emit(
+        {
+            "type": "system",
+            "subtype": "task_updated",
+            "task_id": "bz1",
+            "patch": {"status": "completed", "end_time": int(time.time() * 1000)},
+        }
+    )
+    emit(
+        {
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "bz1",
+            "tool_use_id": "toolu_sub_sleep",
+            "status": "completed",
+            "output_file": "",
+            "summary": "recheck",
+        }
+    )
+    init()
+    text("RECHECK: recheck")
+    result("RECHECK: recheck")
+    serve_followups()
+
+
 def scenario_monitor_ticks(first: dict) -> None:
     init()
     tool_use("Monitor", "toolu_mon", {"command": "tick", "timeout_ms": 30000})
@@ -439,6 +539,167 @@ def scenario_followup(first: dict) -> None:
     if RESULT_DELAY_S > 0:
         time.sleep(RESULT_DELAY_S)
     result("FIRST")
+    serve_followups()
+
+
+def _notify(task_id: str, tool_id: str) -> None:
+    emit(
+        {
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": task_id,
+            "tool_use_id": tool_id,
+            "status": "completed",
+            "output_file": "",
+            "summary": f"bg {task_id} finished",
+        }
+    )
+
+
+def scenario_multi_agent_acks(first: dict) -> None:
+    """#785 part 2 (the nsd blogs shape): two background agents. Each finish
+    produces the CLI's pair of wake turns — an ``unknown`` one opened before
+    the task's end lands (the end arrives mid-turn), then the task's own
+    notification turn restating it. The first finish is a short ack while the
+    other agent still runs; the second finish's first turn is the compiled
+    report (long). ``FAKE_CLAUDE_ACK_TOOL=1`` makes the first ack use a tool."""
+    init()
+    tool_use("Agent", "toolu_a1", {"description": "sweep one", "prompt": "go"})
+    start_bg("a1", "toolu_a1", task_type="local_agent")
+    tool_result("toolu_a1", "Async agent launched successfully.")
+    tool_use("Agent", "toolu_a2", {"description": "sweep two", "prompt": "go"})
+    start_bg("a2", "toolu_a2", task_type="local_agent")
+    tool_result("toolu_a2", "Async agent launched successfully.")
+    text("Two sweeps running in the background; I'll report back.")
+    result("Two sweeps running in the background; I'll report back.", turns=3)
+    for task_id, tool_id, first_answer in (
+        ("a1", "toolu_a1", "Sweep one is back; waiting on sweep two."),
+        ("a2", "toolu_a2", "REPORT: " + "all findings compiled. " * 30),
+    ):
+        if wait_idle_or_eof(WAKE_S) is None:
+            shutdown()
+        init()
+        if task_id == "a1" and os.environ.get("FAKE_CLAUDE_ACK_TOOL") == "1":
+            tool_use("Read", "toolu_rd", {"file_path": "/tmp/out.md"})
+            tool_result("toolu_rd", "notes")
+        text(first_answer)
+        _end_quietly(task_id)
+        result(first_answer)
+        _notify(task_id, tool_id)
+        init()
+        text(f"{task_id} finished (again).")
+        result(f"{task_id} finished (again).")
+    serve_followups()
+
+
+def scenario_quiet_batch_report(first: dict) -> None:
+    """#785 dev-bot regression (session 09ab089b): three background tasks;
+    two short acks fold; an ``unknown`` ack turn completes while the shell
+    task still runs; the shell task then ends moments later (the runner pairs
+    that end with the ack turn, so the task counts as announced); its own
+    notification turn is the batch's only real content — a long report."""
+    init()
+    for task_id, tool_id, kind in (
+        ("a1", "toolu_a1", "local_agent"),
+        ("a2", "toolu_a2", "local_agent"),
+        ("b3", "toolu_b3", "local_bash"),
+    ):
+        tool_use("Agent" if kind == "local_agent" else "Bash", tool_id, {})
+        start_bg(task_id, tool_id, task_type=kind)
+        tool_result(tool_id, "launched")
+    result("Three jobs running; I'll report back.", turns=4)
+    for task_id in ("a1", "a2"):
+        if wait_idle_or_eof(WAKE_S) is None:
+            shutdown()
+        init()
+        text(f"{task_id} is back.")
+        _end_quietly(task_id)
+        result(f"{task_id} is back.")
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    init()
+    text("Still waiting on the shell job.")
+    result("Still waiting on the shell job.")
+    _end_quietly("b3")
+    _notify("b3", "toolu_b3")
+    init()
+    report = "REPORT: " + "all three jobs finished cleanly. " * 20
+    text(report)
+    result(report)
+    serve_followups()
+
+
+def scenario_acks_only_batch(first: dict) -> None:
+    """#785: every wake turn of the batch is a short ack that folds, and the
+    last task ends with no turn after it — the batch still needs one push."""
+    init()
+    for task_id, tool_id in (("b1", "toolu_b1"), ("b2", "toolu_b2")):
+        tool_use("Bash", tool_id, {"command": "sleep 20", "run_in_background": True})
+        start_bg(task_id, tool_id)
+        tool_result(tool_id, "running")
+    result("Two jobs running.", turns=3)
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    end_bg("b1")
+    init()
+    text("b1 done; waiting on b2.")
+    result("b1 done; waiting on b2.")
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    _end_quietly("b2")
+    serve_followups()
+
+
+def scenario_report_then_noop(first: dict) -> None:
+    """#785 dev bot (session 4b3a2ab8): the task's report pushes; two seconds
+    later the CLI runs an unnamed ``unknown`` no-op turn ("nothing new"), and
+    later a ScheduleWakeup fires with nothing new either."""
+    init()
+    tool_use("Bash", "toolu_b1", {"command": "sleep 20", "run_in_background": True})
+    start_bg("b1", "toolu_b1")
+    tool_result("toolu_b1", "running")
+    result("One job running.", turns=2)
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    end_bg("b1")
+    init()
+    report = "REPORT: " + "the job finished cleanly. " * 20
+    text(report)
+    result(report)
+    init()
+    text("I already posted its output above; nothing new.")
+    result("I already posted its output above; nothing new.")
+    lifecycle("wake-cmd-late", "started")
+    init()
+    text("Wake-up: still nothing new.")
+    result("Wake-up: still nothing new.")
+    serve_followups()
+
+
+def scenario_followup_launches_bg(first: dict) -> None:
+    """#795: the run answers; a follow-up (injected user line) launches a
+    background Bash; that task's wake turn must reply to the follow-up."""
+    init()
+    text("FIRST")
+    result("FIRST")
+    obj = next_user(None)
+    if not isinstance(obj, dict):
+        shutdown()
+    cmd = obj.get("uuid")
+    lifecycle(cmd, "queued")
+    lifecycle(cmd, "started")
+    init()
+    tool_use("Bash", "toolu_bg2", {"command": "sleep 20", "run_in_background": True})
+    start_bg("b2", "toolu_bg2")
+    tool_result("toolu_bg2", "Command running in background with ID: b2.")
+    text("launched")
+    result("launched", turns=2)
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    end_bg("b2")
+    init()
+    text("GOT: B2")
+    result("GOT: B2")
     serve_followups()
 
 
@@ -528,16 +789,80 @@ def scenario_error_first(first: dict) -> None:
     serve_followups()
 
 
+def _collect_steers() -> tuple[list[dict], bool]:
+    """Wait for steered user lines (#775): the first within STEER_WAIT_S,
+    then any more until a short quiet gap. Returns (steers, eof)."""
+    steers: list[dict] = []
+    got = next_user(STEER_WAIT_S)
+    while isinstance(got, dict):
+        steers.append(got)
+        lifecycle(got.get("uuid"), "queued")
+        got = next_user(0.3)
+    return steers, got is None
+
+
+def scenario_steer_mid_tool(first: dict) -> None:
+    """#775 / probe F5: user lines written while a tool runs are folded into
+    the SAME turn at the next tool boundary — one result that honours them.
+    The CLI reports each as ``command_lifecycle{started}`` after the tool's
+    result, while the turn is still open (probed on CLI 2.1.284)."""
+    init()
+    tool_use("Bash", "toolu_sleep", {"command": "sleep 8"})
+    steers, eof = _collect_steers()
+    tool_result("toolu_sleep", "slept")
+    for steer in steers:
+        lifecycle(steer.get("uuid"), "started")
+    answer = "DONE"
+    if steers:
+        answer += " + " + " | ".join(user_text(s) for s in steers)
+    text(answer)
+    result(answer, turns=2)
+    for steer in steers:
+        lifecycle(steer.get("uuid"), "completed")
+    if eof:
+        shutdown()
+    serve_followups()
+
+
+def scenario_steer_post_last_tool(first: dict) -> None:
+    """#775 / probe F6: a user line written after the turn's last tool call
+    (during text generation) becomes the NEXT turn in the same process — a
+    second result, started only after the first one."""
+    init()
+    tool_use("Bash", "toolu_echo", {"command": "echo hi"})
+    tool_result("toolu_echo", "hi")
+    steers, eof = _collect_steers()
+    text("FIRST")
+    result("FIRST", turns=2)
+    for steer in steers:
+        lifecycle(steer.get("uuid"), "started")
+        init()
+        text(f"ECHO: {user_text(steer)}")
+        result(f"ECHO: {user_text(steer)}")
+    if eof:
+        shutdown()
+    serve_followups()
+
+
 _SCENARIOS = {
+    "steer_mid_tool": scenario_steer_mid_tool,
+    "steer_post_last_tool": scenario_steer_post_last_tool,
     "error_first": scenario_error_first,
     "ignore_eof": scenario_ignore_eof,
     "ignore_eof_with_task": scenario_ignore_eof_with_task,
     "bg_bash_wake": scenario_bg_bash_wake,
     "bg_agent_wake": scenario_bg_agent_wake,
     "agent_wake_unknown_first": scenario_agent_wake_unknown_first,
+    "agent_resumed": scenario_agent_resumed,
+    "agent_orphans_bg_task": scenario_agent_orphans_bg_task,
     "monitor_ticks": scenario_monitor_ticks,
     "scheduled_wakeup": scenario_scheduled_wakeup,
     "followup": scenario_followup,
+    "followup_launches_bg": scenario_followup_launches_bg,
+    "multi_agent_acks": scenario_multi_agent_acks,
+    "quiet_batch_report": scenario_quiet_batch_report,
+    "acks_only_batch": scenario_acks_only_batch,
+    "report_then_noop": scenario_report_then_noop,
     "resume_after_killed_task": scenario_resume_after_killed_task,
     "inherited_fd_after_exit": scenario_inherited_fd_after_exit,
 }

@@ -22,11 +22,11 @@ import time
 import tty
 import weakref
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 import msgspec
@@ -36,6 +36,7 @@ from ..config import ConfigError
 from ..events import EventFactory
 from ..logging import get_logger
 from ..model import (
+    TURN_COMPLETE_MARKER,
     Action,
     ActionKind,
     CompletedEvent,
@@ -336,6 +337,12 @@ class LiveSession:
     # transcript is complete, so a close that overruns its grace must not
     # quarantine it.
     closed_idle_clean: bool = False
+    # #775: the steer window. Set (under ``lock``) when /cancel or /new
+    # interrupts an active turn — the process is about to be killed, so a
+    # steer must fall back to the queue path instead of being written into a
+    # pipe nobody will answer. Closing stdin (``closing``) shuts it too.
+    steer_closed: bool = False
+    steer_closed_reason: str | None = None
     listeners: list[Callable[[str, dict[str, Any]], Any]] = field(default_factory=list)
 
     @property
@@ -345,6 +352,10 @@ class LiveSession:
     @property
     def accepting_input(self) -> bool:
         return not self.closing
+
+    @property
+    def accepting_steer(self) -> bool:
+        return not self.closing and not self.steer_closed
 
 
 _LIVE_SESSIONS: dict[str, LiveSession] = {}
@@ -557,6 +568,99 @@ async def inject_when_idle(
                         live.idle_since = time.monotonic()
                     return ok
         await anyio.sleep(poll_s)
+
+
+# ``steered``: written while a turn was open (folded into it, or run as the
+# next turn if it arrived after the last tool call). ``written_idle``: the
+# session sat between turns, so the line simply runs as the next turn — an
+# ordinary follow-up, nothing was steered.
+SteerOutcome = Literal[
+    "steered",
+    "written_idle",
+    "no_live_session",
+    "window_closed",
+    "options_changed",
+    "write_failed",
+]
+
+_UNSET_OPTIONS: Any = object()
+
+
+async def close_steer_window(session_id: str, reason: str) -> bool:
+    """Stop accepting steers into ``session_id`` (#775 race guard).
+
+    Taken under ``LiveSession.lock`` — the same lock :func:`steer_into_session`
+    holds while it checks the window and writes — so a steer either lands
+    before this returns or sees the window closed and falls back to the queue
+    path. Idempotent; False when there is no live session.
+    """
+    live = _LIVE_SESSIONS.get(session_id)
+    if live is None:
+        return False
+    async with live.lock:
+        if live.steer_closed:
+            return True
+        live.steer_closed = True
+        live.steer_closed_reason = reason
+    logger.info(
+        "claude.live_session.steer_window_closed", session_id=session_id, reason=reason
+    )
+    return True
+
+
+async def steer_into_session(
+    session_id: str,
+    text: str,
+    *,
+    command_uuid: str,
+    run_options: Any = _UNSET_OPTIONS,
+) -> SteerOutcome:
+    """Steer mode (#775): write ``text`` into the live session *now*.
+
+    Unlike :func:`inject_when_idle` this does not wait for the turn to end:
+    written mid-turn the CLI folds it into the running turn at the next tool
+    boundary (F5; the fold is confirmed by ``command_lifecycle{started}``
+    arriving while the turn is open — see :func:`_absorb_injected`); written
+    after the turn's last tool call or between turns it becomes the next turn
+    in the same process (F6), delivered as a follow-up turn.
+
+    The window check and the write happen under ``LiveSession.lock``, which
+    :func:`close_live_session` and :func:`close_steer_window` also take, so a
+    steer can never be written into a pipe that is closing (no orphan turns).
+    ``run_options``: when given and the session is idle between turns, a
+    mismatch with the options the process was spawned with returns
+    ``options_changed`` — the queue path then restarts it with the new ones.
+    """
+    live = _LIVE_SESSIONS.get(session_id)
+    if live is None:
+        return "no_live_session"
+    async with live.lock:
+        if not live.accepting_steer:
+            return "window_closed"
+        if (
+            run_options is not _UNSET_OPTIONS
+            and live.idle
+            and run_options != live.state.spawn_run_options
+        ):
+            return "options_changed"
+        state = live.state
+        # Record before writing: command_lifecycle can race the send.
+        state.steered_commands[command_uuid] = text
+        ok = await write_user_message(session_id, text, command_uuid=command_uuid)
+        if not ok:
+            state.steered_commands.pop(command_uuid, None)
+            return "write_failed"
+        mid_turn = not live.idle
+        if not mid_turn:
+            live.idle_since = time.monotonic()
+    logger.info(
+        "claude.live_session.steered",
+        session_id=session_id,
+        command_uuid=command_uuid,
+        mid_turn=mid_turn,
+        turn=live.state.turn,
+    )
+    return "steered" if mid_turn else "written_idle"
 
 
 def is_session_alive(session_id: str) -> bool:
@@ -781,6 +885,13 @@ _DISCUSS_ESCALATION_MESSAGE = (
 # snapshot would otherwise be the only backstop against a pinned session.
 _TASK_LIVE_STATUSES = frozenset({"running", "pending"})
 
+# #801: a snapshot is a provisional signal next to the authoritative
+# task_started / task_updated. Within this window of an end (or a revival) a
+# snapshot that disagrees is taken to straddle those events, not to revive
+# (or re-end) the task: it can neither pin a just-finished task open nor end
+# a just-resumed one. task_started / task_updated always apply at once.
+_TASK_REVIVE_GRACE_S = 5.0
+
 
 @dataclass(slots=True)
 class ClaudeTask:
@@ -803,14 +914,42 @@ class ClaudeTask:
     ended_at: float | None = None
     last_usage: dict[str, Any] | None = None
     last_tool_name: str | None = None
+    # #801: times this task_id came back after ending — Claude resuming a
+    # finished agent (SendMessage) reuses its id. ``started_at`` is reset to
+    # the latest revival, so ``started_at``/``ended_at`` describe the current
+    # run only.
+    revived_count: int = 0
+    # #777: the agent's current step from ``task_progress.description``
+    # ("Running <step>") — kept apart from ``description`` (the task's label).
+    last_step: str | None = None
+    # #795: the live-session turn the task was launched in (1 = the run's
+    # own prompt), so its wake turn can reply to the message that asked.
+    origin_turn: int | None = None
+    # #777: for a subagent's own task, the ``tool_use_id`` of the Agent call
+    # that spawned the subagent (from the subagent's tool_use
+    # ``parent_tool_use_id``) — the status panel only lists such a task on
+    # its own once that agent is gone. None = unknown.
+    owner_tool_use_id: str | None = None
 
     @property
     def is_live_background(self) -> bool:
+        """A live background task the parent session launched itself — the
+        ones the parent's ``background_tasks_changed`` snapshot lists and
+        wake turns are attributed to (#785)."""
         return (
             self.is_backgrounded
             and not self.owned_by_subagent
             and self.status in _TASK_LIVE_STATUSES
         )
+
+    @property
+    def holds_session(self) -> bool:
+        """#801: live background work the live session must stay open for,
+        whoever launched it. A subagent's backgrounded task (``Bash
+        run_in_background`` inside an agent) outlives the agent that started
+        it; closing stdin under it kills it. A subagent's foreground tools
+        (``is_backgrounded=False``) die with the subagent and don't count."""
+        return self.is_backgrounded and self.status in _TASK_LIVE_STATUSES
 
 
 @dataclass(slots=True)
@@ -850,13 +989,27 @@ class ClaudeStreamState:
     max_text_len_since_cooldown: int = 0
     # Store outline text for embedding in synthetic approve/deny action
     outline_text: str | None = None
-    # #508 ExitPlanMode plan body — captured from the tool_use input on
-    # every ExitPlanMode call so the bridge can re-emit it as part of the
-    # final answer when the post-approval result is brief or empty
-    # (research/audit tasks where Claude has nothing left to say after
-    # the user approves).  Plan messages on Telegram are deleted on
-    # approve, so this is the only path to retain the body.
+    # #508 ExitPlanMode plan body the user APPROVED in this turn, re-emitted
+    # as "📋 Plan (approved)" in the final answer when the post-approval
+    # result is brief or empty (research/audit tasks where Claude has nothing
+    # left to say after the user approves).  Plan messages on Telegram are
+    # deleted on approve, so this is the only path to retain the body.
+    # #793: set only when a request is approved — never from a denied one.
     last_exitplanmode_plan: str | None = None
+    # #793: ExitPlanMode ``input.plan`` per control request awaiting a
+    # decision (request_id -> input, "" when absent). Resolved to the plan
+    # body at decision time — see ``_resolve_exitplanmode_plan``.
+    exitplanmode_plans: dict[str, str] = field(default_factory=dict)
+    # #793: plan bodies the user explicitly rejected (❌ Deny) in this
+    # process — only consulted when the body had to come from the
+    # (possibly stale) ``input.plan`` fallback.
+    rejected_exitplanmode_plans: set[str] = field(default_factory=set)
+    # #793: the plan file (``…/.claude/plans/*.md``) this session writes, and
+    # its content when the last write was a full ``Write``. The plan file is
+    # the source of truth: on plan-file CLIs ExitPlanMode's ``input.plan``
+    # lags it by one write when both are issued in the same message.
+    plan_file_path: str | None = None
+    plan_file_content: str | None = None
     # Cumulative seconds the session spent in Anthropic-side rate-limit waits (#349).
     # #790: only *throttling* events accrue (a `rejected` snapshot, or the
     # legacy retry_after_ms/reset-ts shape) — `allowed` heartbeats never do.
@@ -908,6 +1061,9 @@ class ClaudeStreamState:
     # handles decide, unchanged.
     tasks: dict[str, ClaudeTask] = field(default_factory=dict)
     native_tasks_seen: bool = False
+    # #777: subagent tool_use id -> the parent Agent's tool_use id (from
+    # ``parent_tool_use_id``), linking a subagent-owned task to its agent.
+    tool_parents: dict[str, str] = field(default_factory=dict)
 
     # #776 live-session turn segmentation. ``live_mode`` is armed by
     # ``ClaudeRunner.run_impl`` in control-channel mode (kill switch
@@ -942,6 +1098,11 @@ class ClaudeStreamState:
     # Injected lines whose turn hasn't opened yet: the lifecycle must not
     # close stdin under them, and the next queued follow-up waits for them.
     awaiting_injected: dict[str, float] = field(default_factory=dict)
+    # #775: uuid -> text of lines written in steer mode (a subset of
+    # ``injected_commands``), used to label the "steer received" row.
+    steered_commands: dict[str, str] = field(default_factory=dict)
+    # #775: injected lines the CLI folded into an already-open turn.
+    absorbed_commands: set[str] = field(default_factory=set)
     # #776 resume guard (F11): the stopped-task replay + 0-turn result that
     # precede the real answer on --resume of a session whose previous
     # process ended with live background work.
@@ -2411,7 +2572,9 @@ def _live_bounded_handle_count(handles: set[str], deadlines: dict[str, float]) -
 
 
 def _live_native_tasks(state: ClaudeStreamState) -> list[ClaudeTask]:
-    return [task for task in state.tasks.values() if task.is_live_background]
+    """Live background tasks that hold the session open — top-level ones and
+    a subagent's backgrounded tasks alike (#801)."""
+    return [task for task in state.tasks.values() if task.holds_session]
 
 
 def _is_native_monitor(state: ClaudeStreamState, task: ClaudeTask) -> bool:
@@ -2574,6 +2737,49 @@ def _end_task(
     _note_task_end(state, task)
 
 
+def _revive_task(
+    state: ClaudeStreamState, task: ClaudeTask, source: str, status: str = "running"
+) -> None:
+    """#801: bring an ended task back to life. Claude resuming a finished
+    agent reuses its ``task_id``; left terminal, the task reads as idle and
+    the live session closes under the resumed agent."""
+    prior_status = task.status
+    ended_at = task.ended_at
+    task.status = status
+    task.ended_at = None
+    task.started_at = time.monotonic()
+    task.revived_count += 1
+    # #795: the turn that resumed it is the one its next wake turn answers.
+    task.origin_turn = state.turn
+    # Its next end is a new finish (#785): a wake turn may announce it again.
+    state.announced_task_ids.discard(task.task_id)
+    if task.holds_session:
+        state.background_observed = True
+    log = logger.info if task.is_backgrounded else logger.debug
+    log(
+        "claude.task.revived",
+        task_id=task.task_id,
+        task_type=task.task_type,
+        prior_status=prior_status,
+        ended_ago_s=(
+            round(task.started_at - ended_at, 1) if ended_at is not None else None
+        ),
+        revived_count=task.revived_count,
+        description=(task.description or "")[:80],
+        source=source,
+    )
+
+
+def _mark_announced(state: ClaudeStreamState, task_ids: Iterable[str]) -> None:
+    """#785: record finishes a wake turn delivered — except a task that has
+    been revived since (#801): its next end is news, not the same finish."""
+    for task_id in task_ids:
+        task = state.tasks.get(task_id)
+        if task is not None and task.ended_at is None:
+            continue
+        state.announced_task_ids.add(task_id)
+
+
 def _register_task(
     state: ClaudeStreamState, event: claude_schema.StreamSystemMessage, source: str
 ) -> ClaudeTask:
@@ -2583,6 +2789,8 @@ def _register_task(
     if task is None:
         task = ClaudeTask(task_id=task_id)
         state.tasks[task_id] = task
+    elif task.ended_at is not None and source == "task_started":
+        _revive_task(state, task, source)
     if event.task_type is not None:
         task.task_type = event.task_type
     if event.tool_use_id is not None:
@@ -2595,7 +2803,7 @@ def _register_task(
         task.is_backgrounded = event.is_backgrounded
     if event.owned_by_subagent is not None:
         task.owned_by_subagent = event.owned_by_subagent
-    if task.is_live_background:
+    if task.holds_session:
         state.background_observed = True
     if created or source == "task_started":
         log = logger.info if task.is_backgrounded else logger.debug
@@ -2612,6 +2820,24 @@ def _register_task(
     return task
 
 
+def _stamp_task_origin(state: ClaudeStreamState, task: ClaudeTask) -> None:
+    """#795: remember the turn a task was launched in (first sighting wins)."""
+    if task.origin_turn is None:
+        task.origin_turn = state.turn
+
+
+def _task_attribution(state: ClaudeStreamState, task_ids: list[str]) -> dict[str, Any]:
+    """#795/#785: TurnEvent detail naming the tasks a wake turn answers and
+    the turn that launched them (the bridge replies to that turn's message)."""
+    detail: dict[str, Any] = {"task_ids": list(task_ids)}
+    for tid in task_ids:
+        task = state.tasks.get(tid)
+        if task is not None and task.origin_turn is not None:
+            detail["origin_turn"] = task.origin_turn
+            break
+    return detail
+
+
 def _apply_task_event(
     state: ClaudeStreamState, event: claude_schema.StreamSystemMessage
 ) -> None:
@@ -2622,12 +2848,27 @@ def _apply_task_event(
     if subtype == "background_tasks_changed":
         snapshot = event.tasks or []
         present: set[str] = set()
+        now = time.monotonic()
         for entry in snapshot:
             task_id = entry.get("task_id") if isinstance(entry, dict) else None
             if not isinstance(task_id, str) or not task_id:
                 continue
             present.add(task_id)
-            if task_id not in state.tasks:
+            known = state.tasks.get(task_id)
+            if known is not None and known.ended_at is not None:
+                # #801: a finished task listed again — Claude resumed it (the
+                # snapshot precedes its task_started). A listing moments
+                # after its end straddles the end events instead.
+                if now - known.ended_at >= _TASK_REVIVE_GRACE_S:
+                    _revive_task(state, known, "snapshot")
+                else:
+                    logger.debug(
+                        "claude.task.snapshot_revive_skipped",
+                        task_id=task_id,
+                        status=known.status,
+                        ended_ago_s=round(now - known.ended_at, 1),
+                    )
+            elif known is None:
                 # The snapshot lands a moment before task_started; register a
                 # background placeholder so the gap can't read as "idle".
                 task = ClaudeTask(
@@ -2638,6 +2879,7 @@ def _apply_task_event(
                 )
                 state.tasks[task_id] = task
                 state.background_observed = True
+                _stamp_task_origin(state, task)
                 logger.info(
                     "claude.task.registered",
                     task_id=task_id,
@@ -2650,13 +2892,25 @@ def _apply_task_event(
                 )
         for task in list(state.tasks.values()):
             if task.is_live_background and task.task_id not in present:
+                if task.revived_count and now - task.started_at < _TASK_REVIVE_GRACE_S:
+                    # #801: a snapshot from before the revival; the resumed
+                    # run's own task_updated (or a later snapshot) ends it.
+                    logger.debug(
+                        "claude.task.snapshot_end_deferred",
+                        task_id=task.task_id,
+                        revived_ago_s=round(now - task.started_at, 1),
+                    )
+                    continue
                 _end_task(state, task, "ended", "snapshot")
         return
     task_id = event.task_id
     if not task_id:
         return
     if subtype == "task_started":
-        _register_task(state, event, "task_started")
+        task = _register_task(state, event, "task_started")
+        _stamp_task_origin(state, task)
+        if task.owned_by_subagent and task.tool_use_id:
+            task.owner_tool_use_id = state.tool_parents.get(task.tool_use_id)
         return
     task = state.tasks.get(task_id)
     if task is None:
@@ -2667,15 +2921,25 @@ def _apply_task_event(
         )
         return
     if subtype == "task_progress":
+        # #801: progress carries no status, so it never revives an ended task
+        # — a straggler must not pin the session; a real resume sends
+        # task_started (and a snapshot listing the id).
         if event.usage is not None:
             task.last_usage = dict(event.usage)
         if event.last_tool_name is not None:
             task.last_tool_name = event.last_tool_name
+        if event.description:
+            # #777: on task_progress the description is the agent's current
+            # step ("Running tests"), not the task's label.
+            task.last_step = event.description
         return
     if subtype == "task_updated":
         status = (event.patch or {}).get("status")
         if isinstance(status, str) and status not in _TASK_LIVE_STATUSES:
             _end_task(state, task, status, "task_updated")
+        elif isinstance(status, str) and task.ended_at is not None:
+            # #801: the CLI's own status patch says it runs again.
+            _revive_task(state, task, "task_updated", status)
         return
     if subtype == "task_notification":
         if event.usage is not None:
@@ -2914,6 +3178,175 @@ def _prepend_exitplanmode_plan(final_answer: str | None, plan_body: str | None) 
     if final:
         return f"📋 Plan (approved):\n\n{body}\n\n---\n\n{final}"
     return f"📋 Plan (approved):\n\n{body}"
+
+
+def _exitplanmode_plan_input(raw_input: Any) -> str | None:
+    plan = raw_input.get("plan") if isinstance(raw_input, dict) else None
+    return plan if isinstance(plan, str) and plan.strip() else None
+
+
+_PLAN_FILE_MAX_BYTES = 256 * 1024
+_PLAN_FILE_TOOLS = frozenset({"Write", "Edit", "MultiEdit"})
+
+
+def _is_plan_file_path(path: Path) -> bool:
+    """A Claude Code plan file: ``<config dir>/plans/<name>.md`` where the
+    config dir is ``~/.claude`` (any home) or ``$CLAUDE_CONFIG_DIR``."""
+    if not path.is_absolute() or path.suffix != ".md":
+        return False
+    plans = path.parent
+    if plans.name != "plans":
+        return False
+    if plans.parent.name == ".claude":
+        return True
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    return bool(config_dir) and plans.parent == Path(config_dir).expanduser()
+
+
+def _observe_plan_file_write(
+    state: ClaudeStreamState, tool_name: str, raw_input: Any
+) -> None:
+    """#793: remember the session's plan file, and its full content when the
+    CLI writes it whole — that content is the plan the next ExitPlanMode is
+    about, whatever its lagging ``input.plan`` says."""
+    if tool_name not in _PLAN_FILE_TOOLS or not isinstance(raw_input, dict):
+        return
+    file_path = raw_input.get("file_path")
+    if not isinstance(file_path, str) or not _is_plan_file_path(Path(file_path)):
+        return
+    state.plan_file_path = file_path
+    content = raw_input.get("content") if tool_name == "Write" else None
+    # An Edit/MultiEdit changes part of the file: read it from disk later.
+    state.plan_file_content = content if isinstance(content, str) else None
+
+
+def _read_plan_file(path_str: str) -> str | None:
+    """Read the plan file, bounded and only if it still resolves to a plan
+    file (no symlink escape). ``None`` on any problem."""
+    try:
+        path = Path(path_str).resolve(strict=True)
+        if not _is_plan_file_path(path) or not path.is_file():
+            return None
+        if path.stat().st_size > _PLAN_FILE_MAX_BYTES:
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
+
+
+def _resolve_exitplanmode_plan(
+    state: ClaudeStreamState,
+    request_id: str,
+    input_body: str,
+    *,
+    session_id: str | None,
+    decision: str,
+) -> tuple[str | None, str]:
+    """#793: the plan body a decision on ``request_id`` is about, and where
+    it came from (``write`` / ``file`` / ``input``).
+
+    The plan file wins over ExitPlanMode's ``input.plan``: when the CLI
+    issues the plan-file Write and ExitPlanMode in one message, the input is
+    read before the Write lands and carries the PREVIOUS plan (CLI 2.1.284,
+    dev-bot transcript). A disagreement is logged as the stale-input quirk.
+    """
+    file_body: str | None = None
+    source = "input"
+    if state.plan_file_content is not None and state.plan_file_content.strip():
+        file_body, source = state.plan_file_content, "write"
+    elif state.plan_file_path is not None:
+        disk = _read_plan_file(state.plan_file_path)
+        if disk is not None and disk.strip():
+            file_body, source = disk, "file"
+    if file_body is None:
+        return (input_body or None), "input"
+    if input_body and input_body.strip() != file_body.strip():
+        logger.info(
+            "claude.plan.stale_input",
+            request_id=request_id,
+            session_id=session_id,
+            decision=decision,
+            plan_source=source,
+            input_chars=len(input_body),
+            file_chars=len(file_body),
+        )
+    return file_body, source
+
+
+def _approve_exitplanmode_plan(
+    state: ClaudeStreamState,
+    request_id: str,
+    *,
+    session_id: str | None,
+    source: str,
+) -> None:
+    """#793: the user approved ExitPlanMode request ``request_id`` (Telegram
+    Approve, the ``plan-auto`` stamp, or the post-outline auto-approve) —
+    its plan body becomes the one the final answer may re-show."""
+    input_body = state.exitplanmode_plans.pop(request_id, None)
+    if input_body is None:
+        return
+    body, plan_source = _resolve_exitplanmode_plan(
+        state, request_id, input_body, session_id=session_id, decision="approved"
+    )
+    if body is None:
+        return
+    if plan_source == "input" and body in state.rejected_exitplanmode_plans:
+        # No plan file to check against, and the input repeats a plan the
+        # user denied — the stale-input quirk. Labelling it "approved" would
+        # be wrong, and an earlier approved body isn't what the agent now
+        # executes, so show none.
+        state.last_exitplanmode_plan = None
+        logger.info(
+            "claude.plan.stale_input",
+            request_id=request_id,
+            session_id=session_id,
+            decision="approved",
+            plan_source="input",
+            reason="matches_rejected",
+            input_chars=len(body),
+        )
+        return
+    state.last_exitplanmode_plan = body
+    logger.debug(
+        "claude.plan.approved",
+        request_id=request_id,
+        session_id=session_id,
+        source=source,
+        plan_source=plan_source,
+        plan_chars=len(body),
+    )
+
+
+def _drop_exitplanmode_plan(
+    state: ClaudeStreamState,
+    request_id: str,
+    *,
+    rejected: bool,
+    reason: str,
+    session_id: str | None = None,
+) -> None:
+    """#793: ExitPlanMode request ``request_id`` was not approved — its body
+    is never re-shown. ``rejected`` is the user's explicit ❌ Deny; procedural
+    denials (Pause & Outline, Let's discuss, outline guard, timeout) are not
+    a verdict on the plan, so a later identical approval still counts."""
+    input_body = state.exitplanmode_plans.pop(request_id, None)
+    if input_body is None:
+        return
+    plan_source = None
+    if rejected:
+        body, plan_source = _resolve_exitplanmode_plan(
+            state, request_id, input_body, session_id=session_id, decision="denied"
+        )
+        if body is not None:
+            state.rejected_exitplanmode_plans.add(body)
+    logger.debug(
+        "claude.plan.not_approved",
+        request_id=request_id,
+        rejected=rejected,
+        reason=reason,
+        plan_source=plan_source,
+    )
 
 
 def _maybe_audit_env(state: ClaudeStreamState, session_id: str) -> None:
@@ -3190,18 +3623,22 @@ def _open_followup_turn(
         reason = "task_finished"
         detail["tasks"] = list(state.turn_notifications)
         ids = list(state.turn_notification_ids)
+        detail.update(_task_attribution(state, ids))
         if ids and all(tid in state.announced_task_ids for tid in ids):
             # #785: the second wake turn for one finish (the first opened as
             # ``unknown`` and was attributed to it) — the bridge won't push.
             detail["already_announced"] = True
-        state.announced_task_ids.update(ids)
+        _mark_announced(state, ids)
     elif command_uuid is not None:
         reason = "scheduled_wakeup"
     elif monitors := [
-        task for task in _live_native_tasks(state) if _is_native_monitor(state, task)
+        task
+        for task in _live_native_tasks(state)
+        if task.is_live_background and _is_native_monitor(state, task)
     ]:
         reason = "monitor_event"
         detail["tasks"] = [t.description or "Monitor" for t in monitors]
+        detail.update(_task_attribution(state, [t.task_id for t in monitors]))
     if reason == "scheduled_wakeup":
         state.pending_wakeup_until = None
     if reason == "followup" and command_uuid is not None:
@@ -3238,6 +3675,56 @@ def _open_followup_turn(
     )
 
 
+_STEER_SNIPPET_CHARS = 80
+
+
+def _absorb_injected(
+    state: ClaudeStreamState, factory: EventFactory, command_uuid: str
+) -> list[UntetherEvent]:
+    """#775: an injected line the CLI picked up while a turn was already open
+    — it was folded into that turn (F5) instead of starting its own.
+
+    Clears the awaiting marker (so the idle close and the next queued
+    follow-up aren't held for a turn that will never open) and surfaces a
+    "steer received" row in the running turn's progress. The bridge pops the
+    line's reply anchor on seeing ``detail["absorbed_command_uuid"]`` — its
+    answer is this turn's answer, so no separate reply is owed.
+    """
+    state.absorbed_commands.add(command_uuid)
+    state.awaiting_injected.pop(command_uuid, None)
+    steer_text = state.steered_commands.get(command_uuid)
+    label = "steer" if steer_text is not None else "follow-up"
+    title = f"\N{RIGHTWARDS ARROW WITH HOOK}\N{VARIATION SELECTOR-16} {label} received"
+    if steer_text:
+        snippet = " ".join(steer_text.split())
+        if len(snippet) > _STEER_SNIPPET_CHARS:
+            snippet = snippet[: _STEER_SNIPPET_CHARS - 1] + "…"
+        title = f"{title}: {snippet}"
+    logger.info(
+        "claude.live_session.injected_absorbed",
+        session_id=factory.resume.value if factory.resume else None,
+        command_uuid=command_uuid,
+        steer=steer_text is not None,
+        turn=state.turn,
+    )
+    state.note_seq += 1
+    action_id = f"claude.steer.{state.note_seq}"
+    detail = {"absorbed_command_uuid": command_uuid, "steer": steer_text is not None}
+    return [
+        factory.action_started(
+            action_id=action_id, kind="note", title=title, detail=detail
+        ),
+        factory.action_completed(
+            action_id=action_id,
+            kind="note",
+            title=title,
+            ok=True,
+            level="info",
+            detail=detail,
+        ),
+    ]
+
+
 def translate_claude_event(
     event: claude_schema.StreamJsonMessage,
     *,
@@ -3247,6 +3734,17 @@ def translate_claude_event(
 ) -> list[UntetherEvent]:
     """Translate one CLI line, adding #776 turn segmentation around
     :func:`_translate_claude_event_base`."""
+    if (
+        isinstance(event, claude_schema.StreamCommandLifecycleMessage)
+        and event.state == "started"
+        and state.turn_open
+        and event.command_uuid is not None
+        and event.command_uuid in state.injected_commands
+        and event.command_uuid not in state.absorbed_commands
+    ):
+        # #775: started while a turn is open → folded into it (probed on CLI
+        # 2.1.284: queued at write, started after the running tool's result).
+        return _absorb_injected(state, factory, event.command_uuid)
     if (
         isinstance(event, claude_schema.StreamSystemMessage)
         and event.subtype == "task_notification"
@@ -3357,9 +3855,10 @@ def translate_claude_event(
                 # its final gets the real header.
                 detail["tasks"] = [label for _, label in state.turn_ended_tasks]
                 detail["retro_attributed"] = True
-                state.announced_task_ids.update(
-                    tid for tid, _ in state.turn_ended_tasks
+                detail.update(
+                    _task_attribution(state, [tid for tid, _ in state.turn_ended_tasks])
                 )
+                _mark_announced(state, (tid for tid, _ in state.turn_ended_tasks))
                 state.turn_reason = "task_finished"
                 logger.info(
                     "claude.turn.retro_attributed",
@@ -3509,6 +4008,8 @@ def _translate_claude_event_base(
                             content,
                             parent_tool_use_id=parent_tool_use_id,
                         )
+                        if parent_tool_use_id and content.id:
+                            state.tool_parents[content.id] = parent_tool_use_id
                         state.pending_actions[action.id] = action
                         state.last_tool_use_id = content.id
                         # #347 track long-running primitives that outlive
@@ -3519,19 +4020,15 @@ def _translate_claude_event_base(
                         # (master toggle gate inside).  Sibling of, not
                         # replacement for, _register_background_handle.
                         _observe_loop_tool_use(state, content)
-                        # #508 capture ExitPlanMode plan body so the bridge
-                        # can re-emit it in the final answer when the
-                        # post-approval result is brief/empty (research
-                        # tasks).  Only captures from the regular Approve
-                        # flow — Pause-and-Outline outlines go via
-                        # state.outline_text and a different code path.
-                        if str(content.name or "") == "ExitPlanMode":
-                            _epm_input = (
-                                content.input if isinstance(content.input, dict) else {}
+                        # #508/#793: the ExitPlanMode plan body is recorded
+                        # from its control_request (keyed by request_id) and
+                        # kept only if that request is approved — not here,
+                        # where the user hasn't decided yet. The parent's
+                        # plan-file writes are tracked as its source of truth.
+                        if parent_tool_use_id is None:
+                            _observe_plan_file_write(
+                                state, str(content.name or ""), content.input
                             )
-                            _plan_body = _epm_input.get("plan")
-                            if isinstance(_plan_body, str) and _plan_body.strip():
-                                state.last_exitplanmode_plan = _plan_body
                         out.append(
                             factory.action_started(
                                 action_id=action.id,
@@ -3735,7 +4232,7 @@ def _translate_claude_event_base(
                     factory.started(
                         resume,
                         title=None,
-                        meta={"complete": "✓ turn complete"},
+                        meta={"complete": TURN_COMPLETE_MARKER},
                     )
                 )
             events_out.append(
@@ -3808,6 +4305,19 @@ def _translate_claude_event_base(
                 _REQUEST_TO_INPUT[request_id] = getattr(request, "input", {})
                 state.auto_approve_queue.append(request_id)
                 return []
+
+            # #793: record every ExitPlanMode plan body against its request;
+            # the approval paths below (and write_control_response) promote
+            # it, every denial path drops it.
+            if (
+                isinstance(request, claude_schema.ControlCanUseToolRequest)
+                and getattr(request, "tool_name", "") == "ExitPlanMode"
+            ):
+                # Recorded even without an input body: the plan file may
+                # still supply one at decision time.
+                state.exitplanmode_plans[request_id] = (
+                    _exitplanmode_plan_input(getattr(request, "input", {})) or ""
+                )
 
             # Auto-approve tool requests that don't need user interaction.
             # _DIFF_PREVIEW_TOOLS is module-scoped — see top of file.
@@ -3898,6 +4408,9 @@ def _translate_claude_event_base(
                     auto_session = factory.resume.value if factory.resume else None
                     if auto_session is not None:
                         _PLAN_EXIT_APPROVED.add(auto_session)
+                    _approve_exitplanmode_plan(
+                        state, request_id, session_id=auto_session, source="plan_auto"
+                    )
                     _REQUEST_TO_INPUT[request_id] = getattr(request, "input", {})
                     state.auto_approve_queue.append(request_id)
                     return []
@@ -3917,6 +4430,12 @@ def _translate_claude_event_base(
                             "control_request.discuss_approved",
                             request_id=request_id,
                             session_id=session_id,
+                        )
+                        _approve_exitplanmode_plan(
+                            state,
+                            request_id,
+                            session_id=session_id,
+                            source="discuss_approved",
                         )
                         _REQUEST_TO_INPUT[request_id] = getattr(request, "input", {})
                         state.auto_approve_queue.append(request_id)
@@ -4003,6 +4522,12 @@ def _translate_claude_event_base(
                                 "control_request.outline_guard_deny",
                                 request_id=request_id,
                                 session_id=session_id,
+                            )
+                            _drop_exitplanmode_plan(
+                                state,
+                                request_id,
+                                rejected=False,
+                                reason="outline_guard",
                             )
                             _REQUEST_TO_INPUT.pop(request_id, None)
                             _REQUEST_TO_TOOL_NAME.pop(request_id, None)
@@ -4193,6 +4718,7 @@ def _translate_claude_event_base(
             ]
             for rid in expired:
                 del state.pending_control_requests[rid]
+                _drop_exitplanmode_plan(state, rid, rejected=False, reason="timeout")
                 _REQUEST_TO_INPUT.pop(rid, None)
                 _REQUEST_TO_TOOL_NAME.pop(rid, None)
                 state.request_to_action.pop(rid, None)
@@ -4436,13 +4962,39 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         ) or self.permission_mode
 
     async def write_control_response(
-        self, request_id: str, approved: bool, *, deny_message: str | None = None
+        self,
+        request_id: str,
+        approved: bool,
+        *,
+        deny_message: str | None = None,
+        rejects_plan: bool = True,
     ) -> bool:
         """Write a control response to the Claude Code process via PIPE or PTY.
 
         Uses _SESSION_STDIN to find the correct stdin for the session,
         supporting concurrent sessions on the same runner instance.
+
+        ``rejects_plan`` (#793): whether a denial of an ExitPlanMode request
+        is the user rejecting the plan (❌ Deny) rather than a procedural
+        denial (Pause & Outline, Let's discuss).
         """
+        # #793: settle the request's recorded plan body on the run's own
+        # state (per-session, never the shared runner attributes).
+        plan_session = _REQUEST_TO_SESSION.get(request_id)
+        plan_state = _SESSION_BG_STATE.get(plan_session) if plan_session else None
+        if plan_state is not None:
+            if approved:
+                _approve_exitplanmode_plan(
+                    plan_state, request_id, session_id=plan_session, source="telegram"
+                )
+            else:
+                _drop_exitplanmode_plan(
+                    plan_state,
+                    request_id,
+                    rejected=rejects_plan,
+                    reason="telegram_deny" if rejects_plan else "telegram_procedural",
+                    session_id=plan_session,
+                )
         if approved:
             inner: dict[str, Any] = {"behavior": "allow"}
             # Claude Code CLI requires updatedInput for can_use_tool responses
@@ -5418,7 +5970,9 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         # started. Without entry/exit/tick logs we can't discriminate
         # them. These logs are intentionally verbose for rc17 — at 30 s
         # poll x hours of session = O(120) lines, trivial; rate-limiting
-        # now would create ambiguity in the next reproduction.
+        # now would create ambiguity in the next reproduction. #799: that
+        # held per session but not per fleet — unarmed ticks are now DEBUG,
+        # with one INFO ``armed`` edge; armed ticks stay INFO.
         #
         # Exception strategy mirrors ``_subprocess_watchdog``
         # (src/untether/runner.py:1010-1079) and
@@ -5438,6 +5992,9 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             poll_interval_s=poll_interval,
         )
         exit_reason = "loop_exited"
+        # #799: edge-triggered INFO for the idle timer arming, so the
+        # per-tick log can drop to DEBUG while nothing is armed.
+        was_armed = False
         try:
             # #333 Tier 1 entry check: if ``reader_done`` is already set
             # before the first poll (e.g. the JSONL reader finished
@@ -5498,6 +6055,20 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                         exit_reason = "reader_done"
                         return
                     armed_at = state.result_received_at
+                    # A live session's post-result idle belongs to
+                    # `_live_session_lifecycle` (#776), so it never arms here.
+                    armed_now = armed_at is not None and not state.live_mode
+                    if armed_now and not was_armed:
+                        run_logger.info(
+                            "claude.post_result_idle.armed",
+                            session_id=(
+                                state.factory.resume.value
+                                if state.factory.resume is not None
+                                else None
+                            ),
+                            timeout_s=timeout_s,
+                        )
+                    was_armed = armed_now
                     if armed_at is None:
                         # Pre-result: tick log still useful so we can
                         # confirm the watchdog is alive even before the
@@ -5535,7 +6106,17 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                             if pre_sid
                             else []
                         )
-                        run_logger.info(
+                        # #799: an unarmed tick is a no-op heartbeat — every
+                        # session, every 30 s, for the whole turn (a quarter
+                        # of nsd's journal on rc12). DEBUG, unless it carries
+                        # the #696 "waiting on the user" signal, which stays
+                        # greppable at INFO.
+                        tick_log = (
+                            run_logger.info
+                            if pre_pending_requests or pre_pending_asks
+                            else run_logger.debug
+                        )
+                        tick_log(
                             "claude.post_result_idle.tick",
                             session_id=pre_sid,
                             armed=False,
@@ -6807,7 +7388,11 @@ BACKEND = EngineBackend(
 
 # Phase 2: Public API for sending control responses
 async def send_claude_control_response(
-    request_id: str, approved: bool, *, deny_message: str | None = None
+    request_id: str,
+    approved: bool,
+    *,
+    deny_message: str | None = None,
+    rejects_plan: bool = True,
 ) -> bool:
     """Send a control response to an active Claude Code session.
 
@@ -6815,6 +7400,8 @@ async def send_claude_control_response(
         request_id: The control request ID
         approved: Whether to approve (True) or deny (False) the request
         deny_message: Custom denial message (used when approved=False)
+        rejects_plan: For an ExitPlanMode denial, whether it rejects the plan
+            (❌ Deny) or is procedural (Pause & Outline / Let's discuss) — #793
 
     Returns:
         True if the response was sent successfully, False if the request is not found
@@ -6847,7 +7434,7 @@ async def send_claude_control_response(
 
     runner, _ = _ACTIVE_RUNNERS[session_id]
     success = await runner.write_control_response(
-        request_id, approved, deny_message=deny_message
+        request_id, approved, deny_message=deny_message, rejects_plan=rejects_plan
     )
 
     # Clean up the mapping after use

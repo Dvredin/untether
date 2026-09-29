@@ -453,3 +453,272 @@ def test_run_level_edits_stand_down_during_followup_turns() -> None:
     assert edits._is_live_session_idle() is False  # a turn's own edits
     edits.run_level = True
     assert edits._is_live_session_idle() is True  # the run's edits stand down
+
+
+# ── #798: "✓ turn complete" on live follow-up / wake turn finals ────────────
+#
+# Driven through the real handle_message → FollowupTurnRouter → _deliver_final
+# path: ScriptRunner's TurnEvents reach the router exactly like a live
+# ClaudeRunner's do.
+
+from untether.markdown import MarkdownPresenter  # noqa: E402
+from untether.model import (  # noqa: E402
+    TURN_COMPLETE_MARKER,
+    CompletedEvent,
+    ResumeToken,
+    StartedEvent,
+)
+from untether.runner_bridge import (  # noqa: E402
+    ExecBridgeConfig,
+    IncomingMessage,
+    handle_message,
+)
+from untether.runners.mock import Emit, Return, ScriptRunner  # noqa: E402
+
+_TOKEN = ResumeToken(engine="claude", value="sess-798")
+
+
+def _no_usage_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _raise() -> dict:
+        raise RuntimeError("no usage API in tests")
+
+    monkeypatch.setattr("untether.utils.usage_cache.fetch_claude_usage_cached", _raise)
+
+
+async def _run_with_turn(
+    *turn_steps: Emit, end_mid_turn: bool = False
+) -> tuple[FakeTransport, MessageRef]:
+    """A run whose first result carried the #333 marker (as the Claude runner
+    sends it), then one live turn. ``end_mid_turn``: the run's result comes
+    first (the real live order) and the stream ends with the turn still open.
+    Returns the transport and the run's own progress ref."""
+    first = CompletedEvent(engine="claude", resume=_TOKEN, ok=True, answer="FIRST")
+    transport = FakeTransport()
+    runner = ScriptRunner(
+        [
+            Emit(StartedEvent(engine="claude", resume=_TOKEN, meta={"model": "opus"})),
+            Emit(
+                StartedEvent(
+                    engine="claude",
+                    resume=_TOKEN,
+                    meta={"complete": TURN_COMPLETE_MARKER},
+                )
+            ),
+            *([Emit(first)] if end_mid_turn else []),
+            *turn_steps,
+            # (end_mid_turn: ScriptRunner's closing CompletedEvent lands in
+            # the still-open turn, as any late event would.)
+            *([] if end_mid_turn else [Return(answer="FIRST")]),
+        ],
+        engine="claude",
+        resume_value=_TOKEN.value,
+    )
+    cfg = ExecBridgeConfig(
+        transport=transport, presenter=MarkdownPresenter(), final_notify=True
+    )
+    await handle_message(
+        cfg,
+        runner=runner,
+        incoming=IncomingMessage(channel_id=1, message_id=10, text="go"),
+        resume_token=None,
+    )
+    return transport, transport.send_calls[0]["ref"]
+
+
+def _turn_texts(
+    transport: FakeTransport, run_progress: MessageRef, answer: str
+) -> tuple[str, list[str]]:
+    """(the turn's final text, every text its progress message showed before
+    it). A pushed final is a new message; a silent one (Monitor tick) edits
+    the progress message in place."""
+    calls = [*transport.send_calls, *transport.edit_calls]
+    finals = [c["message"].text for c in calls if answer in c["message"].text]
+    assert len(finals) == 1
+    progress_refs = {
+        c["ref"]
+        for c in transport.send_calls
+        if c["ref"] != run_progress
+        and answer not in c["message"].text
+        and "FIRST" not in c["message"].text
+    }
+    assert progress_refs, "the turn never showed a progress message"
+    progress = [
+        c["message"].text
+        for c in calls
+        if c["ref"] in progress_refs and answer not in c["message"].text
+    ]
+    return finals[0], progress
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["followup", "task_finished", "scheduled_wakeup", "monitor_event", "unknown"],
+)
+async def test_turn_final_carries_turn_complete_marker(
+    reason: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#798: every successful live turn final shows the #333 marker, whatever
+    started the turn; the turn's in-flight progress never does (the run's
+    marker is stripped from the turn tracker and the final adds its own to
+    the snapshot only)."""
+    _no_usage_fetch(monkeypatch)
+    transport, run_progress = await _run_with_turn(
+        Emit(_turn("started", reason=reason)),
+        Emit(_action()),
+        Emit(_turn("completed", reason=reason, ok=True, answer="TURN-2-ANSWER")),
+    )
+    final, progress = _turn_texts(transport, run_progress, "TURN-2-ANSWER")
+    assert final.count(TURN_COMPLETE_MARKER) == 1
+    assert "opus" in final  # the run's meta is kept alongside the marker
+    assert all(TURN_COMPLETE_MARKER not in t for t in progress)
+
+
+async def test_failed_turn_final_has_no_turn_complete_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_usage_fetch(monkeypatch)
+    transport, run_progress = await _run_with_turn(
+        Emit(_turn("started", reason="followup")),
+        Emit(_action()),
+        Emit(
+            _turn(
+                "completed",
+                reason="followup",
+                ok=False,
+                answer="TURN-2-ANSWER",
+                error="API Error: overloaded",
+            )
+        ),
+    )
+    final, progress = _turn_texts(transport, run_progress, "TURN-2-ANSWER")
+    assert TURN_COMPLETE_MARKER not in final
+    assert all(TURN_COMPLETE_MARKER not in t for t in progress)
+
+
+async def test_interrupted_turn_final_has_no_turn_complete_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn the session ended under (router.aclose) is not "complete"."""
+    _no_usage_fetch(monkeypatch)
+    transport, run_progress = await _run_with_turn(
+        Emit(_turn("started", reason="task_finished", detail={"tasks": ["b1"]})),
+        Emit(_action()),
+        end_mid_turn=True,
+    )
+    final, progress = _turn_texts(
+        transport, run_progress, "the session ended before this turn finished"
+    )
+    assert TURN_COMPLETE_MARKER not in final
+    assert all(TURN_COMPLETE_MARKER not in t for t in progress)
+
+
+# ── #795 wake-turn reply anchor ──────────────────────────────────────────────
+
+FOLLOWUP_REF = MessageRef(channel_id=1, message_id=20)
+
+
+async def _followup_turn(router, turn: int = 2) -> None:
+    await router.on_turn(
+        _turn("started", turn=turn, reason="followup", command_uuid="u1")
+    )
+    await router.on_turn(
+        _turn(
+            "completed",
+            turn=turn,
+            reason="followup",
+            ok=True,
+            answer="ok",
+            command_uuid="u1",
+        )
+    )
+
+
+async def test_795_wake_turn_replies_to_the_turn_that_launched_its_task() -> None:
+    rec = _Recorder()
+    router = _router(rec, anchors={"u1": (FOLLOWUP_REF, None)})
+    await _followup_turn(router)
+    detail = {"tasks": ["bg b2"], "task_ids": ["b2"], "origin_turn": 2}
+    await router.on_turn(_turn("started", turn=3, detail=detail))
+    await router.on_turn(
+        _turn("completed", turn=3, ok=True, answer="done", detail=detail)
+    )
+    assert rec.delivered[-1][5] == 20
+    assert router.anchor_for_turn(3) == FOLLOWUP_REF
+    assert router.last_reply_to == FOLLOWUP_REF
+
+
+async def test_795_task_from_the_run_itself_replies_to_the_run_prompt() -> None:
+    rec = _Recorder()
+    router = _router(rec, anchors={"u1": (FOLLOWUP_REF, None)})
+    await _followup_turn(router)
+    detail = {"tasks": ["bg b1"], "task_ids": ["b1"], "origin_turn": 1}
+    await router.on_turn(_turn("started", turn=3, detail=detail))
+    await router.on_turn(
+        _turn("completed", turn=3, ok=True, answer="done", detail=detail)
+    )
+    assert rec.delivered[-1][5] == 10
+
+
+async def test_795_retro_attributed_turn_moves_its_reply_to_the_origin() -> None:
+    """An ``unknown`` wake turn only learns its task at completion; its final
+    (not yet sent) then replies to the launching follow-up."""
+    rec = _Recorder()
+    router = _router(rec, anchors={"u1": (FOLLOWUP_REF, None)})
+    await _followup_turn(router)
+    await router.on_turn(_turn("started", turn=3, reason="unknown"))
+    assert router.current is not None and router.current.reply_to == USER_REF
+    await router.on_turn(
+        _turn(
+            "completed",
+            turn=3,
+            reason="task_finished",
+            ok=True,
+            answer="report",
+            detail={
+                "tasks": ["bg b2"],
+                "task_ids": ["b2"],
+                "origin_turn": 2,
+                "retro_attributed": True,
+            },
+        )
+    )
+    assert rec.delivered[-1][5] == 20
+
+
+@pytest.mark.parametrize("detail", [{}, {"origin_turn": 9}, {"origin_turn": True}])
+async def test_795_unknown_origin_falls_back_to_the_default(detail: dict) -> None:
+    rec = _Recorder()
+    router = _router(rec)
+    await router.on_turn(_turn("started", turn=2, detail=detail))
+    await router.on_turn(_turn("completed", turn=2, ok=True, answer="x", detail=detail))
+    assert rec.delivered[-1][5] == 10
+
+
+async def test_785_thinking_note_alone_opens_no_progress_when_filtered() -> None:
+    """#785 part 2: with consolidation on, a wake turn's thinking note must
+    not open a progress message (it may fold into the status message); a
+    tool call still does."""
+    rec = _Recorder()
+    router = rb.FollowupTurnRouter(
+        new_tracker=lambda: ProgressTracker(engine="claude"),
+        create_progress=rec.create,
+        close_progress=rec.close,
+        deliver=rec.deliver,
+        default_reply_to=USER_REF,
+        followup_notify=False,
+        anchor_for=None,
+        progress_for=lambda evt: evt.action.kind != "note",
+    )
+    await router.on_turn(_turn("started", detail={"tasks": ["build"]}))
+    note = ActionEvent(
+        engine="claude",
+        action=Action(id="claude.thinking.1", kind="note", title="hmm"),
+        phase="completed",
+        ok=True,
+    )
+    await router.on_event(note)
+    assert rec.created == []
+    assert router.current is not None
+    assert router.current.tracker.action_count == 1  # still tracked
+    await router.on_event(_action())
+    assert rec.created == [2]

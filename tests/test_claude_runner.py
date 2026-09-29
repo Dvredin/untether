@@ -2255,11 +2255,14 @@ def test_translate_server_tool_use_block() -> None:
     assert state.last_tool_use_id == "stu_01"
 
 
-def test_translate_exitplanmode_captures_plan_body() -> None:
-    """#508 — translating a tool_use(name='ExitPlanMode', input.plan='...')
-    captures the plan body onto state.last_exitplanmode_plan so the bridge
-    can re-emit it in the final answer if the post-approval result is
-    brief.  Regression for the live research-task short-final-message bug.
+def test_translate_exitplanmode_records_plan_body_pending_approval() -> None:
+    """#508 / #793 — the ExitPlanMode plan body is recorded against its
+    control request so the final answer can re-emit it if the post-approval
+    result is brief (the live research-task short-final-message bug). Until
+    that request is approved it is NOT the approved plan: the tool_use alone
+    never sets state.last_exitplanmode_plan (#793 showed denied plans as
+    "📋 Plan (approved)"). Full decision matrix in
+    tests/test_exitplanmode_plan_approval.py.
     """
     state = ClaudeStreamState()
     state.factory._resume = ResumeToken(engine="claude", value="sess-508")
@@ -2290,28 +2293,44 @@ def test_translate_exitplanmode_captures_plan_body() -> None:
         state=state,
         factory=state.factory,
     )
+    assert state.last_exitplanmode_plan is None  # not approved yet
 
-    assert state.last_exitplanmode_plan == plan_body
+    control = {
+        "type": "control_request",
+        "request_id": "req_epm_1",
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": "ExitPlanMode",
+            "input": {"plan": plan_body},
+        },
+    }
+    translate_claude_event(
+        _decode_event(control),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+
+    assert state.exitplanmode_plans == {"req_epm_1": plan_body}
+    assert state.last_exitplanmode_plan is None
 
 
 def test_translate_exitplanmode_ignores_empty_plan_body() -> None:
-    """#508 — empty/whitespace-only plan bodies are NOT captured. Avoids
-    overwriting a real prior value with an inadvertent retry/empty call."""
+    """#508 — an empty/whitespace-only plan input can't replace a real
+    approved value. (#793: the request is still recorded, with an empty
+    input, because a plan file may supply the body at decision time.)"""
+    from untether.runners.claude import _approve_exitplanmode_plan
+
     state = ClaudeStreamState()
     state.factory._resume = ResumeToken(engine="claude", value="sess-508")
     state.last_exitplanmode_plan = "earlier plan body"
     event = {
-        "type": "assistant",
-        "message": {
-            "id": "msg_2",
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": "tu_epm_2",
-                    "name": "ExitPlanMode",
-                    "input": {"plan": "   "},
-                }
-            ],
+        "type": "control_request",
+        "request_id": "req_epm_2",
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": "ExitPlanMode",
+            "input": {"plan": "   "},
         },
     }
 
@@ -2322,6 +2341,8 @@ def test_translate_exitplanmode_ignores_empty_plan_body() -> None:
         factory=state.factory,
     )
 
+    assert state.exitplanmode_plans == {"req_epm_2": ""}
+    _approve_exitplanmode_plan(state, "req_epm_2", session_id=None, source="test")
     assert state.last_exitplanmode_plan == "earlier plan body"
 
 
@@ -4377,6 +4398,134 @@ async def test_post_result_idle_watchdog_exits_reader_done_on_reader_done(
     assert exit_log["reason"] == "reader_done"
 
 
+# ── #799: unarmed post_result_idle ticks are DEBUG, not INFO ────────────────
+
+
+async def _run_idle_watchdog_ticks(
+    monkeypatch, state: ClaudeStreamState, *, timeout_s: float = 600.0
+) -> list[dict]:
+    """Drive ``_post_result_idle_watchdog`` for many fast ticks through a
+    real structlog logger and return the captured log entries."""
+    from untether.runners.claude import ClaudeRunner
+
+    real_sleep = anyio.sleep
+
+    async def fast_sleep(s: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr("untether.runners.claude.anyio.sleep", fast_sleep)
+
+    class FakeStdin:
+        async def aclose(self) -> None:
+            pass
+
+    reader_done = anyio.Event()
+    runner = ClaudeRunner(claude_cmd="claude")
+    with structlog.testing.capture_logs() as logs:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                runner._post_result_idle_watchdog,
+                state,
+                FakeStdin(),
+                reader_done,
+                structlog.get_logger("untether.test"),
+                timeout_s,
+            )
+            await real_sleep(0.05)
+            reader_done.set()
+    return logs
+
+
+def _ticks(logs: list[dict]) -> list[dict]:
+    return [lg for lg in logs if lg["event"] == "claude.post_result_idle.tick"]
+
+
+@pytest.mark.anyio
+async def test_post_result_idle_unarmed_tick_logs_at_debug(monkeypatch) -> None:
+    claude_runner._REQUEST_TO_SESSION.clear()
+    claude_runner._PENDING_ASK_REQUESTS.clear()
+    state = ClaudeStreamState()
+    state.factory.started(ResumeToken(engine="claude", value="unarmed-799"))
+
+    logs = await _run_idle_watchdog_ticks(monkeypatch, state)
+
+    ticks = _ticks(logs)
+    assert len(ticks) >= 2, "watchdog should have ticked several times"
+    assert all(t["armed"] is False for t in ticks)
+    assert all(t["log_level"] == "debug" for t in ticks), [
+        t["log_level"] for t in ticks
+    ]
+    assert not any(lg["event"] == "claude.post_result_idle.armed" for lg in logs)
+    # Lifecycle bookends stay INFO.
+    levels = {lg["event"]: lg["log_level"] for lg in logs}
+    assert levels["claude.post_result_idle.task_started"] == "info"
+    assert levels["claude.post_result_idle.task_exited"] == "info"
+
+
+@pytest.mark.anyio
+async def test_post_result_idle_unarmed_tick_waiting_on_user_stays_info(
+    monkeypatch,
+) -> None:
+    # #696's greppable "this run is waiting on the user" marker survives.
+    claude_runner._REQUEST_TO_SESSION.clear()
+    claude_runner._PENDING_ASK_REQUESTS.clear()
+    claude_runner._REQUEST_TO_SESSION["req_799"] = "waiting-799"
+    claude_runner._PENDING_ASK_REQUESTS["req_799"] = (123, "Which one?")
+    try:
+        state = ClaudeStreamState()
+        state.factory.started(ResumeToken(engine="claude", value="waiting-799"))
+        logs = await _run_idle_watchdog_ticks(monkeypatch, state)
+    finally:
+        claude_runner._REQUEST_TO_SESSION.clear()
+        claude_runner._PENDING_ASK_REQUESTS.clear()
+
+    ticks = _ticks(logs)
+    assert ticks
+    assert all(t["log_level"] == "info" for t in ticks)
+    assert all(t["pending_asks"] == 1 for t in ticks)
+
+
+@pytest.mark.anyio
+async def test_post_result_idle_armed_ticks_info_with_single_armed_edge(
+    monkeypatch,
+) -> None:
+    claude_runner._REQUEST_TO_SESSION.clear()
+    claude_runner._PENDING_ASK_REQUESTS.clear()
+    state = ClaudeStreamState()
+    state.factory.started(ResumeToken(engine="claude", value="armed-799"))
+    state.result_received_at = time.monotonic()  # armed, far from timeout
+
+    logs = await _run_idle_watchdog_ticks(monkeypatch, state)
+
+    armed_edges = [lg for lg in logs if lg["event"] == "claude.post_result_idle.armed"]
+    assert len(armed_edges) == 1
+    assert armed_edges[0]["log_level"] == "info"
+    assert armed_edges[0]["session_id"] == "armed-799"
+    ticks = _ticks(logs)
+    assert len(ticks) >= 2
+    assert all(t["armed"] is True and t["log_level"] == "info" for t in ticks)
+    # The edge precedes the first armed tick.
+    assert logs.index(armed_edges[0]) < logs.index(ticks[0])
+
+
+@pytest.mark.anyio
+async def test_post_result_idle_live_mode_never_arms_or_ticks_info(
+    monkeypatch,
+) -> None:
+    # #776: a live session's post-result idle is owned by the lifecycle.
+    claude_runner._REQUEST_TO_SESSION.clear()
+    claude_runner._PENDING_ASK_REQUESTS.clear()
+    state = ClaudeStreamState()
+    state.factory.started(ResumeToken(engine="claude", value="live-799"))
+    state.live_mode = True
+    state.result_received_at = time.monotonic()
+
+    logs = await _run_idle_watchdog_ticks(monkeypatch, state)
+
+    assert not any(lg["event"] == "claude.post_result_idle.armed" for lg in logs)
+    assert not any(t["log_level"] == "info" for t in _ticks(logs))
+
+
 def test_meta_line_renders_turn_complete_marker() -> None:
     """format_meta_line includes the `complete` hint when set on meta."""
     from untether.markdown import format_meta_line
@@ -6187,8 +6336,14 @@ async def test_592_pre_result_silence_cap_kills_silent_run(monkeypatch) -> None:
             0.0,  # limbo grace off
             0.15,  # pre_result_silence_timeout_s — the cap under test
         )
+        # Wait for the watchdog's own exit log, not just the SIGTERM: it
+        # logs task_exited only after its grace poll, so cancelling on the
+        # signal alone raced it under load.
         with anyio.move_on_after(3.0):
-            while signal.SIGTERM not in killed_signals:
+            while not any(
+                e == "claude.post_result_idle.task_exited"
+                for _lvl, e, _kw in logger.records
+            ):
                 await anyio.sleep(0.02)
         tg.cancel_scope.cancel()
 

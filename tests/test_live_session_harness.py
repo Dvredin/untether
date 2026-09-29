@@ -25,13 +25,18 @@ from untether.runner_bridge import (
 from untether.runners import claude as claude_mod
 from untether.runners.claude import ClaudeRunner
 from untether.session_quarantine import QuarantineStore, set_quarantine_store
-from untether.settings import WatchdogSettings
+from untether.settings import ProgressSettings, WatchdogSettings
 from untether.transport import MessageRef
 
 pytestmark = pytest.mark.anyio
 
 FAKE_CLI = Path(__file__).parent / "fake_clis" / "fake_claude_live.py"
-_ENV = ("FAKE_CLAUDE_SCENARIO", "FAKE_CLAUDE_WAKE_S", "FAKE_CLAUDE_TASK_END")
+_ENV = (
+    "FAKE_CLAUDE_SCENARIO",
+    "FAKE_CLAUDE_WAKE_S",
+    "FAKE_CLAUDE_TASK_END",
+    "FAKE_CLAUDE_ACK_TOOL",
+)
 
 
 class _OrderedTransport(FakeTransport):
@@ -65,8 +70,19 @@ class _LiveRunner(ClaudeRunner):
         return base
 
 
+def _progress(monkeypatch: pytest.MonkeyPatch, **values: Any) -> None:
+    import untether.runner_bridge as bridge_mod
+
+    settings = ProgressSettings(**values)
+    monkeypatch.setattr(bridge_mod, "_load_progress_settings", lambda: settings)
+
+
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    # The rc11/rc12 assertions below predate the #777 status message and the
+    # #785 wake-ack consolidation: pin both off (= rc12 delivery) unless a
+    # test opts in via ``_progress``.
+    _progress(monkeypatch, show_background_tasks=False, consolidate_wake_turns=False)
     set_quarantine_store(QuarantineStore(tmp_path / "q.json"))
     yield
     set_quarantine_store(None)
@@ -202,6 +218,31 @@ async def test_wake_turn_pair_one_push_and_real_header(
     assert not any("Inspect nested agents" in c["message"].text for c in sends)
 
 
+async def test_wake_turn_final_shows_turn_complete_not_its_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#798 end to end: turn 1's final and the wake turn's final both carry
+    the #333 "✓ turn complete" marker; the wake turn's in-flight progress
+    message never does."""
+    from untether.model import TURN_COMPLETE_MARKER
+
+    _watchdog(monkeypatch)
+    transport = await _drive("bg_agent_wake")
+    turn1_final = [
+        c for c in transport.edit_calls if "agent started" in c["message"].text
+    ]
+    assert turn1_final and TURN_COMPLETE_MARKER in turn1_final[-1]["message"].text
+    wake_progress_ref = transport.send_calls[1]["ref"]
+    wake_progress = [transport.send_calls[1]["message"].text] + [
+        c["message"].text for c in transport.edit_calls if c["ref"] == wake_progress_ref
+    ]
+    assert all(TURN_COMPLETE_MARKER not in t for t in wake_progress)
+    wake_final = next(
+        c for c in transport.send_calls if "REPORT: all good" in c["message"].text
+    )
+    assert TURN_COMPLETE_MARKER in wake_final["message"].text
+
+
 async def test_max_hold_sends_closing_notice(monkeypatch: pytest.MonkeyPatch) -> None:
     _watchdog(monkeypatch, post_result_bg_max_hold=0.5)
     transport = await _drive("bg_bash_wake", wake_s=30)
@@ -285,3 +326,35 @@ async def test_510_concurrent_chats_each_bind_their_own_stream(
         assert edits.stream.found_session.value == outcome.resume.value
         sessions.add(outcome.resume.value)
     assert sessions == {"sess-510-a", "sess-510-b"}
+
+
+async def test_777_status_message_opens_after_answer_and_finalises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#777 end to end: after the run's answer, live background work gets ONE
+    silent status message (replying to the prompt that launched it), edited
+    in place and finalised once the task has finished."""
+    _watchdog(monkeypatch)
+    _progress(monkeypatch, show_background_tasks=True)
+    transport = await _drive("bg_agent_wake")
+    sends = transport.send_calls
+    answer = next(i for i, c in enumerate(transport.log) if "agent started" in c[1])
+    status_idx = next(
+        i
+        for i, (kind, text, _) in enumerate(transport.log)
+        if kind == "send" and text.startswith("⏳ background (1)")
+    )
+    assert answer < status_idx
+    status = next(c for c in sends if c["message"].text.startswith("⏳ background"))
+    assert status["options"].notify is False
+    assert status["options"].reply_to.message_id == 10
+    assert "🤖 bg a1" in status["message"].text
+    # Exactly one status message; its last edit is the finalised form.
+    assert sum(c["message"].text.startswith("⏳ background") for c in sends) == 1
+    final = [
+        c["message"].text for c in transport.edit_calls if c["ref"] == status["ref"]
+    ][-1]
+    assert final.splitlines()[0] == "✅ background task done"
+    assert "✅ bg a1 ·" in final
+    # The wake turn's report still arrives as its own message.
+    assert any("REPORT: all good" in c["message"].text for c in sends)

@@ -140,6 +140,18 @@ Behavior:
 - Forwarded messages arriving during the window are appended to the prompt
   (separated by blank lines) and do not start their own runs.
 - Forwarded messages by themselves do not start runs.
+- Another plain prompt from the same sender inside the window is **merged**:
+  the texts are joined in order with a blank line and run once, anchored on the
+  latest message (logged at INFO as `forward.prompt.merged` with
+  `merged_count`). Earlier releases replaced the pending prompt and silently
+  dropped its text ([#794](https://github.com/littlebearapps/untether/issues/794)).
+- A prompt that can't share a run with the pending one — it replies to a
+  different message, it's a voice transcript while the other isn't, it starts
+  with a directive (`/codex …`, `/project …`, `@branch …`), or the chat's
+  context changed in between — sends the pending prompt straight away as its own
+  run (`forward.prompt.flushed` with a `reason`). Nothing is dropped.
+- Slash commands are never merged into a prompt; they run as soon as they
+  arrive. Replies to a message whose run is still going bypass the window.
 
 Configuration (under `[transports.telegram]`):
 
@@ -237,8 +249,14 @@ trimming instead:
     message_overflow = "trim" # trim | split
     ```
 
-Split mode sends multiple messages. Each chunk includes the footer; follow-up
-chunks add a "continued (N/M)" header.
+Split mode sends multiple messages (~3500 body characters each). Follow-up
+chunks add a "continued (N/M)" header, and only the last chunk carries the
+footer: the meta line, the cost line (`💰`), a budget or run-outlier alert,
+the subscription usage line (`⚡`) and the resume line, in that order
+([#770](https://github.com/littlebearapps/untether/issues/770)). The ~600
+characters of headroom under the limit leave room for every footer line; in
+the rare case one still wouldn't fit, it's sent as a short extra message
+rather than risk Telegram rejecting the whole reply.
 
 ## Forum topics (workspace mode)
 

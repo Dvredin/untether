@@ -256,6 +256,11 @@ async def test_wake_turn_opened_before_task_end_is_retro_attributed() -> None:
     assert _labels(turns[1]) == ["bg a1"]
     assert turns[1].answer == "The sweep is back"
     assert not turns[1].detail.get("already_announced")
+    # #795/#785: the attributed task and the turn that launched it (the run).
+    assert turns[1].detail["task_ids"] == ["a1"]
+    assert turns[1].detail["origin_turn"] == 1
+    assert turns[2].detail["task_ids"] == ["a1"]
+    assert turns[2].detail["origin_turn"] == 1
     assert _labels(turns[2]) == ["bg a1"]
     assert turns[2].detail.get("already_announced") is True
     assert turns[3].detail.get("already_announced") is True
@@ -276,6 +281,29 @@ async def test_task_end_just_after_unknown_turn_marks_next_turn_announced() -> N
     ]
     assert _labels(turns[2]) == ["bg a1"]
     assert turns[2].detail.get("already_announced") is True
+
+
+async def test_resumed_agent_second_finish_is_announced() -> None:
+    """#801: the wake turn sends a finished agent back to work under the same
+    task_id; its second finish opens a normal ``task_finished`` wake turn —
+    not one suppressed as the already-announced first finish (#785)."""
+    with capture_logs() as logs:
+        events = await _collect("agent_resumed", until=3)
+    turns = _turns(events)
+    assert [(t.phase, t.reason) for t in turns] == [
+        ("started", "task_finished"),
+        ("completed", "task_finished"),
+        ("started", "task_finished"),
+        ("completed", "task_finished"),
+    ]
+    assert turns[1].answer == "I've sent it back to re-check, it's running now"
+    assert _labels(turns[2]) == ["bg a1"]
+    assert not turns[2].detail.get("already_announced")
+    assert turns[3].answer == "RECHECK DONE"
+    revived = [e for e in logs if e["event"] == "claude.task.revived"]
+    assert len(revived) == 1
+    assert revived[0]["task_id"] == "a1"
+    assert revived[0]["prior_status"] == "completed"
 
 
 async def test_subagent_owned_notification_never_labels_a_turn() -> None:

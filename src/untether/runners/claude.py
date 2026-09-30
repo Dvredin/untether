@@ -26,7 +26,7 @@ from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import anyio
 import msgspec
@@ -35,6 +35,7 @@ from ..backends import EngineBackend, EngineConfig
 from ..config import ConfigError
 from ..events import EventFactory
 from ..logging import get_logger
+from ..markdown import _short_model_name
 from ..model import (
     TURN_COMPLETE_MARKER,
     Action,
@@ -60,6 +61,7 @@ from ..session_quarantine import get_quarantine_store
 from ..settings import load_settings_if_exists
 from ..utils.env_audit import audit_proc_env
 from ..utils.paths import get_run_base_dir
+from ..utils.proc_diag import CliScan, hook_clock
 from ..utils.streams import drain_stderr
 from ..utils.subprocess import (
     manage_subprocess,
@@ -145,6 +147,81 @@ def _load_env_extras() -> tuple[tuple[str, ...], tuple[str, ...]]:
         )
     except Exception:  # noqa: BLE001 — never let config errors block a run
         return ((), ())
+
+
+# #812: ``--include-hook-events`` (listed in ``claude --help`` on 2.1.284,
+# findings §A2). Not in ``_RESERVED_FLAGS`` (D-2): a config that already
+# passes it must keep working, so ``_build_args`` dedupes instead.
+_HOOK_EVENTS_FLAG = "--include-hook-events"
+_CLI_HELP_TIMEOUT_S = 15.0
+# (resolved cmd path, mtime) -> does ``--help`` list the flag. Unknown (probe
+# failed) is cached as False until the binary changes.
+_HOOK_EVENTS_SUPPORT: dict[tuple[str, float], bool] = {}
+
+
+def _probe_cli_help(path: str) -> str | None:
+    """Run ``<claude> --help`` (zero-token, no session). None on failure.
+    Tests stub this (see ``tests/conftest.py``)."""
+    try:
+        proc = subprocess_module.run(  # nosec B603 — fixed argv, no shell
+            [path, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=_CLI_HELP_TIMEOUT_S,
+            stdin=subprocess_module.DEVNULL,
+            check=False,
+        )
+    except (OSError, subprocess_module.SubprocessError):
+        return None
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
+def cli_supports_hook_events(cmd: str) -> bool:
+    """#812: does the installed Claude CLI accept ``--include-hook-events``?
+
+    One ``--help`` probe per (binary path, mtime) — a CLI upgrade re-probes.
+    Unknown (unresolvable command, probe failure) → False: the flag is never
+    passed to a CLI that might reject it.
+    """
+    path = shutil.which(cmd) or (cmd if os.path.isabs(cmd) else None)
+    if path is None:
+        return False
+    try:
+        real = os.path.realpath(path)
+        key = (real, os.stat(real).st_mtime)
+    except OSError:
+        return False
+    cached = _HOOK_EVENTS_SUPPORT.get(key)
+    if cached is not None:
+        return cached
+    text = _probe_cli_help(real)
+    supported = text is not None and _HOOK_EVENTS_FLAG in text
+    _HOOK_EVENTS_SUPPORT[key] = supported
+    logger.info(
+        "claude.hook_events.probe",
+        cli_path=real,
+        supported=supported,
+        probe_ok=text is not None,
+    )
+    return supported
+
+
+def _load_hook_hold_settings() -> tuple[bool, float]:
+    """#812: ``[watchdog] hold_for_async_hooks`` / ``async_hook_max_hold``.
+
+    Best-effort: a config error falls back to the defaults (hold on, 630 s).
+    """
+    try:
+        result = load_settings_if_exists()
+        if result is not None:
+            settings, _ = result
+            return (
+                bool(getattr(settings.watchdog, "hold_for_async_hooks", True)),
+                float(getattr(settings.watchdog, "async_hook_max_hold", 630.0)),
+            )
+    except Exception:  # noqa: BLE001 — config errors must never block a run
+        logger.debug("claude.hook_hold.settings_load_failed", exc_info=True)
+    return (True, 630.0)
 
 
 def _load_quarantine_on_forced_teardown() -> bool:
@@ -337,6 +414,18 @@ class LiveSession:
     # transcript is complete, so a close that overruns its grace must not
     # quarantine it.
     closed_idle_clean: bool = False
+    # #812: background hooks still unpaired when stdin was closed (the
+    # stream's view — *candidates*: frames carry no pid, so which of them is
+    # still running can't be told); empty when no hook was running. The
+    # close grace stretches to cover the CLI's own 30 s asyncRewake wait
+    # when this — or a live hook process — is seen.
+    close_hooks: list[PendingHook] = field(default_factory=list)
+    # How many hooks the close cut short: the live hook processes at close,
+    # capped by the candidates (the candidate count when the process table
+    # couldn't be read). Never more than were running.
+    close_hook_count: int = 0
+    # Raw live hook-process count at close (None: not scanned / unreadable).
+    close_hook_procs: int | None = None
     # #775: the steer window. Set (under ``lock``) when /cancel or /new
     # interrupts an active turn — the process is about to be killed, so a
     # steer must fall back to the queue path instead of being written into a
@@ -426,6 +515,16 @@ async def close_live_session(
     live = _LIVE_SESSIONS.get(session_id)
     if live is None:
         return False
+    shells: list[int] | None = None
+    if not live.closing and _hooks_outstanding(live.state):
+        # #812: which hooks are still running is known only as a count of
+        # live hook processes. None left while idle → every unpaired hook has
+        # finished (a plain ``async`` hook's response is withheld until the
+        # next turn): release them so this close doesn't report them cut
+        # short.
+        shells = await _hook_processes(live.state, live.pid)
+        if live.idle and shells is not None and not shells:
+            release_settled_async_hooks(live.state)
     async with live.lock:
         if live.closing:
             return False
@@ -438,6 +537,13 @@ async def close_live_session(
         live.close_reason = reason
         live.state.live_close_reason = reason
         live.closed_idle_clean = _is_clean_idle(live)
+        candidates = _hooks_at_close(live)
+        # Never claim more hooks than live hook processes (and never more than
+        # the candidates); the candidate count only when unreadable.
+        count = len(candidates) if shells is None else min(len(shells), len(candidates))
+        live.close_hooks = candidates if count else []
+        live.close_hook_count = count
+        live.close_hook_procs = None if shells is None else len(shells)
     tasks = live_task_descriptions(live.state)
     logger.info(
         "claude.live_session.stdin_closed",
@@ -447,10 +553,26 @@ async def close_live_session(
         turn=live.state.turn,
         age_s=round(time.monotonic() - live.spawned_at, 1),
     )
-    if notice:
-        await _notify_live_listeners(
-            live, "closing", {"reason": reason, "tasks": tasks}
+    hooks = _hook_event_labels(live.close_hooks)
+    if hooks:
+        _log_async_hook_killed(
+            live,
+            hook_count=live.close_hook_count,
+            live_hook_processes=live.close_hook_procs,
+            hook_events=hooks,
+            hook_names=[h.name or h.label for h in live.close_hooks],
+            hook_ids=[h.hook_id for h in live.close_hooks],
+            source="stream",
         )
+    # #812: an automatic close over a background hook tells the user its
+    # feedback was lost (a user-initiated close already has its own notice).
+    hook_notice = bool(hooks) and reason not in _USER_CLOSE_REASONS
+    if notice or hook_notice:
+        payload: dict[str, Any] = {"reason": reason, "tasks": tasks}
+        if hook_notice:
+            payload["hooks"] = hooks
+            payload["hook_count"] = live.close_hook_count
+        await _notify_live_listeners(live, "closing", payload)
     lock = _stdin_lock(live.stdin)
     with contextlib.suppress(Exception):
         if lock is None:
@@ -459,6 +581,156 @@ async def close_live_session(
             async with lock:
                 await live.stdin.aclose()
     return True
+
+
+# #812: closes the user (or an operator restart) asked for — a hook they
+# cut short is expected, so it logs at INFO and gets no extra notice.
+_USER_CLOSE_REASONS = frozenset({"cancel", "new", "drain", "options_changed"})
+
+
+async def _cli_children(pid: int | None) -> CliScan | None:
+    if not isinstance(pid, int):
+        return None
+    from ..utils.proc_diag import cli_children
+
+    try:
+        return await anyio.to_thread.run_sync(cli_children, pid)
+    except Exception:  # noqa: BLE001 — a scan failure must not break a close
+        logger.debug("claude.hook.proc_scan_failed", exc_info=True)
+        return None
+
+
+def _oldest_unpaired_hook_at(state: ClaudeStreamState) -> float | None:
+    """#812: when (``hook_clock()``) the oldest hook still unpaired — pending
+    or expired — was seen starting; no hook process of theirs can predate
+    it. None when there is none or a start is unknown (no timing
+    exemption)."""
+    starts = [h.started_clock for h in _hooks_outstanding(state)]
+    if not starts or any(t is None for t in starts):
+        return None
+    return min(t for t in starts if t is not None)
+
+
+async def _hook_processes(
+    state: ClaudeStreamState, pid: int | None
+) -> list[int] | None:
+    """#812: the CLI children that may be a running command hook — any
+    direct child except Bash-tool shells, children older than the oldest
+    unpaired hook, and non-detached ones that are in the session baseline
+    (MCP servers) or look like a service (see
+    ``proc_diag.hook_evidence_children``). A shell that execs a single hook
+    command (bash/zsh — macOS) leaves no ``<shell> -c`` behind, so the
+    wrapper alone isn't enough. None when unknown (no pid, unreadable
+    table): the caller must not assume no hook is running, so the hold
+    stays bounded by ``async_hook_max_hold_s``."""
+    scan = await _cli_children(pid)
+    if scan is None:
+        return None
+    from ..utils.proc_diag import hook_evidence_children
+
+    return hook_evidence_children(
+        scan, state.cli_baseline_children, since=_oldest_unpaired_hook_at(state)
+    )
+
+
+async def capture_cli_baseline(state: ClaudeStreamState, pid: int | None) -> None:
+    """#812: record the CLI's non-detached children right after
+    ``system/init`` — its long-lived MCP servers (started before init) — so
+    they are never taken for a running hook. Hooks are spawned detached, so
+    one still running at init (a ``UserPromptSubmit`` hook starts before it)
+    is left out; entries are (pid, start time), so a reused PID isn't
+    exempt. Once per process; a failed scan leaves None (then nothing is
+    exempt: the hold errs long, bounded)."""
+    if state.cli_baseline_children is not None:
+        return
+    scan = await _cli_children(pid)
+    if scan is None:
+        return
+    from ..utils.proc_diag import baseline_ids
+
+    state.cli_baseline_children = baseline_ids(scan)
+    logger.debug(
+        "claude.hook.cli_baseline",
+        pid=pid,
+        cli_pid=scan.cli_pid,
+        children=len(scan.children),
+        baselined=len(state.cli_baseline_children),
+    )
+
+
+def _hooks_at_close(live: LiveSession) -> list[PendingHook]:
+    """#812: background hooks a close is about to cut short. Mid-turn, the
+    open turn's own (synchronous) hooks don't count — only earlier turns'."""
+    state = live.state
+    return [
+        hook
+        for hook in _hooks_outstanding(state)
+        if live.idle or hook.turn < state.turn
+    ]
+
+
+def _hook_event_labels(hooks: Iterable[PendingHook]) -> list[str]:
+    """#812: the distinct events among ``hooks``, sorted — what a message
+    can honestly say about them when it can't tell which one is running."""
+    return sorted({h.label for h in hooks})
+
+
+def _log_async_hook_killed(
+    live: LiveSession,
+    *,
+    hook_count: int,
+    hook_names: list[str],
+    hook_events: list[str],
+    source: str,
+    live_hook_processes: int | None = None,
+    hook_ids: list[str] | None = None,
+) -> None:
+    reason = live.close_reason
+    log = logger.info if reason in _USER_CLOSE_REASONS else logger.warning
+    log(
+        "claude.live_session.async_hook_killed",
+        session_id=live.session_id,
+        close_reason=reason,
+        hook_count=hook_count,
+        live_hook_processes=live_hook_processes,
+        hook_events=hook_events,
+        hook_names=hook_names,
+        hook_ids=hook_ids or [],
+        note=(
+            "hook_count were running; hook_names/hook_ids are the unpaired "
+            "candidates (frames carry no pid)"
+            if source == "stream"
+            else "hook_names are hook scripts found under the CLI"
+        ),
+        source=source,
+    )
+
+
+_HOOK_SCAN_MAX_PIDS = 64
+
+
+def _scan_hook_children(child_pids: Iterable[int]) -> list[str]:
+    """#812: labels of hook scripts running under the CLI at close — the
+    fallback signal when the stream can't say (no ``--include-hook-events``).
+    Scans raw argv via ``hook_script_label`` (``describe_process`` output
+    loses the ``/hooks/`` segment). Best-effort; never raises."""
+    from ..utils.proc_diag import find_descendants, hook_script_label
+
+    labels: list[str] = []
+    try:
+        pids: list[int] = []
+        for child in child_pids:
+            pids.append(child)
+            pids.extend(find_descendants(child))
+            if len(pids) >= _HOOK_SCAN_MAX_PIDS:
+                break
+        for pid in pids[:_HOOK_SCAN_MAX_PIDS]:
+            label = hook_script_label(pid)
+            if label is not None and label not in labels:
+                labels.append(label)
+    except Exception:  # noqa: BLE001 — diagnostics must never break teardown
+        logger.debug("claude.live_session.hook_scan_failed", exc_info=True)
+    return labels
 
 
 def _is_clean_idle(live: LiveSession) -> bool:
@@ -952,6 +1224,67 @@ class ClaudeTask:
         return self.is_backgrounded and self.status in _TASK_LIVE_STATUSES
 
 
+# #814: safeguard-stop outcomes, as logged and carried on ``usage``.
+SAFEGUARD_OUTCOME_RETRIED = "retried"
+SAFEGUARD_OUTCOME_SWITCHED = "switched"
+SAFEGUARD_OUTCOME_NOT_RETRIED = "not_retried"
+
+
+@dataclass(slots=True)
+class SafeguardTurn:
+    """#814: safeguard stops seen in one turn (reset when a turn opens).
+
+    A stop can surface twice — as the refused assistant frame
+    (``stop_reason == "refusal"``) and as the CLI's reaction to it (the
+    ``informational`` "continuing once" notice or a ``model_refusal_*``
+    frame) — so the turn's count is ``max(refusals, notices)``, never the
+    sum.
+    """
+
+    refusals: int = 0
+    notices: int = 0
+    # Stops already written to the ``claude.safeguard_stop`` log.
+    logged: int = 0
+    outcome: str | None = None
+    category: str | None = None
+    model: str | None = None
+    fallback_model: str | None = None
+    # The first signal seen this turn (stop_reason / informational /
+    # model_refusal_fallback / model_refusal_no_fallback).
+    source: str | None = None
+    # A main-thread assistant frame arrived after the refusal — the CLI
+    # re-ran the request (used when no notice says so before the result).
+    output_after_refusal: bool = False
+    refused_message_ids: set[str] = field(default_factory=set)
+
+    @property
+    def stops(self) -> int:
+        return max(self.refusals, self.notices)
+
+
+@dataclass(slots=True)
+class PendingHook:
+    """#812: a hook whose ``hook_started`` hasn't been paired with its
+    ``hook_response`` yet (``--include-hook-events``). After the turn's
+    result that is the only runtime sign of a hook still running in the
+    background — the frames carry no async marker (findings §A2)."""
+
+    hook_id: str
+    name: str | None
+    event: str | None
+    started_at: float
+    # The turn the hook belongs to: the open turn, or — when it started
+    # while idle (the next turn's UserPromptSubmit) — the upcoming one.
+    turn: int
+    # ``proc_diag.hook_clock()`` when the frame was read (counts through
+    # system sleep; compared with CLI children's start times). None: unknown.
+    started_clock: float | None = None
+
+    @property
+    def label(self) -> str:
+        return self.event or self.name or "hook"
+
+
 @dataclass(slots=True)
 class ClaudeStreamState:
     factory: EventFactory = field(default_factory=lambda: EventFactory(ENGINE))
@@ -1077,6 +1410,11 @@ class ClaudeStreamState:
     turn_command_uuid: str | None = None
     # Hints collected while idle, consumed when the next turn opens.
     pending_command_uuid: str | None = None
+    # #815: when the CLI announced the next turn (``command_lifecycle
+    # {started}``). The turn only opens on its first frame — for a tool-free
+    # turn that is the final assistant message, seconds later — so the
+    # TurnEvent carries the lead time for the bridge's elapsed header.
+    pending_turn_since: float | None = None
     turn_notifications: list[str] = field(default_factory=list)
     # #785: task ids behind ``turn_notifications`` (a notification for a task
     # the map doesn't know contributes a label but no id).
@@ -1090,6 +1428,10 @@ class ClaudeStreamState:
     # #785: tasks whose finish a wake turn already delivered; a later turn
     # opened only by their notification is the same finish, not news.
     announced_task_ids: set[str] = field(default_factory=set)
+    # #813: task id -> the ``unknown`` wake turn its end was paired with, so
+    # the bridge files that turn's folded ack under the task (not merely the
+    # latest unattributed ack).
+    task_announced_turn: dict[str, int] = field(default_factory=dict)
     # #785: when the last wake turn completed still ``unknown``; a task
     # ending within ``_WAKE_PAIR_WINDOW_S`` after it is paired with it.
     unattributed_turn_completed_at: float | None = None
@@ -1293,6 +1635,54 @@ class ClaudeStreamState:
     # the attempt counter goes backwards (a new sequence).
     api_retry_action_id: str | None = None
     api_retry_last_attempt: int = 0
+
+    # #814: safeguard stops in the current turn (reset per turn) and in the
+    # whole session; ``session_model`` is the last model the stream named
+    # (system/init or a main-thread assistant frame), used when a
+    # safeguard signal carries none.
+    safeguard: SafeguardTurn = field(default_factory=SafeguardTurn)
+    safeguard_session_count: int = 0
+    session_model: str | None = None
+
+    # #812: hooks seen via ``--include-hook-events``. ``pending_hooks`` is
+    # hook_id -> PendingHook (insertion-ordered, capped at
+    # ``_PENDING_HOOKS_MAX``); SessionStart / Setup are never recorded (the
+    # CLI settles those in-band). Entries past ``async_hook_max_hold_s``
+    # move to ``expired_hooks`` so a later close can still name them.
+    pending_hooks: dict[str, PendingHook] = field(default_factory=dict)
+    expired_hooks: dict[str, PendingHook] = field(default_factory=dict)
+    # Plain ``async: true`` hooks whose process has already exited: the CLI
+    # withholds their ``hook_response`` until the next turn or teardown
+    # (docs: "If the session is idle, the response waits until the next
+    # user interaction"), so they must not hold the session. Only
+    # ``asyncRewake`` hooks report back while idle — and a finished process
+    # can no longer rewake. See ``release_settled_async_hooks``.
+    deferred_hooks: dict[str, PendingHook] = field(default_factory=dict)
+    # Monotonic time the live-session lifecycle first found no hook process
+    # under the CLI while hooks were pending (None once one is seen again).
+    hook_procs_gone_since: float | None = None
+    # Live hook processes at the lifecycle's last scan (None: unreadable /
+    # not scanned). Labels a hold expiry — never more hooks than this.
+    live_hook_processes: int | None = None
+    # (pid, start) of the CLI's non-detached children right after
+    # ``system/init`` (MCP servers): never hook evidence (None: not captured
+    # — nothing exempt).
+    cli_baseline_children: frozenset[tuple[int, int | None]] | None = None
+    # (hook name, hook event, monotonic ts) of an async hook that exited 2
+    # (the asyncRewake wake signal) while idle; the next turn opening within
+    # ``_HOOK_REWAKE_HINT_TTL_S`` is its rewake. Cleared on every turn open.
+    hook_rewake_hint: tuple[str | None, str | None, float] | None = None
+    # The hint the open turn saw (stale at open, or an earlier turn's async
+    # hook exiting 2 mid-turn) — the result's ``origin`` confirms it.
+    turn_hook_hint: tuple[str | None, str | None, float] | None = None
+    hooks_started: int = 0
+    # Mirrored from ``[watchdog] hold_for_async_hooks`` /
+    # ``async_hook_max_hold`` by ``run_impl`` (read per spawn, so a config
+    # edit applies to the next run).
+    hold_for_async_hooks: bool = True
+    async_hook_max_hold_s: float = 630.0
+    # ``claude.hook.pending_hold`` fires once per hold; reset when it ends.
+    hook_hold_logged: bool = False
 
     # #572: set when the run's StreamResultMessage was a Stream-idle-timeout
     # failure — "type_a" (mid-generation stall, retryable) or "type_b"
@@ -2062,6 +2452,643 @@ def _translate_api_retry(
     ]
 
 
+def _str_or_none(value: Any) -> str | None:
+    """Normalise an ``Any``-typed schema field (#814): a non-empty string,
+    else None — so a shape drift degrades to "field missing"."""
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    return None
+
+
+# #814: the CLI's same-model refusal-retry notice (CLI 2.1.285, level notice):
+#   "<Model>'s safeguards stopped the response above · continuing once with
+#    that noted"
+_SAFEGUARD_NOTICE_RE = re.compile(r"safeguards stopped", re.IGNORECASE)
+_SAFEGUARD_NOTICE_MODEL_RE = re.compile(
+    r"^(.+?)['’]s safeguards stopped", re.IGNORECASE
+)
+_INFORMATIONAL_MAX_CHARS = 200
+_INFORMATIONAL_ROW_LEVELS = frozenset({"warning", "notice"})
+
+
+def _safeguard_model_label(model: str | None) -> str | None:
+    """Display form of a model named by a safeguard signal: an ID
+    (``claude-opus-5-5``) is shortened like the footer does; a display name
+    (``Opus 5.5``, from the notice text) is kept as-is."""
+    if not model:
+        return None
+    if model.lower().startswith("claude-"):
+        return _short_model_name(model)
+    return model
+
+
+def _safeguard_outcome_label(outcome: str | None, fallback_model: str | None) -> str:
+    """Human wording for a #814 outcome (progress row and footer)."""
+    if outcome == SAFEGUARD_OUTCOME_RETRIED:
+        return "retried once"
+    if outcome == SAFEGUARD_OUTCOME_SWITCHED:
+        target = _safeguard_model_label(fallback_model)
+        return f"switched to {target}" if target else "switched model"
+    if outcome == SAFEGUARD_OUTCOME_NOT_RETRIED:
+        return "not retried"
+    return "outcome pending"
+
+
+def _log_safeguard_stop(
+    state: ClaudeStreamState, factory: EventFactory, *, outcome: str
+) -> None:
+    """Write ``claude.safeguard_stop`` once per newly-resolved stop."""
+    sg = state.safeguard
+    if sg.stops <= sg.logged:
+        return
+    sg.logged = sg.stops
+    logger.info(
+        "claude.safeguard_stop",
+        session_id=factory.resume.value if factory.resume else None,
+        model=sg.model,
+        source=sg.source,
+        category=sg.category,
+        outcome=outcome,
+        fallback_model=sg.fallback_model,
+        turn=state.turn,
+        turn_count=sg.stops,
+        session_count=state.safeguard_session_count,
+    )
+
+
+def _note_safeguard(
+    state: ClaudeStreamState,
+    factory: EventFactory,
+    *,
+    source: str,
+    outcome: str | None,
+    category: str | None = None,
+    model: str | None = None,
+    fallback_model: str | None = None,
+) -> list[UntetherEvent]:
+    """#814: a safeguard stop → one updating ``🛡️`` note per turn, the
+    ``claude.safeguard_stop`` log, and the per-turn tally the result's
+    ``usage["safeguard"]`` carries to the footer.
+
+    ``outcome`` is None for the refused assistant frame itself — the CLI's
+    reaction (notice / fallback frame) resolves it; the result infers it
+    when that reaction never came first (ordering is unverified). Never an
+    error: the row is ``ok=True`` and the run's outcome is untouched.
+    """
+    sg = state.safeguard
+    before = sg.stops
+    if source == "stop_reason":
+        sg.refusals += 1
+    else:
+        sg.notices += 1
+    state.safeguard_session_count += sg.stops - before
+    if sg.source is None:
+        sg.source = source
+    if outcome is not None:
+        sg.outcome = outcome
+    if fallback_model:
+        sg.fallback_model = fallback_model
+    if category:
+        sg.category = category
+    if sg.model is None:
+        # The first model named this turn is the one that was stopped.
+        sg.model = model or state.session_model
+    if sg.outcome is not None:
+        _log_safeguard_stop(state, factory, outcome=sg.outcome)
+    if not state.turn_open:
+        # Arrived after the turn's result (live session): counted and
+        # logged above, but that turn's progress/final is already gone.
+        return []
+    return _safeguard_row(state, factory)
+
+
+def _safeguard_row(
+    state: ClaudeStreamState, factory: EventFactory
+) -> list[UntetherEvent]:
+    sg = state.safeguard
+    label = _safeguard_model_label(sg.model)
+    who = f"{label} safeguards" if label else "Safeguards"
+    title = f"\N{SHIELD}\N{VARIATION SELECTOR-16} {who} stopped a response"
+    if sg.outcome is not None:
+        title += f" · {_safeguard_outcome_label(sg.outcome, sg.fallback_model)}"
+    if sg.stops > 1:
+        title += f" (×{sg.stops})"
+    action_id = f"claude.safeguard.{state.turn}"
+    detail: dict[str, Any] = {"safeguard": True, "stops": sg.stops}
+    if sg.outcome is not None:
+        detail["outcome"] = sg.outcome
+    if sg.category:
+        detail["category"] = sg.category
+    level = "warning" if sg.outcome == SAFEGUARD_OUTCOME_NOT_RETRIED else "info"
+    return [
+        factory.action_started(
+            action_id=action_id, kind="note", title=title, detail=detail
+        ),
+        factory.action_completed(
+            action_id=action_id,
+            kind="note",
+            title=title,
+            ok=True,
+            level=level,
+            detail=detail,
+        ),
+    ]
+
+
+def _note_assistant_refusal(
+    event: claude_schema.StreamAssistantMessage,
+    *,
+    state: ClaudeStreamState,
+    factory: EventFactory,
+) -> list[UntetherEvent]:
+    """#814: main-thread assistant frames — track the model, mark output
+    after a refusal, and note a ``stop_reason == "refusal"`` frame."""
+    if event.parent_tool_use_id is not None:
+        return []
+    message = event.message
+    if message.model and message.model != "<synthetic>":
+        state.session_model = message.model
+    sg = state.safeguard
+    if message.stop_reason != "refusal":
+        if sg.refusals:
+            sg.output_after_refusal = True
+        return []
+    frame_id = message.id or event.uuid
+    if frame_id is not None:
+        if frame_id in sg.refused_message_ids:
+            return []
+        sg.refused_message_ids.add(frame_id)
+    details = message.stop_details if isinstance(message.stop_details, dict) else {}
+    return _note_safeguard(
+        state,
+        factory,
+        source="stop_reason",
+        outcome=None,
+        category=_str_or_none(details.get("category")),
+        model=message.model if message.model != "<synthetic>" else None,
+    )
+
+
+def _finalize_safeguard_turn(
+    state: ClaudeStreamState, factory: EventFactory
+) -> dict[str, Any] | None:
+    """At the turn's result: resolve a still-pending outcome and return the
+    ``usage["safeguard"]`` payload (None when the turn had no stop)."""
+    sg = state.safeguard
+    if sg.stops == 0:
+        return None
+    if sg.outcome is None:
+        # A refused frame with no CLI reaction yet: later output means the
+        # request was re-run; none means it wasn't.
+        sg.outcome = (
+            SAFEGUARD_OUTCOME_RETRIED
+            if sg.output_after_refusal
+            else SAFEGUARD_OUTCOME_NOT_RETRIED
+        )
+    _log_safeguard_stop(state, factory, outcome=sg.outcome)
+    payload: dict[str, Any] = {
+        "stops": sg.stops,
+        "outcome": sg.outcome,
+        "outcome_label": _safeguard_outcome_label(sg.outcome, sg.fallback_model),
+        "category": sg.category,
+        "model": _safeguard_model_label(sg.model),
+    }
+    if sg.fallback_model:
+        payload["fallback_model"] = _safeguard_model_label(sg.fallback_model)
+    return payload
+
+
+def _translate_informational(
+    event: claude_schema.StreamSystemMessage,
+    *,
+    state: ClaudeStreamState,
+    factory: EventFactory,
+) -> list[UntetherEvent]:
+    """#814 ``system/informational``: the safeguard notice → the 🛡️ row;
+    other warning/notice banners → a generic row; info/suggestion → log
+    only (D-15: widen after the 24 h audit shows the level mix)."""
+    content = _str_or_none(event.content)
+    level = _str_or_none(event.level)
+    if content and _SAFEGUARD_NOTICE_RE.search(content):
+        m = _SAFEGUARD_NOTICE_MODEL_RE.match(content)
+        return _note_safeguard(
+            state,
+            factory,
+            source="informational",
+            outcome=SAFEGUARD_OUTCOME_RETRIED,
+            model=m.group(1).strip() if m else None,
+        )
+    first_line = (content or "").splitlines()[0].strip() if content else ""
+    if len(first_line) > _INFORMATIONAL_MAX_CHARS:
+        first_line = first_line[: _INFORMATIONAL_MAX_CHARS - 1] + "…"
+    rendered = level in _INFORMATIONAL_ROW_LEVELS and bool(first_line)
+    (logger.info if rendered else logger.debug)(
+        "claude.informational",
+        session_id=event.session_id,
+        level=level,
+        prevent_continuation=event.prevent_continuation is True,
+        content_len=len(content or ""),
+        rendered=rendered,
+    )
+    if not rendered or not state.turn_open:
+        return []
+    tool_use_id = _str_or_none(event.tool_use_id)
+    if tool_use_id is not None:
+        # "Dedupes progress messages for the same tool use" — one row.
+        action_id = f"claude.informational.{tool_use_id}"
+    else:
+        state.note_seq += 1
+        action_id = f"claude.informational.{state.note_seq}"
+    icon = (
+        "\N{WARNING SIGN}\N{VARIATION SELECTOR-16}"
+        if level == "warning"
+        else "\N{INFORMATION SOURCE}\N{VARIATION SELECTOR-16}"
+    )
+    title = f"{icon} {first_line}"
+    detail: dict[str, Any] = {"level": level}
+    return [
+        factory.action_started(
+            action_id=action_id, kind="note", title=title, detail=detail
+        ),
+        factory.action_completed(
+            action_id=action_id,
+            kind="note",
+            title=title,
+            ok=True,
+            level="warning" if level == "warning" else "info",
+            detail=detail,
+        ),
+    ]
+
+
+def _translate_model_refusal_fallback(
+    event: claude_schema.StreamSystemMessage,
+    *,
+    state: ClaudeStreamState,
+    factory: EventFactory,
+) -> list[UntetherEvent]:
+    """#814 ``system/model_refusal_fallback``: the refused request is re-run
+    on the fallback model."""
+    fallback = _str_or_none(event.fallback_model)
+    if fallback and _str_or_none(event.scope) != "local":
+        # ``scope:"local"`` = a subagent / side question fell back; the
+        # session model is unchanged.
+        state.session_model = fallback
+    return _note_safeguard(
+        state,
+        factory,
+        source="model_refusal_fallback",
+        outcome=SAFEGUARD_OUTCOME_SWITCHED,
+        category=_str_or_none(event.api_refusal_category),
+        model=_str_or_none(event.original_model),
+        fallback_model=fallback,
+    )
+
+
+def _translate_model_refusal_no_fallback(
+    event: claude_schema.StreamSystemMessage,
+    *,
+    state: ClaudeStreamState,
+    factory: EventFactory,
+) -> list[UntetherEvent]:
+    """#814 ``system/model_refusal_no_fallback``: refused and not re-run."""
+    return _note_safeguard(
+        state,
+        factory,
+        source="model_refusal_no_fallback",
+        outcome=SAFEGUARD_OUTCOME_NOT_RETRIED,
+        category=_str_or_none(event.api_refusal_category),
+        model=_str_or_none(event.original_model),
+    )
+
+
+def _translate_model_fallback(
+    event: claude_schema.StreamSystemMessage,
+    *,
+    state: ClaudeStreamState,
+    factory: EventFactory,
+) -> list[UntetherEvent]:
+    """#814 ``system/model_fallback``: the turn switched to the configured
+    fallback model (overloaded / model_not_found / …) — not a safeguard
+    stop, but the user should know which model answered."""
+    original = _str_or_none(event.original_model)
+    fallback = _str_or_none(event.fallback_model)
+    trigger = _str_or_none(event.trigger)
+    logger.info(
+        "claude.model_fallback",
+        session_id=event.session_id,
+        original_model=original,
+        fallback_model=fallback,
+        trigger=trigger,
+    )
+    if fallback:
+        state.session_model = fallback
+    if not state.turn_open:
+        return []
+    src = _safeguard_model_label(original) or "?"
+    dst = _safeguard_model_label(fallback) or "?"
+    title = (
+        f"\N{RIGHTWARDS ARROW WITH HOOK}\N{VARIATION SELECTOR-16} "
+        f"Switched model {src} \N{RIGHTWARDS ARROW} {dst}"
+    )
+    if trigger:
+        title += f" ({trigger.replace('_', ' ')})"
+    state.note_seq += 1
+    action_id = f"claude.model_fallback.{state.note_seq}"
+    detail: dict[str, Any] = {"original_model": original, "fallback_model": fallback}
+    return [
+        factory.action_started(
+            action_id=action_id, kind="note", title=title, detail=detail
+        ),
+        factory.action_completed(
+            action_id=action_id,
+            kind="note",
+            title=title,
+            ok=True,
+            level="info",
+            detail=detail,
+        ),
+    ]
+
+
+# #812 hook lifecycle (``--include-hook-events``).
+_PENDING_HOOKS_MAX = 256
+# SessionStart / Setup hook events are always emitted and settled in-band by
+# the CLI itself (findings §A1 P2) — they never hold a session.
+_HOOK_NEVER_HOLD_EVENTS = frozenset({"SessionStart", "Setup"})
+# A rewake turn opens right after its hook's ``hook_response`` (P5-A: same
+# millisecond); a hint older than this is not taken as the turn's cause.
+_HOOK_REWAKE_HINT_TTL_S = 10.0
+# The asyncRewake wake signal: exit code 2 (``outcome: "error"``).
+_HOOK_REWAKE_EXIT_CODE = 2
+
+
+def _hook_event_name(event: claude_schema.StreamSystemMessage) -> str | None:
+    hook_event = _str_or_none(event.hook_event)
+    if hook_event:
+        return hook_event
+    # ``hook_name`` is ``Stop`` or ``SessionStart:startup`` style.
+    name = _str_or_none(event.hook_name)
+    return name.split(":", 1)[0] if name else None
+
+
+def _hook_never_holds(event_name: str | None) -> bool:
+    return event_name in _HOOK_NEVER_HOLD_EVENTS
+
+
+def _apply_hook_event(
+    state: ClaudeStreamState, event: claude_schema.StreamSystemMessage
+) -> None:
+    """#812: track ``hook_started`` / ``hook_response`` pairs by ``hook_id``.
+
+    Produces no UntetherEvents — hook traffic (every configured hook on every
+    tool call) must never reach progress rows or the bridge's stall timers.
+    """
+    subtype = event.subtype
+    hook_id = _str_or_none(event.hook_id)
+    name = _str_or_none(event.hook_name)
+    hook_event = _hook_event_name(event)
+    session_id = event.session_id
+    if subtype == "hook_started":
+        state.hooks_started += 1
+        if hook_id is None or _hook_never_holds(hook_event):
+            return
+        if hook_id not in state.pending_hooks and (
+            len(state.pending_hooks) >= _PENDING_HOOKS_MAX
+        ):
+            oldest_id = next(iter(state.pending_hooks))
+            oldest = state.pending_hooks.pop(oldest_id)
+            logger.debug(
+                "claude.hook.pending_evicted",
+                session_id=session_id,
+                hook_id=oldest_id,
+                hook_event=oldest.event,
+                cap=_PENDING_HOOKS_MAX,
+            )
+        state.pending_hooks[hook_id] = PendingHook(
+            hook_id=hook_id,
+            name=name,
+            event=hook_event,
+            started_at=time.monotonic(),
+            # Started while idle → the upcoming turn's hook (e.g. its
+            # UserPromptSubmit, emitted before ``system/init``).
+            turn=state.turn if state.turn_open else state.turn + 1,
+            started_clock=hook_clock(),
+        )
+        return
+    if subtype != "hook_response":
+        return  # hook_progress: output polling, nothing to track.
+    pending = state.pending_hooks.pop(hook_id, None) if hook_id else None
+    expired = state.expired_hooks.pop(hook_id, None) if hook_id else None
+    deferred = state.deferred_hooks.pop(hook_id, None) if hook_id else None
+    known = pending or expired or deferred
+    outcome = _str_or_none(event.outcome)
+    exit_code = event.exit_code
+    is_rewake_signal = (
+        outcome == "error"
+        and isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and exit_code == _HOOK_REWAKE_EXIT_CODE
+        and not _hook_never_holds(hook_event)
+    )
+    if is_rewake_signal:
+        hint = (name, hook_event, time.monotonic())
+        if not state.turn_open:
+            state.hook_rewake_hint = hint
+        elif known is not None and known.turn < state.turn:
+            # An earlier turn's async hook exited 2 after this turn opened
+            # (the turn's own cause, confirmed by ``origin`` at its result).
+            state.turn_hook_hint = hint
+        logger.info(
+            "claude.hook.rewake_signal",
+            session_id=session_id,
+            hook_name=name,
+            hook_event=hook_event,
+            turn_open=state.turn_open,
+            held_s=(
+                round(time.monotonic() - known.started_at, 1)
+                if known is not None
+                else None
+            ),
+        )
+    elif outcome == "cancelled":
+        logger.info(
+            "claude.hook.cancelled",
+            session_id=session_id,
+            hook_name=name,
+            hook_event=hook_event,
+            exit_code=exit_code,
+        )
+    else:
+        logger.debug(
+            "claude.hook.response",
+            session_id=session_id,
+            hook_name=name,
+            hook_event=hook_event,
+            outcome=outcome,
+            exit_code=exit_code,
+        )
+
+
+def _translate_hook_event(
+    event: claude_schema.StreamSystemMessage,
+    *,
+    state: ClaudeStreamState,
+    factory: EventFactory,
+) -> list[UntetherEvent]:
+    _apply_hook_event(state, event)
+    return []
+
+
+def has_pending_async_hooks(state: ClaudeStreamState) -> bool:
+    """#812: True while a hook may still be running in the background — a
+    ``hook_started`` with no ``hook_response`` yet, inside the hold bound.
+    The live-session lifecycle holds stdin open on it (closing stdin makes
+    the CLI drop an asyncRewake hook's findings, §A1 P5-B).
+
+    Deliberately separate from :func:`has_live_background_work` (D-1): hooks
+    aren't background tasks, so they must not show in footers or the #777
+    panel, nor change the #592 cap, the #346 gate or ``_is_clean_idle``.
+
+    All-or-nothing: the frames carry no pid and hooks started in the same
+    millisecond can't be told apart, so no unpaired hook is judged finished
+    on its own (``release_settled_async_hooks`` releases them together once
+    no hook process is left). The hold therefore lasts until the *newest*
+    unpaired hook is ``async_hook_max_hold_s`` old — whichever one is
+    running gets its full bound — then every unpaired hook moves to
+    ``expired_hooks`` with one ``claude.hook.hold_expired`` WARN, even if a
+    hook process is still up (the bound is the bound).
+    """
+    if not state.hold_for_async_hooks or not state.pending_hooks:
+        return False
+    hooks = [h for h in state.pending_hooks.values() if not _hook_never_holds(h.event)]
+    if not hooks:
+        return False
+    max_hold = state.async_hook_max_hold_s
+    if max_hold <= 0:
+        return False
+    now = time.monotonic()
+    if now - max(h.started_at for h in hooks) < max_hold:
+        return True
+    for hook in hooks:
+        state.pending_hooks.pop(hook.hook_id, None)
+        if len(state.expired_hooks) >= _PENDING_HOOKS_MAX:
+            state.expired_hooks.pop(next(iter(state.expired_hooks)))
+        state.expired_hooks[hook.hook_id] = hook
+    logger.warning(
+        "claude.hook.hold_expired",
+        session_id=(
+            state.factory.resume.value if state.factory.resume is not None else None
+        ),
+        # The hooks actually still running (None: process table unreadable);
+        # ``pending_hooks`` counts the unpaired candidates, most of which may
+        # be plain ``async`` hooks that finished long ago.
+        live_hook_processes=state.live_hook_processes,
+        pending_hooks=len(hooks),
+        hook_events=_hook_event_labels(hooks),
+        hook_ids=[h.hook_id for h in hooks],
+        held_s=round(now - min(h.started_at for h in hooks), 1),
+        max_hold_s=max_hold,
+    )
+    return False
+
+
+# A hook younger than this is never judged finished on a process scan (its
+# ``/bin/sh -c`` child may not be visible yet), and the lifecycle releases
+# only after finding no hook process for this long (a hook that just exited
+# may not have reported back yet — exit → ``hook_response`` isn't atomic).
+_HOOK_PROC_SETTLE_S = 1.0
+
+
+def release_settled_async_hooks(
+    state: ClaudeStreamState, *, now: float | None = None
+) -> list[PendingHook]:
+    """#812: the CLI has no hook process left, so every unpaired hook (older
+    than ``_HOOK_PROC_SETTLE_S``) has finished. The ones still unpaired are
+    plain ``async: true`` hooks — the CLI withholds their ``hook_response``
+    until the next turn or teardown, so waiting for it would hold the
+    session to ``async_hook_max_hold_s`` for nothing. An ``asyncRewake``
+    hook reports back as soon as it exits (and a finished process can't
+    rewake), so none is lost. Moves them — and any expired ones, equally
+    finished — to ``deferred_hooks`` (still paired when the response lands;
+    never "killed" at a close). Returns the pending hooks released.
+
+    Only ever called on "no hook process at all": while any hook process
+    is alive, nothing is released, because a shell can't be tied to a hook."""
+    now = time.monotonic() if now is None else now
+    released: list[PendingHook] = []
+    for hook_id, hook in list(state.pending_hooks.items()):
+        if _hook_never_holds(hook.event) or now - hook.started_at < _HOOK_PROC_SETTLE_S:
+            continue
+        state.pending_hooks.pop(hook_id, None)
+        released.append(hook)
+        _defer_hook(state, hook)
+    for hook_id, hook in list(state.expired_hooks.items()):
+        state.expired_hooks.pop(hook_id, None)
+        _defer_hook(state, hook)
+    return released
+
+
+def _defer_hook(state: ClaudeStreamState, hook: PendingHook) -> None:
+    if len(state.deferred_hooks) >= _PENDING_HOOKS_MAX:
+        state.deferred_hooks.pop(next(iter(state.deferred_hooks)))
+    state.deferred_hooks[hook.hook_id] = hook
+
+
+def _hooks_outstanding(state: ClaudeStreamState) -> list[PendingHook]:
+    """#812: hooks still unpaired at a close — pending or past their hold."""
+    return [
+        hook
+        for hook in (*state.pending_hooks.values(), *state.expired_hooks.values())
+        if not _hook_never_holds(hook.event)
+    ]
+
+
+class _SystemSubtypeHandler(Protocol):
+    def __call__(
+        self,
+        event: claude_schema.StreamSystemMessage,
+        *,
+        state: ClaudeStreamState,
+        factory: EventFactory,
+    ) -> list[UntetherEvent]: ...
+
+
+# System subtypes with their own translation (#792, #814). Add a subtype by
+# writing a handler with this signature and registering it here; anything
+# not listed falls through to the ``claude.system_event.non_init`` debug
+# log in ``_translate_claude_event_base``.
+_SYSTEM_SUBTYPE_HANDLERS: dict[str, _SystemSubtypeHandler] = {
+    "api_retry": _translate_api_retry,
+    "informational": _translate_informational,
+    "model_refusal_fallback": _translate_model_refusal_fallback,
+    "model_refusal_no_fallback": _translate_model_refusal_no_fallback,
+    "model_fallback": _translate_model_fallback,
+    # #812: hook lifecycle frames — tracked, never surfaced.
+    "hook_started": _translate_hook_event,
+    "hook_progress": _translate_hook_event,
+    "hook_response": _translate_hook_event,
+}
+
+
+def _translate_system_subtype(
+    event: claude_schema.StreamSystemMessage,
+    *,
+    state: ClaudeStreamState,
+    factory: EventFactory,
+) -> list[UntetherEvent] | None:
+    """Dispatch a system frame to its registered handler; None when the
+    subtype has none."""
+    handler = _SYSTEM_SUBTYPE_HANDLERS.get(event.subtype)
+    if handler is None and event.subtype.startswith("hook_"):
+        # #812: any future hook lifecycle subtype stays silent too.
+        handler = _translate_hook_event
+    if handler is None:
+        return None
+    return handler(event, state=state, factory=factory)
+
+
 def _normalize_tool_result(content: Any) -> str:
     if content is None:
         return ""
@@ -2687,6 +3714,7 @@ def _note_task_end(state: ClaudeStreamState, task: ClaudeTask) -> None:
         return
     state.unattributed_turn_completed_at = None
     state.announced_task_ids.add(task.task_id)
+    state.task_announced_turn[task.task_id] = state.turn
     logger.info(
         "claude.turn.task_end_paired",
         turn=state.turn,
@@ -3610,6 +4638,15 @@ def _completed_keeps_session_live(evt: CompletedEvent) -> bool:
     )
 
 
+def _result_origin_kind(event: claude_schema.StreamResultMessage) -> str | None:
+    """The result's ``origin.kind`` (``task-notification`` for a CLI-started
+    turn, #812 §A3), read defensively — ``origin`` is typed Any."""
+    origin = event.origin
+    if isinstance(origin, dict):
+        return _str_or_none(origin.get("kind"))
+    return None
+
+
 def _open_followup_turn(
     state: ClaudeStreamState, factory: EventFactory
 ) -> UntetherEvent:
@@ -3628,7 +4665,33 @@ def _open_followup_turn(
             # #785: the second wake turn for one finish (the first opened as
             # ``unknown`` and was attributed to it) — the bridge won't push.
             detail["already_announced"] = True
+        # #813: the wake turn(s) these finishes were paired with.
+        if announced_turns := sorted(
+            {
+                state.task_announced_turn[t]
+                for t in ids
+                if t in state.task_announced_turn
+            }
+        ):
+            detail["announced_turns"] = announced_turns
         _mark_announced(state, ids)
+    elif (hint := state.hook_rewake_hint) is not None and time.monotonic() - hint[
+        2
+    ] <= _HOOK_REWAKE_HINT_TTL_S:
+        # #812: an asyncRewake hook exited 2 while idle; the CLI enqueued
+        # its findings as a task-notification turn (§A3) — no
+        # command_lifecycle, so this sits before scheduled_wakeup.
+        reason = "hook_rewake"
+        detail["hook"] = hint[0]
+        detail["hook_event"] = hint[1]
+        logger.info(
+            "claude.turn.hook_rewake",
+            session_id=factory.resume.value if factory.resume else None,
+            turn=state.turn + 1,
+            hook_name=hint[0],
+            hook_event=hint[1],
+            attributed="open",
+        )
     elif command_uuid is not None:
         reason = "scheduled_wakeup"
     elif monitors := [
@@ -3648,12 +4711,23 @@ def _open_followup_turn(
     state.turn_reason = reason
     state.turn_command_uuid = command_uuid if reason == "followup" else None
     state.pending_command_uuid = None
+    started_ago_s = (
+        max(0.0, time.monotonic() - state.pending_turn_since)
+        if state.pending_turn_since is not None
+        else None
+    )
+    state.pending_turn_since = None
     state.turn_notifications = []
     state.turn_notification_ids = []
     state.turn_ended_tasks = []
     state.turn_detail = detail
     state.unattributed_turn_completed_at = None
+    # #812: a stale hint (a slow turn start) is kept for the result's
+    # ``origin`` check; either way the idle-time hint is spent.
+    state.turn_hook_hint = None if reason == "hook_rewake" else state.hook_rewake_hint
+    state.hook_rewake_hint = None
     # Per-turn scalars (see their field docs) start fresh for the new turn.
+    state.safeguard = SafeguardTurn()
     state.last_assistant_text = None
     state.last_exitplanmode_plan = None
     state.last_schedule_wakeup_arm_delay = None
@@ -3672,6 +4746,7 @@ def _open_followup_turn(
         reason=reason,  # type: ignore[arg-type]
         command_uuid=state.turn_command_uuid,
         detail=detail,
+        started_ago_s=started_ago_s,
     )
 
 
@@ -3796,6 +4871,8 @@ def translate_claude_event(
         case claude_schema.StreamCommandLifecycleMessage(state=cmd_state):
             if cmd_state == "started" and not state.turn_open:
                 state.pending_command_uuid = event.command_uuid
+                if state.pending_turn_since is None:
+                    state.pending_turn_since = time.monotonic()
             return []
         case claude_schema.StreamSystemMessage(subtype=subtype):
             if subtype == "task_notification" and not state.turn_open:
@@ -3866,6 +4943,28 @@ def translate_claude_event(
                     turn=state.turn,
                     task_ids=[tid for tid, _ in state.turn_ended_tasks],
                 )
+            elif (
+                state.turn_reason == "unknown"
+                and (hook_hint := state.turn_hook_hint) is not None
+                and _result_origin_kind(event) == "task-notification"
+            ):
+                # #812: the turn opened without a fresh hint (slow start, or
+                # the hook's exit-2 response landed after the turn opened);
+                # the CLI's task-notification origin confirms it was the
+                # rewake.
+                state.turn_reason = "hook_rewake"
+                detail["hook"] = hook_hint[0]
+                detail["hook_event"] = hook_hint[1]
+                detail["retro_attributed"] = True
+                logger.info(
+                    "claude.turn.hook_rewake",
+                    session_id=event.session_id,
+                    turn=state.turn,
+                    hook_name=hook_hint[0],
+                    hook_event=hook_hint[1],
+                    attributed="result",
+                )
+            state.turn_hook_hint = None
             state.turn_ended_tasks = []
             state.unattributed_turn_completed_at = (
                 time.monotonic() if state.turn_reason == "unknown" else None
@@ -3953,8 +5052,9 @@ def _translate_claude_event_base(
             if subtype.startswith("task_") or subtype == "background_tasks_changed":
                 _apply_task_event(state, event)
                 return []
-            if subtype == "api_retry":
-                return _translate_api_retry(event, state=state, factory=factory)
+            handled = _translate_system_subtype(event, state=state, factory=factory)
+            if handled is not None:
+                return handled
             if subtype != "init":
                 logger.debug(
                     "claude.system_event.non_init",
@@ -3987,6 +5087,8 @@ def _translate_claude_event_base(
             if run_options is not None and run_options.reasoning:
                 meta["effort"] = run_options.reasoning
             model = event.model
+            if isinstance(model, str) and model:
+                state.session_model = model
             token = ResumeToken(engine=ENGINE, value=session_id)
             event_title = str(model) if isinstance(model, str) and model else title
             return [factory.started(token, title=event_title, meta=meta or None)]
@@ -4075,6 +5177,8 @@ def _translate_claude_event_base(
                                 state.outline_text = text
                     case _:
                         continue
+            # #814: a refused main-thread response → the 🛡️ row.
+            out.extend(_note_assistant_refusal(event, state=state, factory=factory))
             return out
         case claude_schema.StreamUserMessage(message=message):
             if not isinstance(message.content, list):
@@ -4203,6 +5307,14 @@ def _translate_claude_event_base(
                 # remedy to name.
                 _maybe_latch_action_required(event.result)
             usage = _usage_payload(event)
+            # #814: rides on usage (not StartedEvent meta) so it reaches both
+            # CompletedEvent and a live turn's TurnEvent — D-12.
+            if (safeguard := _finalize_safeguard_turn(state, factory)) is not None:
+                usage["safeguard"] = safeguard
+            if event.terminal_reason in claude_schema.CLAUDE_ABORTED_TERMINAL_REASONS:
+                # #806: an interrupted turn — the bridge renders it as
+                # cancelled rather than as an answer / error.
+                usage["terminal_reason"] = event.terminal_reason
 
             # #572: record the stream-idle classification so the bridge's
             # bounded auto-retry gate can read it via engine_state duck-typing.
@@ -5138,6 +6250,17 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         # resume / model / effort / allowed-tools / permission so the final
         # prompt position (after `--`) is never displaced (#407).
         args.extend(self.extra_args)
+        # #812: hook lifecycle frames let the live session hold stdin open
+        # for a background (async / asyncRewake) hook. Control-channel mode
+        # only (live sessions need it), behind the kill switch, only when the
+        # CLI lists the flag, and never twice (a config may already pass it).
+        if (
+            effective_mode is not None
+            and _HOOK_EVENTS_FLAG not in self.extra_args
+            and _load_hook_hold_settings()[0]
+            and cli_supports_hook_events(self.claude_cmd)
+        ):
+            args.append(_HOOK_EVENTS_FLAG)
 
         if resume is not None:
             if resume.is_continue:
@@ -5437,6 +6560,10 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                             stdin=session_stdin,
                             pid=pid,
                         )
+                        # #812: MCP servers are up by system/init. Always
+                        # captured: the close-grace check uses it even with
+                        # the hold switched off.
+                        await capture_cli_baseline(state, pid)
                     logger.info(
                         "session_stdin.registered",
                         session_id=registered_session_id,
@@ -5728,6 +6855,9 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     # #791: after the close grace, SIGINT (the CLI's Ctrl-C path) gets this
     # long before the SIGTERM escalation.
     _live_close_sigint_grace_s: float = 5.0
+    # #812: the close grace when a background hook is evident at close — the
+    # CLI's 30 s asyncRewake exit wait (``Rxo``, §A1) + 5 s.
+    _live_close_grace_hooks_s: float = 35.0
 
     async def _live_session_lifecycle(
         self,
@@ -5780,9 +6910,69 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     )
                     return
                 now = time.monotonic()
-                live_work = has_live_background_work(state) or _has_pending_wakeup(
-                    state
+                # #812: a hook still running in the background holds stdin
+                # open too (sibling predicate, D-1) — closing it would make
+                # the CLI drop an asyncRewake hook's findings. All or
+                # nothing: while ANY hook process lives every unpaired hook
+                # holds (a shell can't be tied to a hook); once none has
+                # been alive for the settle, they have all finished (plain
+                # ``async``: response withheld by the CLI until the next
+                # turn) and are released together.
+                if (
+                    live.idle
+                    and state.hold_for_async_hooks
+                    and state.async_hook_max_hold_s > 0
+                    and state.pending_hooks
+                ):
+                    shells = await _hook_processes(
+                        state,
+                        getattr(proc, "pid", None)
+                        if getattr(proc, "returncode", None) is None
+                        else None,
+                    )
+                    state.live_hook_processes = None if shells is None else len(shells)
+                    if shells is None or shells:
+                        # Unreadable → the bounded hold; alive → hold.
+                        state.hook_procs_gone_since = None
+                    elif state.hook_procs_gone_since is None:
+                        # First scan with no hook process: give a hook that
+                        # just exited a moment to report back first.
+                        state.hook_procs_gone_since = now
+                    elif now - state.hook_procs_gone_since >= _HOOK_PROC_SETTLE_S:
+                        released = release_settled_async_hooks(state, now=now)
+                        if released:
+                            run_logger.info(
+                                "claude.hook.hold_released",
+                                session_id=sid,
+                                hook_names=[h.label for h in released],
+                                hook_ids=[h.hook_id for h in released],
+                                reason="no_hook_process",
+                                held_s=round(
+                                    now - min(h.started_at for h in released), 1
+                                ),
+                            )
+                else:
+                    state.hook_procs_gone_since = None
+                hooks_pending = live.idle and has_pending_async_hooks(state)
+                live_work = (
+                    has_live_background_work(state)
+                    or _has_pending_wakeup(state)
+                    or hooks_pending
                 )
+                if hooks_pending and not state.hook_hold_logged:
+                    state.hook_hold_logged = True
+                    run_logger.info(
+                        "claude.hook.pending_hold",
+                        session_id=sid,
+                        hook_names=[
+                            h.label
+                            for h in state.pending_hooks.values()
+                            if not _hook_never_holds(h.event)
+                        ],
+                        max_hold_s=state.async_hook_max_hold_s,
+                    )
+                elif not hooks_pending:
+                    state.hook_hold_logged = False
                 if abs_cap_s > 0 and now - live.spawned_at >= abs_cap_s:
                     await close_live_session(sid, "abs_cap", notice=live_work)
                     continue
@@ -5848,7 +7038,53 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         if proc is not None and isinstance(getattr(proc, "pid", None), int):
             with contextlib.suppress(Exception):
                 grace_start_diag = collect_proc_diag(proc.pid)
-        with anyio.move_on_after(self._live_close_grace_s):
+        # #812 fallback (flag off, CLI too old, or hold bound hit): with a
+        # background hook still evident, give the CLI its own 30 s
+        # asyncRewake exit wait (+5 s) before signalling it. This only lets
+        # plain hooks finish their teardown — a rewake that fires after
+        # stdin closed is dropped by the CLI regardless (§A1 P5-B).
+        hooks_evident = bool(live.close_hooks)
+        if not hooks_evident and grace_start_diag is not None:
+            proc_hooks = _scan_hook_children(grace_start_diag.child_pids)
+            if proc_hooks:
+                hooks_evident = True
+                _log_async_hook_killed(
+                    live,
+                    hook_count=len(proc_hooks),
+                    hook_names=proc_hooks,
+                    hook_events=[],
+                    source="proc",
+                )
+                if live.close_reason not in _USER_CLOSE_REASONS:
+                    await _notify_live_listeners(
+                        live,
+                        "closing",
+                        {
+                            "reason": live.close_reason,
+                            "tasks": [],
+                            "hooks": proc_hooks,
+                            "hook_count": len(proc_hooks),
+                        },
+                    )
+        if not hooks_evident and proc is not None and proc.returncode is None:
+            # Process evidence: a live hook process (whatever its command —
+            # the ``/hooks/`` path heuristic above misses inline commands)
+            # still gets the CLI's asyncRewake exit wait.
+            shells = await _hook_processes(live.state, getattr(proc, "pid", None))
+            if shells:
+                hooks_evident = True
+                run_logger.info(
+                    "claude.live_session.hook_process_at_close",
+                    session_id=live.session_id,
+                    close_reason=live.close_reason,
+                    live_hook_processes=len(shells),
+                )
+        grace_s = (
+            self._live_close_grace_hooks_s
+            if hooks_evident
+            else self._live_close_grace_s
+        )
+        with anyio.move_on_after(grace_s):
             await reader_done.wait()
         if reader_done.is_set() or proc is None or proc.returncode is not None:
             return "exited_after_close"
@@ -5866,7 +7102,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             session_id=sid,
             pid=proc.pid,
             close_reason=live.close_reason,
-            grace_s=self._live_close_grace_s,
+            grace_s=grace_s,
             live_tasks=live_tasks,
             idle_clean=idle_clean,
             **_close_grace_diag(proc.pid, grace_start_diag),
@@ -6796,7 +8032,8 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             found_session.value if found_session else (resume.value if resume else None)
         )
         if session_id:
-            _cleanup_session_registries(session_id)
+            # #816: never deregister a newer process that owns the session.
+            _cleanup_session_registries(session_id, owner_state=state)
 
         parts = [f"Claude Code failed ({_rc_label(rc)})."]
         session = _session_label(found_session, resume)
@@ -6828,7 +8065,8 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             found_session.value if found_session else (resume.value if resume else None)
         )
         if session_id:
-            _cleanup_session_registries(session_id)
+            # #816: never deregister a newer process that owns the session.
+            _cleanup_session_registries(session_id, owner_state=state)
 
         if not found_session:
             parts = ["Claude Code finished but no session_id was captured"]
@@ -6875,6 +8113,13 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
 
         tag = self.tag()
         run_logger = self.get_logger()
+        if self._effective_permission_mode() is not None:
+            # #812: warm the cached `--help` probe off the event loop so the
+            # (synchronous) build_args below only reads the cache.
+            with contextlib.suppress(Exception):
+                await anyio.to_thread.run_sync(
+                    cli_supports_hook_events, self.claude_cmd
+                )
         cmd = [self.command(), *self.build_args(prompt, resume, state=state)]
         payload = self.stdin_payload(prompt, resume, state=state)
         env = self.env(state=state)
@@ -7058,6 +8303,13 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                         live_session_max_s = float(
                             settings_obj.watchdog.live_session_max_s
                         )
+                        # #812: read per spawn like live_sessions.
+                        state.hold_for_async_hooks = bool(
+                            getattr(settings_obj.watchdog, "hold_for_async_hooks", True)
+                        )
+                        state.async_hook_max_hold_s = float(
+                            getattr(settings_obj.watchdog, "async_hook_max_hold", 630.0)
+                        )
                 except Exception:  # noqa: BLE001 — settings errors must not block a run
                     run_logger.debug(
                         "post_result_idle.settings_load_failed", exc_info=True
@@ -7235,8 +8487,17 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             # Clean up global registries on ANY exit (cancel, error, normal).
             # process_error_events/stream_end_events handle normal paths but
             # cancellation skips both, leaving stale outline_guard/cooldown state.
-            _sid = resume.value if resume else None
-            if _sid is None:
+            # #816: a /continue token is ``ResumeToken(value="",
+            # is_continue=True)`` — truthy but carrying no session id. The
+            # real id only arrives with the CLI's init, so resolve it from
+            # found_session; keying on "" skipped the cleanup entirely and
+            # left the session looking alive to every later resume.
+            _sid = (
+                resume.value
+                if resume is not None and not resume.is_continue and resume.value
+                else None
+            )
+            if not _sid:
                 try:
                     if stream.found_session is not None:
                         _sid = stream.found_session.value
@@ -7244,7 +8505,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     pass
             if _sid:
                 try:
-                    _cleanup_session_registries(_sid)
+                    _cleanup_session_registries(_sid, owner_state=state)
                 except Exception as e:  # noqa: BLE001
                     logger.warning(
                         "session.registry.cleanup_failed",
@@ -7476,12 +8737,27 @@ def mark_outline_pending(session_id: str) -> None:
     logger.info("outline_pending.set", session_id=session_id)
 
 
-def _cleanup_session_registries(session_id: str) -> None:
+def _cleanup_session_registries(
+    session_id: str, *, owner_state: ClaudeStreamState | None = None
+) -> None:
     """Clean up all global registries for a session.
 
     Called from run_impl finally (covers cancel), process_error_events,
     and stream_end_events. All operations are idempotent.
+
+    ``owner_state`` (#816 hardening): the finishing run's stream state. When
+    given and the session is registered to a DIFFERENT run's state — a newer
+    process now owns the same session id — the cleanup is skipped, so a late
+    finally can't deregister (or strip pending approvals from) a live owner.
     """
+    owner = _SESSION_BG_STATE.get(session_id)
+    if owner_state is not None and owner is not None and owner is not owner_state:
+        logger.info(
+            "claude_runner.session_cleanup_skipped",
+            session_id=session_id,
+            reason="owned_by_other_run",
+        )
+        return
     cleaned: list[str] = []
     if _ACTIVE_RUNNERS.pop(session_id, None) is not None:
         cleaned.append("active_runners")

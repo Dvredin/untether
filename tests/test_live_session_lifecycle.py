@@ -7,6 +7,7 @@ lifecycle timers shrunk to fractions of a second.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -31,7 +32,13 @@ pytestmark = pytest.mark.anyio
 
 FAKE_CLI = Path(__file__).parent / "fake_clis" / "fake_claude_live.py"
 SID = "fake-live-session"
-_ENV = ("FAKE_CLAUDE_SCENARIO", "FAKE_CLAUDE_WAKE_S", "FAKE_CLAUDE_IGNORE_SIGINT")
+_ENV = (
+    "FAKE_CLAUDE_SCENARIO",
+    "FAKE_CLAUDE_WAKE_S",
+    "FAKE_CLAUDE_IGNORE_SIGINT",
+    "FAKE_CLAUDE_REWAKE_WAIT_S",
+    "FAKE_CLAUDE_SYNC_HOOK_S",
+)
 
 
 # ClaudeRunner is a slots dataclass, so these knobs are instance fields: a
@@ -42,6 +49,8 @@ _TIMINGS = {
     "_live_poll_s": 0.05,
     "_live_close_grace_s": 0.8,
     "_live_close_sigint_grace_s": 0.8,
+    # #812: distinct from the plain grace so tests can tell which applied.
+    "_live_close_grace_hooks_s": 1.6,
     "_subcountdown_sigterm_grace_s": 1.0,
     "_subcountdown_sigterm_grace_poll_s": 0.1,
 }
@@ -400,3 +409,566 @@ async def test_idle_close_backs_off_when_a_followup_was_just_written() -> None:
         assert await close_live_session("sid-race2", "cancel") is True
     finally:
         claude_mod._LIVE_SESSIONS.pop("sid-race2", None)
+
+
+# ── #812: background hooks hold the live session ─────────────────────────
+
+
+def _hook_notices() -> tuple[list[tuple[str, dict]], Any]:
+    notices: list[tuple[str, dict]] = []
+
+    async def subscribe(evt: Any) -> None:
+        if isinstance(evt, CompletedEvent):
+            add_live_session_listener(SID, lambda kind, p: notices.append((kind, p)))
+
+    return notices, subscribe
+
+
+async def test_812_pending_hook_holds_idle_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Stop hook outlives the 0.3 s idle grace several times over; stdin
+    stays open until its ``hook_response`` lands, then the session idles
+    out normally — nothing killed, nothing to report."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch)
+    started = anyio.current_time()
+    with capture_logs() as logs:
+        runner, events = await _run("async_hook_success", wake_s=1.5)
+    assert anyio.current_time() - started >= 1.5
+    state = _engine_state(runner)
+    assert state.live_close_reason == "idle_no_tasks"
+    assert state.pending_hooks == {}  # the response arrived before the close
+    assert state.hooks_started == 2  # UserPromptSubmit + Stop
+    holds = _events(logs, "claude.hook.pending_hold")
+    assert len(holds) == 1  # once per hold, not per poll
+    assert holds[0]["hook_names"] == ["Stop"]
+    assert holds[0]["log_level"] == "info"
+    assert _events(logs, "claude.live_session.async_hook_killed") == []
+    assert _events(logs, "claude.live_session.close_grace_expired") == []
+    assert runner.current_stream.proc_returncode == 0
+    assert not any(isinstance(e, TurnEvent) for e in events)
+    # Hooks are not background tasks: nothing in the task map.
+    assert state.tasks == {}
+
+
+async def test_812_plain_async_hooks_do_not_hold_past_their_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live regression (CLI 2.1.285, ``moshi-hook`` ``async: true`` on
+    UserPromptSubmit + Stop): the CLI withholds a plain async hook's
+    ``hook_response`` while the session is idle — it lands only at the next
+    turn or at teardown — so waiting for it held every session to the
+    630 s bound. Once no hook process is left, the stragglers are deferred
+    and the idle close proceeds at the idle grace; the asyncRewake hook
+    alongside still holds until it reports back."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch, async_hook_max_hold=5.0)
+    started = anyio.current_time()
+    with capture_logs() as logs:
+        runner, events = await _run(
+            "async_hook_post_result_response", wake_s=1.0, timeout=15
+        )
+    elapsed = anyio.current_time() - started
+    state = _engine_state(runner)
+    holds = _events(logs, "claude.hook.pending_hold")
+    assert len(holds) == 1
+    assert sorted(holds[0]["hook_names"]) == ["Stop", "Stop", "UserPromptSubmit"]
+    released = _events(logs, "claude.hook.hold_released")
+    assert len(released) == 1
+    # All or nothing: released only once no hook process is left.
+    assert released[0]["reason"] == "no_hook_process"
+    assert sorted(released[0]["hook_ids"]) == ["h-stop-b", "h-ups-b"]
+    closed = _events(logs, "claude.live_session.stdin_closed")
+    assert len(closed) == 1 and closed[0]["reason"] == "idle_no_tasks"
+    assert logs.index(holds[0]) < logs.index(released[0]) < logs.index(closed[0])
+    assert state.live_close_reason == "idle_no_tasks"
+    # The rewake hook held (1 s), no hook process for the 1 s settle, then
+    # the plain 0.3 s idle grace — well short of the 5 s bound.
+    assert 2.0 <= elapsed < 4.5
+    assert _events(logs, "claude.hook.hold_expired") == []
+    assert _events(logs, "claude.live_session.async_hook_killed") == []
+    assert _events(logs, "claude.live_session.close_grace_expired") == []
+    # The withheld responses arrived at teardown and paired off.
+    assert state.pending_hooks == {}
+    assert state.deferred_hooks == {}
+    assert state.expired_hooks == {}
+    assert runner.current_stream.proc_returncode == 0
+    assert not any(isinstance(e, TurnEvent) for e in events)
+
+
+async def test_812_live_hook_shell_holds_every_unpaired_hook_until_rewake(
+    monkeypatch: pytest.MonkeyPatch, quarantine: QuarantineStore
+) -> None:
+    """Live regression (CLI 2.1.285, @untether_dev_bot, 271bb96): plain
+    ``async`` UserPromptSubmit + Stop hooks (exit at once, response
+    withheld), a sync Stop hook with no visible ``<shell> -c`` answering
+    1.5 s after the result, and an ``asyncRewake`` Stop hook whose inline
+    command (no ``/hooks/``) is still running — all started in the same few
+    ms. The per-hook PID binding tied the one live shell to the sync hook,
+    released the rewake hook after 1 s, and once the sync hook answered the
+    session idled out and the rewake was lost. All or nothing: while any
+    hook shell lives nothing is released, so the rewake turn arrives."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch)
+    started = anyio.current_time()
+    with capture_logs() as logs:
+        runner, events = await _run(
+            "async_hook_live_mix_rewake", wake_s=3.0, timeout=20
+        )
+    elapsed = anyio.current_time() - started
+    state = _engine_state(runner)
+    holds = _events(logs, "claude.hook.pending_hold")
+    assert holds and sorted(holds[0]["hook_names"]) == [
+        "Stop",
+        "Stop",
+        "Stop",
+        "UserPromptSubmit",
+    ]
+    # Nothing released while the rewake hook's shell was alive.
+    for released in _events(logs, "claude.hook.hold_released"):
+        assert "h-stop-rewake" not in released["hook_ids"]
+    rewake = [
+        e
+        for e in events
+        if isinstance(e, TurnEvent)
+        and e.phase == "started"
+        and e.reason == "hook_rewake"
+    ]
+    assert len(rewake) == 1
+    finals = [e for e in events if isinstance(e, TurnEvent) and e.phase == "completed"]
+    assert [f.answer for f in finals] == ["HOOK: finding: key leak"]
+    closed = _events(logs, "claude.live_session.stdin_closed")
+    assert len(closed) == 1 and closed[0]["reason"] == "idle_no_tasks"
+    assert logs.index(holds[0]) < logs.index(closed[0])
+    # Held past the 0.3 s idle grace until the rewake (3 s after spawn).
+    assert elapsed >= 3.0
+    assert _events(logs, "claude.hook.hold_expired") == []
+    assert _events(logs, "claude.live_session.async_hook_killed") == []
+    assert _events(logs, "claude.live_session.close_grace_expired") == []
+    assert state.pending_hooks == {} and state.deferred_hooks == {}
+    assert state.expired_hooks == {}
+    assert runner.current_stream.proc_returncode == 0
+    assert not quarantine.is_quarantined("claude", SID)
+
+
+async def test_812_hold_expiry_counts_live_hook_processes_not_candidates(
+    monkeypatch: pytest.MonkeyPatch, quarantine: QuarantineStore
+) -> None:
+    """The same mix, but the rewake hook outlives the bound. The expiry is
+    one WARN for the hold (1 live hook process among 3 unpaired
+    candidates), the close gets the hooks grace from the live shell, and
+    the user hears about ONE hook that could be either event — not "3
+    background hooks" (8cf35e5's labelling defect)."""
+    from structlog.testing import capture_logs
+
+    from untether.runner_bridge import _live_closing_notice
+
+    _settings(monkeypatch, async_hook_max_hold=2.5)
+    # The CLI outwaits the plain grace but not the hooks grace... then some:
+    # force the grace to expire so the log shows which one applied.
+    os.environ["FAKE_CLAUDE_REWAKE_WAIT_S"] = "6"
+    notices, subscribe = _hook_notices()
+    with capture_logs() as logs:
+        runner, _ = await _run(
+            "async_hook_live_mix_running", on_event=subscribe, timeout=25
+        )
+    state = _engine_state(runner)
+    assert _events(logs, "claude.hook.hold_released") == []
+    expired = _events(logs, "claude.hook.hold_expired")
+    assert len(expired) == 1
+    assert expired[0]["log_level"] == "warning"
+    assert expired[0]["live_hook_processes"] == 1
+    assert expired[0]["pending_hooks"] == 3
+    assert expired[0]["hook_events"] == ["Stop", "UserPromptSubmit"]
+    assert expired[0]["held_s"] >= expired[0]["max_hold_s"] == 2.5
+    closed = _events(logs, "claude.live_session.stdin_closed")
+    assert len(closed) == 1 and closed[0]["reason"] == "idle_no_tasks"
+    killed = _events(logs, "claude.live_session.async_hook_killed")
+    assert len(killed) == 1
+    assert killed[0]["log_level"] == "warning"
+    assert killed[0]["hook_count"] == 1
+    assert killed[0]["live_hook_processes"] == 1
+    assert killed[0]["hook_events"] == ["Stop", "UserPromptSubmit"]
+    assert sorted(killed[0]["hook_ids"]) == ["h-stop-plain", "h-stop-rewake", "h-ups"]
+    assert "candidates" in killed[0]["note"]
+    grace = _events(logs, "claude.live_session.close_grace_expired")
+    assert len(grace) == 1
+    assert grace[0]["grace_s"] == runner._live_close_grace_hooks_s == 1.6
+    assert (
+        logs.index(expired[0])
+        < logs.index(closed[0])
+        < logs.index(killed[0])
+        < logs.index(grace[0])
+    )
+    payloads = [p for kind, p in notices if kind == "closing"]
+    assert len(payloads) == 1
+    assert payloads[0]["hooks"] == ["Stop", "UserPromptSubmit"]
+    assert payloads[0]["hook_count"] == 1
+    assert _live_closing_notice(
+        payloads[0]["reason"], [], payloads[0]["hooks"], payloads[0]["hook_count"]
+    ) == (
+        "\N{HOURGLASS WITH FLOWING SAND} Closing session — a background hook "
+        "(Stop or UserPromptSubmit) was still running; its feedback wasn't "
+        "delivered."
+    )
+    assert state.pending_hooks == {}
+    # A clean idle close overrunning its grace is not quarantined (#791).
+    assert not quarantine.is_quarantined("claude", SID)
+
+
+async def test_812_execd_hook_command_is_held_until_its_rewake(
+    monkeypatch: pytest.MonkeyPatch, quarantine: QuarantineStore
+) -> None:
+    """macOS regression (033ca86): ``/bin/sh`` is bash there, and bash execs
+    ``sh -c '<single command>'`` — the security-guidance asyncRewake Stop
+    hook (``bash …/sg-python.sh …``) runs with no ``<shell> -c`` left. Only
+    counting shells, the hold saw no hook process, released at ~1 s and the
+    session idled out: rewake lost. Any non-baseline CLI child counts now."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch)
+    started = anyio.current_time()
+    with capture_logs() as logs:
+        runner, events = await _run("async_hook_exec_rewake", wake_s=3.0, timeout=20)
+    elapsed = anyio.current_time() - started
+    state = _engine_state(runner)
+    for released in _events(logs, "claude.hook.hold_released"):
+        assert "h-stop-rewake" not in released["hook_ids"]
+    rewake = [
+        e
+        for e in events
+        if isinstance(e, TurnEvent)
+        and e.phase == "started"
+        and e.reason == "hook_rewake"
+    ]
+    assert len(rewake) == 1
+    finals = [e for e in events if isinstance(e, TurnEvent) and e.phase == "completed"]
+    assert [f.answer for f in finals] == ["HOOK: finding: key leak"]
+    assert elapsed >= 3.0
+    assert _events(logs, "claude.live_session.async_hook_killed") == []
+    assert _events(logs, "claude.live_session.close_grace_expired") == []
+    assert state.pending_hooks == {} and state.deferred_hooks == {}
+    assert runner.current_stream.proc_returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("scenario", "hook_id"),
+    [
+        # #812 review 2: UserPromptSubmit's hook_started precedes
+        # system/init, so an exec'd asyncRewake UPS hook is still alive when
+        # the baseline is taken — it used to be baselined (never evidence)
+        # and released at ~1 s, losing the rewake.
+        ("async_hook_ups_rewake", "h-ups-rewake"),
+        # #812 review 3: a hook whose argv looks like an MCP server
+        # (``… mcp-scan``) used to be exempt as a "late service".
+        ("async_hook_service_named_rewake", "h-stop-rewake"),
+    ],
+)
+async def test_812_hook_that_looks_exempt_is_held_until_its_rewake(
+    monkeypatch: pytest.MonkeyPatch,
+    quarantine: QuarantineStore,
+    scenario: str,
+    hook_id: str,
+) -> None:
+    """Hooks are spawned detached (their own process group): neither the
+    init baseline nor the MCP/LSP-name heuristic may exempt one."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch)
+    started = anyio.current_time()
+    with capture_logs() as logs:
+        runner, events = await _run(scenario, wake_s=3.0, timeout=20)
+    elapsed = anyio.current_time() - started
+    state = _engine_state(runner)
+    for released in _events(logs, "claude.hook.hold_released"):
+        assert hook_id not in released["hook_ids"]
+    rewake = [
+        e
+        for e in events
+        if isinstance(e, TurnEvent)
+        and e.phase == "started"
+        and e.reason == "hook_rewake"
+    ]
+    assert len(rewake) == 1
+    finals = [e for e in events if isinstance(e, TurnEvent) and e.phase == "completed"]
+    assert [f.answer for f in finals] == ["HOOK: finding: key leak"]
+    assert elapsed >= 3.0
+    assert _events(logs, "claude.live_session.async_hook_killed") == []
+    assert state.pending_hooks == {} and state.deferred_hooks == {}
+    assert runner.current_stream.proc_returncode == 0
+
+
+async def test_812_mcp_like_children_never_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long-lived child present at ``system/init`` (an MCP server, the
+    session baseline — one behind a non-exec'ing ``sh -c``, #812 review 4)
+    and an MCP-looking child started later (a reconnect) are not hook
+    evidence: the finished plain async hooks are released on the normal
+    settle and the session idles out, far inside the bound. (A baselined
+    ``sh -c`` used to count forever: a hold to the bound and a false
+    "feedback wasn't delivered" notice on every session.)"""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch, async_hook_max_hold=8.0)
+    started = anyio.current_time()
+    with capture_logs() as logs:
+        runner, _ = await _run("async_hook_with_services", timeout=20)
+    elapsed = anyio.current_time() - started
+    state = _engine_state(runner)
+    assert state.cli_baseline_children  # the pre-init service was recorded
+    released = _events(logs, "claude.hook.hold_released")
+    assert len(released) == 1 and released[0]["reason"] == "no_hook_process"
+    assert sorted(released[0]["hook_ids"]) == ["h-stop-plain", "h-ups"]
+    closed = _events(logs, "claude.live_session.stdin_closed")
+    assert len(closed) == 1 and closed[0]["reason"] == "idle_no_tasks"
+    assert elapsed < 5.0
+    assert _events(logs, "claude.hook.hold_expired") == []
+    assert _events(logs, "claude.live_session.async_hook_killed") == []
+    assert _events(logs, "claude.live_session.hook_process_at_close") == []
+    assert _events(logs, "claude.live_session.close_grace_expired") == []
+
+
+async def test_812_close_with_no_hook_process_names_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N = 0 at close: unpaired candidates but no live hook process (and an
+    idle scan too slow to have released them) → no async_hook_killed, no
+    hooks notice."""
+    from structlog.testing import capture_logs
+
+    state = ClaudeStreamState()
+    state.completed_turns = 1
+    state.turn_open = False
+    # Too young to release, so they stay candidates at the close.
+    now = time.monotonic()
+    for hook_id, event in (("h-ups", "UserPromptSubmit"), ("h-stop", "Stop")):
+        state.pending_hooks[hook_id] = claude_mod.PendingHook(
+            hook_id=hook_id, name=event, event=event, started_at=now, turn=1
+        )
+
+    class _Pipe:
+        async def aclose(self) -> None:
+            pass
+
+    async def no_shells(state: Any, pid: Any) -> list[int]:
+        return []
+
+    monkeypatch.setattr(claude_mod, "_hook_processes", no_shells)
+    sid = "sess-812-no-proc"
+    claude_mod._LIVE_SESSIONS[sid] = LiveSession(
+        session_id=sid, state=state, stdin=_Pipe(), pid=4242
+    )
+    notices: list[dict] = []
+    add_live_session_listener(sid, lambda kind, p: notices.append(p))
+    try:
+        with capture_logs() as logs:
+            assert await close_live_session(sid, "idle_no_tasks") is True
+        live = claude_mod._LIVE_SESSIONS[sid]
+        assert live.close_hooks == [] and live.close_hook_count == 0
+        assert live.close_hook_procs == 0
+    finally:
+        claude_mod._LIVE_SESSIONS.pop(sid, None)
+    assert _events(logs, "claude.live_session.async_hook_killed") == []
+    assert notices == []
+
+
+async def test_812_cancel_does_not_report_finished_plain_async_hooks_killed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/cancel before the lifecycle's next scan: plain async hooks whose
+    process already exited are not "killed" — the close re-checks the
+    process table itself (their withheld responses land at teardown)."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch)
+    # The lifecycle never polls in time: only the close-time check can tell.
+    monkeypatch.setitem(_TIMINGS, "_live_poll_s", 30.0)
+
+    completed = anyio.Event()
+    result: list[Any] = []
+
+    async def note_result(evt: Any) -> None:
+        if isinstance(evt, CompletedEvent):
+            completed.set()
+
+    async def drive() -> None:
+        result.append(
+            await _run(
+                "async_hook_post_result_response",
+                wake_s=1.0,
+                timeout=15,
+                on_event=note_result,
+            )
+        )
+
+    async def cancel_later() -> None:
+        await completed.wait()
+        await anyio.sleep(1.4)  # the rewake hook (1 s) has reported back
+        assert await close_live_session(SID, "cancel") is True
+
+    with capture_logs() as logs:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(drive)
+            tg.start_soon(cancel_later)
+    runner, _ = result[0]
+    state = _engine_state(runner)
+    assert state.live_close_reason == "cancel"
+    assert _events(logs, "claude.live_session.async_hook_killed") == []
+    assert state.pending_hooks == {} and state.deferred_hooks == {}
+
+
+async def test_812_hook_hold_expiry_logs_async_hook_killed(
+    monkeypatch: pytest.MonkeyPatch, quarantine: QuarantineStore
+) -> None:
+    """Bound variant: a hook that never reports back holds only
+    ``async_hook_max_hold``; the close then says loudly what it cut short."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch, async_hook_max_hold=0.6)
+    notices, subscribe = _hook_notices()
+    with capture_logs() as logs:
+        runner, _ = await _run("async_hook_no_response", on_event=subscribe)
+    state = _engine_state(runner)
+    assert state.live_close_reason == "idle_no_tasks"
+    hold = _events(logs, "claude.hook.pending_hold")
+    expired = _events(logs, "claude.hook.hold_expired")
+    killed = _events(logs, "claude.live_session.async_hook_killed")
+    assert len(hold) == 1 and len(expired) == 1 and len(killed) == 1
+    assert expired[0]["log_level"] == "warning"
+    assert expired[0]["hook_events"] == ["Stop"]
+    assert expired[0]["live_hook_processes"] == 1
+    assert killed[0]["log_level"] == "warning"
+    assert killed[0]["hook_count"] == 1
+    assert killed[0]["source"] == "stream"
+    assert killed[0]["close_reason"] == "idle_no_tasks"
+    assert killed[0]["hook_events"] == ["Stop"]
+    assert logs.index(hold[0]) < logs.index(expired[0]) < logs.index(killed[0])
+    # The user hears about it even on a routine idle close.
+    assert notices and notices[0][0] == "closing"
+    assert notices[0][1]["hooks"] == ["Stop"]
+    assert notices[0][1]["hook_count"] == 1
+    assert notices[0][1]["reason"] == "idle_no_tasks"
+    # The CLI's own asyncRewake wait fits inside the stretched grace, so it
+    # exits by itself: no signal, no quarantine.
+    assert _events(logs, "claude.live_session.close_grace_expired") == []
+    assert runner.current_stream.proc_returncode == 0
+    assert not quarantine.is_quarantined("claude", SID)
+
+
+async def test_812_hooks_child_extends_grace_to_35s(
+    monkeypatch: pytest.MonkeyPatch, quarantine: QuarantineStore
+) -> None:
+    """Fallback (no hook frames — flag off or CLI too old): a hook script
+    found under the CLI at close stretches the grace to the hooks value."""
+    from structlog.testing import capture_logs
+
+    assert ClaudeRunner()._live_close_grace_hooks_s == 35.0  # CLI 30 s + 5 s
+    _settings(monkeypatch)
+    scanned: list[list[int]] = []
+
+    def fake_scan(child_pids: Any) -> list[str]:
+        scanned.append(list(child_pids))
+        return ["security_reminder_hook.py"]
+
+    monkeypatch.setattr(claude_mod, "_scan_hook_children", fake_scan)
+    notices, subscribe = _hook_notices()
+    with capture_logs() as logs:
+        runner, _ = await _run("ignore_eof", on_event=subscribe)
+    assert scanned
+    killed = _events(logs, "claude.live_session.async_hook_killed")
+    assert len(killed) == 1
+    assert killed[0]["source"] == "proc"
+    assert killed[0]["hook_names"] == ["security_reminder_hook.py"]
+    assert killed[0]["log_level"] == "warning"
+    expired = _events(logs, "claude.live_session.close_grace_expired")
+    assert len(expired) == 1
+    assert expired[0]["grace_s"] == runner._live_close_grace_hooks_s == 1.6
+    assert notices and notices[0][1]["hooks"] == ["security_reminder_hook.py"]
+
+
+async def test_812_no_hook_evidence_keeps_the_plain_grace(
+    monkeypatch: pytest.MonkeyPatch, quarantine: QuarantineStore
+) -> None:
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch)
+    monkeypatch.setattr(claude_mod, "_scan_hook_children", lambda pids: [])
+    with capture_logs() as logs:
+        runner, _ = await _run("ignore_eof")
+    expired = _events(logs, "claude.live_session.close_grace_expired")
+    assert expired[0]["grace_s"] == runner._live_close_grace_s == 0.8
+    assert _events(logs, "claude.live_session.async_hook_killed") == []
+
+
+async def test_812_kill_switch_closes_at_idle_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``hold_for_async_hooks = false`` restores today's behaviour: the idle
+    close lands on the plain grace and the pending rewake is lost (P5-B) —
+    but now it is logged."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch, hold_for_async_hooks=False)
+    started = anyio.current_time()
+    with capture_logs() as logs:
+        runner, events = await _run("async_hook_success", wake_s=5)
+    assert anyio.current_time() - started < 4
+    state = _engine_state(runner)
+    assert state.live_close_reason == "idle_no_tasks"
+    assert _events(logs, "claude.hook.pending_hold") == []
+    assert "h-stop" in state.pending_hooks  # never answered (dropped by the CLI)
+    killed = _events(logs, "claude.live_session.async_hook_killed")
+    assert len(killed) == 1 and killed[0]["source"] == "stream"
+    assert not any(isinstance(e, TurnEvent) for e in events)
+
+
+async def test_812_plain_async_hook_cancelled_on_close_logs_info(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch, hold_for_async_hooks=False)
+    with capture_logs() as logs:
+        runner, _ = await _run("plain_async_cancelled_on_eof")
+    cancelled = _events(logs, "claude.hook.cancelled")
+    assert len(cancelled) == 1
+    assert cancelled[0]["log_level"] == "info"
+    assert cancelled[0]["hook_event"] == "PostToolUse"
+    assert _engine_state(runner).pending_hooks == {}
+
+
+async def test_812_user_close_over_pending_hook_logs_info_without_hook_notice() -> None:
+    """/cancel, /new, drain: cutting a hook short is expected — INFO, and no
+    extra hooks notice (the user-initiated close has its own)."""
+    from structlog.testing import capture_logs
+
+    class _Pipe:
+        async def aclose(self) -> None:
+            pass
+
+    state = ClaudeStreamState()
+    state.completed_turns = 1
+    state.turn_open = False
+    state.pending_hooks["h1"] = claude_mod.PendingHook(
+        hook_id="h1", name="Stop", event="Stop", started_at=0.0, turn=1
+    )
+    sid = "sess-812-user-close"
+    claude_mod._LIVE_SESSIONS[sid] = LiveSession(
+        session_id=sid, state=state, stdin=_Pipe()
+    )
+    notices: list[dict] = []
+    add_live_session_listener(sid, lambda kind, p: notices.append(p))
+    try:
+        with capture_logs() as logs:
+            assert await close_live_session(sid, "cancel") is True
+    finally:
+        claude_mod._LIVE_SESSIONS.pop(sid, None)
+    killed = _events(logs, "claude.live_session.async_hook_killed")
+    assert killed and killed[0]["log_level"] == "info"
+    assert killed[0]["close_reason"] == "cancel"
+    assert notices == []  # notice=False and a user close: nothing extra

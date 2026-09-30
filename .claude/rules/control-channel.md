@@ -128,6 +128,71 @@ Denial with message:
 
 Stdin is written from several tasks (control responses, the auto-approve/deny/catalog drains, follow-up injection, the live-session close), so every write goes through `_locked_send` (a per-pipe `anyio.Lock`). `write_user_message(session_id, text, command_uuid=…)` writes a stream-json `user` line with `uuid` — the CLI echoes it as `command_lifecycle.command_uuid`, which attributes the turn. Never write a follow-up mid-turn outside steer mode: `inject_when_idle` waits until the session is idle (a mid-turn write is folded into the running turn). `LiveSession.lock` serialises injection against `close_live_session` (the race guard). Closing a live session closes stdin; if the CLI hasn't exited `_live_close_grace_s` (15 s) later, `_await_live_exit_or_force` logs `claude.live_session.close_grace_expired` with a proc snapshot, sends SIGINT, then SIGTERM/SIGKILL after `_live_close_sigint_grace_s` (5 s). `forced_teardown_after_result` quarantine is skipped when `LiveSession.closed_idle_clean` still holds (#791). `_SESSION_STDIN` still means "a process owns this session"; use `is_session_accepting()` to ask "can I write a follow-up into it".
 
+## Async-hook hold (#812)
+
+Live sessions also stay open while a background command hook (`async` /
+`asyncRewake`) is still running, because the CLI **drops** an `asyncRewake`
+hook's rewake once stdin has closed (`docs/findings/2026-09-29-claude-rc14-cli-surface.md` §A1).
+
+- `--include-hook-events` is added in control-channel mode when a cached
+  `claude --help` probe lists it (`claude.hook_events.probe`) and
+  `[watchdog] hold_for_async_hooks` is on; skipped if `extra_args` already has
+  it. It is **not** in `_RESERVED_FLAGS`.
+- `system/hook_*` frames pair by `hook_id` into `state.pending_hooks` (cap 256,
+  `SessionStart`/`Setup` never hold). No UntetherEvents; `runner.py` keeps them
+  out of `last_event_type` (#470 / auto-continue) but counts them as liveness.
+- `has_pending_async_hooks()` is a **sibling predicate** OR'd into
+  `_live_session_lifecycle`, never part of `has_live_background_work()` — hooks
+  must not reach footers, the #777 panel, the #592 cap or `_is_clean_idle`.
+- Bound `[watchdog] async_hook_max_hold` (630 s, 0–3600) from the **newest**
+  unpaired `hook_started` → every unpaired hook expires together, ONE
+  `claude.hook.hold_expired` WARN per hold (`live_hook_processes`,
+  `pending_hooks`, `hook_events`, `held_s`, `max_hold_s`); the hold then ends
+  even if a hook process lives.
+- The CLI withholds a plain `async` hook's `hook_response` until the next turn
+  or stdin close. Each idle tick counts **hook processes**
+  (`proc_diag.cli_children()` → `hook_evidence_children()`): any direct CLI
+  child except (a) Bash-tool shells, (b) children that started more than
+  `HOOK_START_SLACK_S` (5 s) before the oldest unpaired hook's
+  `hook_started` (the CLI emits the frame, *then* spawns the hook; compared
+  on `hook_clock()`, which counts through sleep), and (c) children **in the
+  CLI's own process group** that are in the `system/init` baseline
+  (`capture_cli_baseline()`, (pid, start time) — MCP servers) or have
+  MCP/LSP-looking argv. The CLI spawns every command hook `detached` (own
+  process group; drift-tested), so a hook alive at init, a baselined PID
+  reused later, or a hook named like `mcp-scan` is never exempt, while a
+  non-detached `sh -c`-wrapped MCP server is. A `/hooks/` token counts
+  unless (b). Never rely on `sh -c` alone: bash (macOS `/bin/sh`) and zsh
+  exec a single hook command (security-guidance's `bash …/sg-python.sh …`).
+  Children come from `/proc/<pid>/task/*/children`, falling back to a
+  /proc ppid scan when that file doesn't exist (no `CONFIG_PROC_CHILDREN`) —
+  never read "no children file" as "no hook"; a forking shell/`env` wrapper
+  around the CLI is resolved to the CLI (Untether's own `env -i` execs).
+  **All-or-nothing — never bind a process to a hook** (frames carry no pid;
+  a turn's hooks start in the same ms; the per-hook binding in 271bb96
+  released a live `asyncRewake` hook and lost its rewake): any hook process
+  alive → every unpaired hook holds; none for 1 s →
+  `release_settled_async_hooks()` releases them all
+  (`claude.hook.hold_released reason=no_hook_process`). Unreadable process
+  table → keep the bounded hold. `close_live_session` re-checks.
+- Labels never claim more hooks than live hook processes: N = live ones
+  (capped by the unpaired candidates; the candidate count only when the table
+  is unreadable), events = the distinct candidate events. N = 0 at a close →
+  no `async_hook_killed`, no notice.
+- Idle exit-2 `hook_response` → next turn `reason="hook_rewake"` (always
+  pushed, never folded); a turn already open is confirmed at its result by
+  `origin.kind == "task-notification"`.
+- A close with a hook still evident (unpaired hooks with a live shell, a
+  `/hooks/` argv child, or any live hook process — process evidence) uses
+  `_live_close_grace_hooks_s` (35 s = the CLI's 30 s rewake wait + 5 s)
+  instead of 15 s, logs `claude.live_session.async_hook_killed` (`hook_count`,
+  `live_hook_processes`, `hook_events`, candidate `hook_names`/`hook_ids` +
+  `note`; INFO for `cancel`/`new`/`drain`/`options_changed`, WARN otherwise)
+  and, on automatic closes only, sends `⏳ Closing session — a background hook
+  (Stop or UserPromptSubmit) was still running; its feedback wasn't
+  delivered.` (`N background hooks (…)` when N ≥ 2).
+- Timing knobs are slots-dataclass fields: set them on the instance in tests.
+
 ## Parent-initiated control_requests (Untether → Claude)
 
 Untether can also *initiate* control_requests on stdin, following the wire format documented in Anthropic's [`claude-agent-sdk-python`](https://github.com/anthropics/claude-agent-sdk-python). Subtypes accepted by Claude Code include: `mcp_status`, `mcp_reconnect` (`serverName`), `mcp_toggle` (`serverName` + `enabled`), `set_permission_mode`, `interrupt`, `set_model`, `stop_task` (`task_id`).

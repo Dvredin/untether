@@ -111,6 +111,16 @@ class StreamAssistantMessageBody(msgspec.Struct, forbid_unknown_fields=False):
     content: list[StreamContentBlock]
     model: str
     error: str | None = None
+    # #814: API message id — one API response may span several stream
+    # frames, so refusal counting dedupes on it.
+    id: str | None = None
+    # #814: ``"refusal"`` when Anthropic's safeguards stopped the response;
+    # ``stop_details`` then carries ``{type:"refusal", category,
+    # explanation}`` (category ∈ cyber / bio / frontier_llm /
+    # reasoning_extraction / general_harms, or null). Passed through
+    # verbatim by the CLI's headless emitter.
+    stop_reason: str | None = None
+    stop_details: dict[str, Any] | None = None
 
 
 class StreamUserMessage(
@@ -190,6 +200,42 @@ class StreamSystemMessage(
     error_status: int | None = None
     error: Any = None
     no_response: ApiRetryNoResponse | None = None
+    # #814 ``informational`` (SDKInformationalMessage): a text banner —
+    # ``content`` + ``level`` (info / notice / suggestion / warning),
+    # optional ``tool_use_id`` / ``prevent_continuation``. The safeguard
+    # notice is ``"<Model>'s safeguards stopped the response above ·
+    # continuing once with that noted"`` at level notice.
+    # ``model_refusal_fallback`` / ``model_refusal_no_fallback`` /
+    # ``model_fallback`` (undocumented, CLI 2.1.285) carry
+    # ``original_model`` / ``fallback_model`` / ``api_refusal_*`` plus
+    # ``trigger`` / ``direction`` / ``scope`` enums. All typed Any: ~40
+    # system subtypes share this struct and their shapes are unverified,
+    # so a type clash must never drop the whole line as
+    # ``jsonl.msgspec.invalid`` — the runner normalises on read.
+    content: Any = None
+    level: Any = None
+    prevent_continuation: Any = None
+    original_model: Any = None
+    fallback_model: Any = None
+    api_refusal_category: Any = None
+    api_refusal_explanation: Any = None
+    trigger: Any = None
+    direction: Any = None
+    scope: Any = None
+    # #812 ``--include-hook-events`` (CLI 2.1.284): ``hook_started`` /
+    # ``hook_progress`` / ``hook_response`` carry ``hook_id`` (pairs started
+    # with response), ``hook_name`` (e.g. ``Stop`` / ``SessionStart:startup``)
+    # and ``hook_event``; ``hook_response`` adds ``outcome``
+    # (success / error / cancelled) and an optional ``exit_code`` (2 =
+    # blocking error, the asyncRewake wake signal). ``stdout`` / ``stderr``
+    # / ``output`` are deliberately NOT declared, so msgspec skips them and
+    # hook output is never held in memory. All typed Any (hook_id included —
+    # the runner normalises on read) for the same drift reason as above.
+    hook_id: Any = None
+    hook_name: Any = None
+    hook_event: Any = None
+    outcome: Any = None
+    exit_code: Any = None
 
 
 class StreamResultMessage(
@@ -205,6 +251,23 @@ class StreamResultMessage(
     usage: dict[str, Any] | None = None
     result: str | None = None
     structured_output: Any = None
+    # #806: why the turn ended. ``aborted_streaming`` / ``aborted_tools``
+    # mean the turn was interrupted (see CLAUDE_ABORTED_TERMINAL_REASONS);
+    # the subtype is then usually ``success``, sometimes
+    # ``error_during_execution`` — classify on this field, never on subtype.
+    terminal_reason: str | None = None
+    # What started the turn (user / task notification / …); read by #812.
+    # Any, not dict: a non-object origin must not drop the result line —
+    # readers check ``isinstance(origin, dict)`` first.
+    origin: Any = None
+    stop_reason: Any = None
+
+
+# #806: result ``terminal_reason`` values that mean the turn was cancelled
+# (an interrupt), not that it failed.
+CLAUDE_ABORTED_TERMINAL_REASONS: frozenset[str] = frozenset(
+    {"aborted_streaming", "aborted_tools"}
+)
 
 
 class StreamEventMessage(

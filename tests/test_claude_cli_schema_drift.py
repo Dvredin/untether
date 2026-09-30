@@ -18,14 +18,18 @@ from collections.abc import Iterator
 
 import pytest
 
+from untether.background_status import COLLECTION_TOOLS
+from untether.runners.claude import _SAFEGUARD_NOTICE_MODEL_RE, _SAFEGUARD_NOTICE_RE
+from untether.runners.claude import _probe_cli_help as _real_probe_cli_help
 from untether.schemas.claude import (
+    CLAUDE_ABORTED_TERMINAL_REASONS,
     CLAUDE_OVERAGE_STATUSES,
     CLAUDE_RATE_LIMIT_STATUSES,
     CLAUDE_RATE_LIMIT_TYPES,
 )
 
 # Last CLI these constants were re-derived against.
-PROBED_CLI_VERSION = "2.1.283"
+PROBED_CLI_VERSION = "2.1.285"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("claude") is None, reason="claude CLI not installed"
@@ -155,3 +159,238 @@ def test_api_retry_subtype_and_counter_keys_present(cli_blob: mmap.mmap) -> None
         f"system/api_retry schema lost keys {missing} "
         f"(last green on CLI {PROBED_CLI_VERSION})"
     )
+
+
+# ---------------------------------------------------------------------------
+# #814 — safeguard stops (findings 2026-09-29 §B)
+# ---------------------------------------------------------------------------
+
+
+def _schema_window(blob: mmap.mmap, subtype: str, size: int = 4000) -> bytes:
+    """The zod object following ``subtype:<fn>("<subtype>")``, with its
+    ``.describe("…")`` strings stripped, up to its ``session_id`` key."""
+    m = re.search(rb'subtype:\w{1,4}\("' + subtype.encode() + rb'"\)', blob)
+    if m is None:
+        pytest.fail(
+            f'installed CLI no longer declares system subtype "{subtype}" '
+            f"(last green on CLI {PROBED_CLI_VERSION})"
+        )
+    window = re.sub(
+        rb'\.describe\((?:"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')\)',
+        b"",
+        blob[m.end() : m.end() + size],
+    )
+    return window.split(b"session_id:", 1)[0]
+
+
+def test_informational_notice_present(cli_blob: mmap.mmap) -> None:
+    """``system/informational`` keeps ``content`` + the ``level`` enum the
+    runner branches on, and the safeguard notice text still matches the
+    runner's patterns."""
+    window = _schema_window(cli_blob, "informational")
+    assert b"content:" in window
+    level = _require(
+        _zod_enum(window, rb"level:\w{1,4}\(\[([^\]]*)\]\)"), "informational.level"
+    )
+    assert set(level) == {"info", "notice", "suggestion", "warning"}, (
+        f"informational.level is now {level} — review the row/log-only split "
+        "in _translate_informational (D-15)"
+    )
+    m = re.search(
+        rb"`\$\{\w{1,4}\(\w{1,4}\)\}('s safeguards stopped the response above"
+        rb"[^`]{0,80})`",
+        cli_blob,
+    )
+    if m is None:
+        pytest.fail(
+            "the safeguard notice text moved — _SAFEGUARD_NOTICE_RE no longer "
+            f"sees it (last green on CLI {PROBED_CLI_VERSION})"
+        )
+    notice = "Opus 5.5" + m.group(1).decode("utf-8", "replace")
+    assert "continuing once" in notice
+    assert _SAFEGUARD_NOTICE_RE.search(notice)
+    model = _SAFEGUARD_NOTICE_MODEL_RE.match(notice)
+    assert model is not None and model.group(1) == "Opus 5.5"
+
+
+def test_refusal_stop_details_present(cli_blob: mmap.mmap) -> None:
+    """The CLI still reads ``stop_reason === "refusal"`` and
+    ``stop_details.category`` off the API message it passes through."""
+    assert re.search(rb'\.stop_reason==="refusal"', cli_blob), (
+        'no `stop_reason==="refusal"` check left in the installed CLI '
+        f"(last green on CLI {PROBED_CLI_VERSION})"
+    )
+    assert re.search(rb"stop_details\??\.category", cli_blob), (
+        "stop_details.category no longer read by the installed CLI"
+    )
+
+
+@pytest.mark.parametrize(
+    ("subtype", "keys"),
+    [
+        (
+            "model_refusal_fallback",
+            ("original_model", "fallback_model", "api_refusal_category", "content"),
+        ),
+        (
+            "model_refusal_no_fallback",
+            ("original_model", "api_refusal_category", "content"),
+        ),
+        ("model_fallback", ("original_model", "fallback_model", "trigger")),
+    ],
+)
+def test_model_refusal_subtypes_present(
+    cli_blob: mmap.mmap, subtype: str, keys: tuple[str, ...]
+) -> None:
+    """The undocumented refusal/fallback subtypes keep the keys the #814
+    handlers read."""
+    window = _schema_window(cli_blob, subtype)
+    missing = [k for k in keys if f"{k}:".encode() not in window]
+    assert not missing, (
+        f"system/{subtype} schema lost keys {missing} "
+        f"(last green on CLI {PROBED_CLI_VERSION})"
+    )
+
+
+def test_terminal_reason_aborted_values_present(cli_blob: mmap.mmap) -> None:
+    """#806 (phase 03): the CLI's own "was this turn aborted?" predicate
+    names exactly CLAUDE_ABORTED_TERMINAL_REASONS."""
+    m = re.search(
+        rb'function \w{1,4}\((\w)\)\{return ((?:\1==="aborted_[a-z_]+"(?:\|\|)?)+)\}',
+        cli_blob,
+    )
+    if m is None:
+        pytest.fail(
+            "the CLI's aborted-terminal predicate moved — re-derive the probe "
+            f"(last green on CLI {PROBED_CLI_VERSION})"
+        )
+    declared = {v.decode() for v in re.findall(rb'"([^"]+)"', m.group(2))}
+    assert declared == set(CLAUDE_ABORTED_TERMINAL_REASONS), (
+        f"installed CLI treats {sorted(declared)} as aborted; "
+        f"CLAUDE_ABORTED_TERMINAL_REASONS holds "
+        f"{sorted(CLAUDE_ABORTED_TERMINAL_REASONS)}"
+    )
+
+
+def test_taskoutput_in_removed_tools(cli_blob: mmap.mmap) -> None:
+    """#813 (phase 06): ``TaskOutput`` is still in the CLI's removed-tools
+    list, so a wake turn collects a task's output with ``Read`` — which
+    COLLECTION_TOOLS must keep treating as read-only."""
+    m = re.search(rb'\[((?:"[A-Za-z]+",)*"TaskOutput"(?:,"[A-Za-z]+")*)\]', cli_blob)
+    if m is None:
+        pytest.fail(
+            "TaskOutput is no longer in a removed-tools list in the installed "
+            f"CLI (last green on CLI {PROBED_CLI_VERSION}) — if it came back, "
+            "re-check COLLECTION_TOOLS"
+        )
+    removed = {v.decode() for v in re.findall(rb'"([^"]+)"', m.group(1))}
+    assert {"TaskOutput", "BashOutput", "AgentOutput"} <= removed
+    assert "Read" in COLLECTION_TOOLS
+
+
+def test_hook_event_flag_and_subtypes_present(cli_blob: mmap.mmap) -> None:
+    """#812: ``--include-hook-events`` is still an option, the three hook
+    lifecycle frames still carry the keys the runner pairs on, the
+    ``outcome`` enum is unchanged, and a CLI-started turn's result origin is
+    still ``task-notification`` (rewake retro-attribution)."""
+    if cli_blob.find(b'.option("--include-hook-events"') < 0:
+        pytest.fail(
+            "--include-hook-events is no longer a CLI option — the #812 hold "
+            "can't see background hooks; the --help probe will stop passing "
+            f"it (last green on CLI {PROBED_CLI_VERSION})"
+        )
+    started = re.search(
+        rb'subtype:"hook_started",hook_id:\w{1,4},hook_name:\w{1,4},'
+        rb"hook_event:\w{1,4}",
+        cli_blob,
+    )
+    progress = cli_blob.find(b'subtype:"hook_progress",hook_id:')
+    # The emitter's object literal nests ``{exit_code:…}``, so take a
+    # bounded window rather than matching braces.
+    response = re.search(rb'subtype:"hook_response",hook_id:[^;]{0,300}', cli_blob)
+    if started is None or progress < 0 or response is None:
+        pytest.fail(
+            "the hook_started / hook_progress / hook_response emitters moved "
+            "— re-derive _apply_hook_event's pairing (last green on CLI "
+            f"{PROBED_CLI_VERSION})"
+        )
+    body = response.group(0)
+    for key in (b"hook_name:", b"hook_event:", b"exit_code:", b"outcome:"):
+        assert key in body, f"hook_response lost {key!r}"
+    outcome = _require(
+        _zod_enum(cli_blob, rb'outcome:\w{1,4}\((\[[^\]]*"cancelled"[^\]]*\])\)'),
+        "hook_response.outcome",
+    )
+    assert set(outcome) == {"success", "error", "cancelled"}, (
+        f"hook_response.outcome is now {outcome} — review the rewake / "
+        "cancelled branches in _apply_hook_event"
+    )
+    if re.search(rb'kind:\w{1,4}\("task-notification"\)', cli_blob) is None:
+        pytest.fail(
+            "result origin kind 'task-notification' moved — hook_rewake "
+            f"retro-attribution is dead code (last green on CLI {PROBED_CLI_VERSION})"
+        )
+
+
+def test_help_probe_detects_hook_events_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#812: the real ``claude --help`` probe (zero-token — no session) sees
+    the flag, so ``_build_args`` passes it. conftest stubs the probe for every
+    other test; this one restores the real one (bound at import)."""
+    from untether.runners import claude as claude_mod
+
+    monkeypatch.setattr(claude_mod, "_probe_cli_help", _real_probe_cli_help)
+    claude_mod._HOOK_EVENTS_SUPPORT.clear()
+    assert claude_mod.cli_supports_hook_events("claude") is True, (
+        "`claude --help` no longer lists --include-hook-events "
+        f"(last green on CLI {PROBED_CLI_VERSION})"
+    )
+
+
+def test_hook_started_precedes_a_detached_hook_spawn(cli_blob: mmap.mmap) -> None:
+    """#812: the hook-process evidence rests on two CLI facts — the CLI
+    emits ``hook_started`` *before* spawning the hook (so a hook's process
+    never predates its frame: ``HOOK_START_SLACK_S``), and it spawns command
+    hooks ``detached`` off Windows (own process group: the baseline and the
+    MCP/LSP-name exemptions only apply to the CLI's own group). If either
+    moves, those exemptions could release a running ``asyncRewake`` hook."""
+    emitter = re.search(
+        rb"function (\w+)\(\w+,\w+,\w+\)\{if\(!\w+\(\w+\)\)return;"
+        rb'\w+\(\{type:"system",subtype:"hook_started"',
+        cli_blob,
+    )
+    if emitter is None:
+        pytest.skip(
+            "hook_started emitter not found — re-derive the probe "
+            f"(last green on CLI {PROBED_CLI_VERSION})"
+        )
+    name = re.escape(emitter.group(1))
+    command_spawns: list[tuple[bytes, bytes]] = []
+    for call in re.finditer(
+        rb"[;,{}]" + name + rb"\(\w+,\w+,\w+\);let \w+=await (\w+)\(", cli_blob
+    ):
+        fn = re.search(
+            rb"async function " + re.escape(call.group(1)) + rb"\(", cli_blob
+        )
+        if fn is None:
+            continue
+        window = cli_blob[fn.start() : fn.start() + 12000]
+        command_spawns.extend(
+            (detached, window)
+            for detached in set(re.findall(rb"detached:(\w+)", window))
+        )
+    if not command_spawns:
+        pytest.skip(
+            "no emit-then-spawn hook call site with a spawn option found — "
+            f"re-derive the probe (last green on CLI {PROBED_CLI_VERSION})"
+        )
+    for detached, window in command_spawns:
+        assigned = re.search(rb"[,;]" + re.escape(detached) + rb"=!(\w+)[,;]", window)
+        assert assigned is not None, (
+            f"hook spawn detached:{detached.decode()} is no longer `!<windows>`"
+        )
+        windows = re.escape(assigned.group(1))
+        assert re.search(
+            windows + rb"\?\w+\(\):null;if\(" + windows + rb"&&!\w+\)throw Error\("
+            rb'`Hook "\$\{\w+\.command\}" requires bash but Git Bash',
+            window,
+        ), "hook spawn detached flag no longer keyed on the Windows/Git Bash check"

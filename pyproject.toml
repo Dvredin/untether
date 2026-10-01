@@ -2,7 +2,7 @@
 name = "untether"
 authors = [{name = "Little Bear Apps", email = "hello@littlebearapps.com"}]
 maintainers = [{name = "Little Bear Apps", email = "hello@littlebearapps.com"}]
-version = "0.35.5rc13"
+version = "0.35.5rc15"
 keywords = ["telegram", "claude-code", "codex", "opencode", "pi", "gemini-cli", "amp", "ai-agents", "coding-assistant", "remote-control", "cli-bridge"]
 description = "Run AI coding agents from your phone. Bridges Claude Code, Codex, OpenCode, and Pi to Telegram with interactive permissions, voice input, cost tracking, and live progress."
 readme = {file = "README.md", content-type = "text/markdown"}
@@ -108,6 +108,7 @@ addopts = ["--cov=untether", "--cov-branch", "--cov-report=term-missing", "--cov
 testpaths = ["tests"]
 markers = [
     "cancel_enforcement: opts a test out of the autouse #593 cancel-enforcement neutraliser",
+    "allow_network: opts a test out of the autouse #808 non-loopback network block",
 ]
 
 [tool.mutmut]

@@ -249,7 +249,7 @@ The server includes a health endpoint at `GET /health` for uptime monitoring. Wh
 Untether ships a master pause toggle ([#294](https://github.com/littlebearapps/untether/issues/294)) that gates **both** crons and webhooks at once — useful when deploying, debugging, or muting overnight without editing config:
 
 * **`/config` home page** shows a one-button toggle row at the bottom whenever triggers are configured.
-* **`/config` → `📡 Triggers`** opens a dedicated page with state, per-chat counts, and a Pause/Resume button. It also lists per-chat crons and webhooks with last-fired times.
+* **`/config` → `⏰ Triggers`** opens a dedicated page with state, per-chat counts, and a Pause/Resume button. It also lists per-chat crons and webhooks with last-fired times.
 * While paused: cron loop skips ticks, webhooks return `503 triggers paused` with `Retry-After: 60`, `/health` returns `paused: true`, and `/ping` shows `⏸ triggers paused: … (suspended)`.
 * `run_once` crons are not consumed during the pause and fire on the next matching tick after resume.
 
@@ -308,7 +308,7 @@ permission_mode = "auto"
 ```
 
 !!! warning "`auto` changed meaning in v0.35.5"
-    Before v0.35.5, `permission_mode = "auto"` meant plan mode with the plan gate auto-approved. It now selects Claude Code's own classifier-gated auto mode, which has no plan phase. Existing crons keep running but behave differently — set `"plan-auto"` to restore the previous behaviour. Untether logs a warning at startup when it sees `"auto"` in a config file.
+    Before v0.35.5, `permission_mode = "auto"` meant plan mode with the plan gate auto-approved. It now selects Claude Code's own classifier-gated auto mode, which has no plan phase. Existing crons keep running but behave differently — set `"plan-auto"` to restore the previous behaviour. Untether logs one warning at startup, and again if a config reload changes the list, naming every engine setting and cron that uses `"auto"`. It also warns at startup about crons set to `default`, `manual`, `acceptEdits` or `plan`, which wait for a tap nobody gives, and logs the same warning when a cron or webhook fires into a chat whose mode will ask for approval.
 
 !!! warning "Prompting modes wait for a tap"
     Since v0.35.5, `default`, `manual` and `acceptEdits` (what `/planmode off` sets) show Approve / Deny buttons for any tool call the mode doesn't cover ([#749](https://github.com/littlebearapps/untether/issues/749)). An unattended cron that inherits one of them will wait on that button. Set `permission_mode` on the cron to `plan-auto`, `auto`, `dontAsk` or `bypassPermissions` for hands-off runs.

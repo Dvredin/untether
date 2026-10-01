@@ -782,6 +782,35 @@ def _resolve_presenter(
     return default_presenter
 
 
+def _refresh_progress_settings(
+    presenter: Presenter, override: Presenter | None = None
+) -> Any:
+    """Push the current ``[progress]`` settings into ``presenter`` (#269).
+
+    ``override`` is a per-chat ``/verbose`` presenter built at run start: it
+    takes the refreshed values too, except the verbosity it overrides.
+    Returns the settings snapshot.
+    """
+    from .telegram.bridge import TelegramPresenter
+
+    progress_cfg = _load_progress_settings()
+    refresh = getattr(presenter, "refresh_progress_settings", None)
+    if callable(refresh):
+        try:
+            refresh(progress_cfg)
+        except Exception:  # noqa: BLE001
+            logger.debug("progress_settings.refresh_failed", exc_info=True)
+    if (
+        override is not None
+        and override is not presenter
+        and isinstance(override, TelegramPresenter)
+        and isinstance(presenter, TelegramPresenter)
+    ):
+        override._formatter.max_actions = presenter._formatter.max_actions
+        override._formatter.show_context_usage = presenter._formatter.show_context_usage
+    return progress_cfg
+
+
 # #410: schema-mismatch surfacing — promoted from one-shot per-process to
 # per-call counter so the issue-watcher actually creates an issue when API-
 # shape drift starts happening (one-shot logs only fire once per restart, so
@@ -1365,6 +1394,31 @@ def _flatten_exception_group(error: BaseException) -> list[BaseException]:
             flattened.extend(_flatten_exception_group(exc))
         return flattened
     return [error]
+
+
+async def _close_runner_events(events: object) -> None:
+    """Close a runner's event generator in the calling task.
+
+    No new cancel scope around the close: while the generator is suspended
+    at a ``yield`` inside its own task group (Claude's ``run_impl``), that
+    group's scope is still this task's current scope, so a scope opened here
+    would exit after it and anyio raises "Attempted to exit a cancel scope
+    that isn't the current tasks's current cancel scope" (rc15 integration
+    finding). Teardown under a pending cancel is the same path every
+    ``/cancel`` already takes. The task group reports the close as a group
+    of ``GeneratorExit``/cancellation, which is a clean close here.
+    """
+    aclose = getattr(events, "aclose", None)
+    if aclose is None:
+        return
+    cancel_exc = anyio.get_cancelled_exc_class()
+    try:
+        await aclose()
+    except BaseExceptionGroup as eg:
+        leaves = _flatten_exception_group(eg)
+        if not all(isinstance(e, (GeneratorExit, cancel_exc)) for e in leaves):
+            raise
+        logger.debug("runner.events_closed", leaves=len(leaves))
 
 
 _RESUME_LINE_MARKER = "\n\n\u21a9\ufe0f "  # ↩️ with variation selector
@@ -2123,6 +2177,19 @@ class ProgressEdits:
                 and diag.alive is False
                 and bool(getattr(self.stream, "did_emit_completed", False))
             ):
+                # The bridge may still be delivering a follow-up turn's final
+                # (a slow Telegram call holds the event loop off the stream).
+                # Reaping then cancels that delivery and the turn reads "the
+                # session ended before this turn finished" (rc15 integration
+                # finding). A bounded delivery ends well inside this grace,
+                # after which the stream ends on its own.
+                dead_for = (
+                    self.clock() - self._last_alive_at
+                    if self._last_alive_at is not None
+                    else None
+                )
+                if dead_for is not None and dead_for < self._REAP_DEAD_GRACE_S:
+                    continue
                 logger.info(
                     "progress_edits.reaped_after_delivery",
                     channel_id=self.channel_id,
@@ -3690,6 +3757,10 @@ class ProgressEdits:
     # deliberations.
     _STALL_THRESHOLD_APPROVAL_FIRST: float = 600.0
     _STALL_THRESHOLD_APPROVAL: float = 1800.0  # refire threshold after first
+    # How long a dead, already-answered run's process must stay dead before
+    # the #650 silent reap: longer than a bounded Telegram delivery
+    # (twice the client's 30 s message timeout) still holding the stream.
+    _REAP_DEAD_GRACE_S: float = 90.0
     _STALL_MAX_WARNINGS: int = 10  # absolute cap
     _STALL_MAX_WARNINGS_NO_PID: int = 3  # aggressive cap when pid=None + no events
     _TCP_ACTIVE_THRESHOLD: int = 20  # TCP connections above this suggest active work
@@ -4073,22 +4144,18 @@ async def run_runner_with_cancel(
                         await edits.on_event(evt)
                 finally:
                     # #614: close the runner generator in THIS task. When the
-                    # async-for is abandoned mid-body (e.g. /cancel lands
-                    # while on_completed is awaiting), the generator is left
-                    # suspended at a yield and would be finalized later by
-                    # the event loop's async-generator hook in a DIFFERENT
+                    # async-for is abandoned mid-body (e.g. a cancel lands
+                    # while a Telegram send is stalled), the generator is
+                    # left suspended at a yield and would be finalized later
+                    # by the event loop's async-generator hook in a DIFFERENT
                     # task — and run_impl's anyio task group then raises
                     # "Attempted to exit cancel scope in a different task
-                    # than it was entered in" as an unretrieved task
-                    # exception. Shielded so the pending bridge-level
-                    # cancellation can't interrupt generator teardown
-                    # (subprocess kill, registry cleanup); bounded so a
-                    # wedged teardown can't hang the bridge.
-                    aclose = getattr(events, "aclose", None)
-                    if aclose is not None:
-                        with anyio.move_on_after(30, shield=True):
-                            await aclose()
-                    runner_finished.set()
+                    # than it was entered in". The base runner's wrappers
+                    # close run_impl with ``aclosing`` so this reaches it.
+                    try:
+                        await _close_runner_events(events)
+                    finally:
+                        runner_finished.set()
                     tg.cancel_scope.cancel()
 
             async def wait_cancel(task: RunningTask) -> None:
@@ -4565,8 +4632,13 @@ class FollowupTurnRouter:
         | None = pop_followup_anchor,
         progress_for: Callable[[ActionEvent], bool] | None = None,
         deliver_cancelled: Callable[[_TurnCtx], Awaitable[None]] | None = None,
+        on_turn_started: Callable[[], None] | None = None,
     ) -> None:
         self._new_tracker = new_tracker
+        # Re-reads ``[progress]`` so a hot-reloaded toggle reaches turns of
+        # a live session, not only the next spawned run (rc15 integration
+        # finding: ``show_context_usage = false`` was ignored by follow-ups).
+        self._on_turn_started = on_turn_started
         self._create_progress = create_progress
         self._close_progress = close_progress
         self._deliver = deliver
@@ -4678,6 +4750,11 @@ class FollowupTurnRouter:
         if evt.phase == "started":
             if self.current is not None:
                 await self._finish(self.current)
+            if self._on_turn_started is not None:
+                try:
+                    self._on_turn_started()
+                except Exception:  # noqa: BLE001
+                    logger.debug("live_turn.on_started_failed", exc_info=True)
             ctx = self._open(evt)
             logger.info(
                 "live_turn.started",
@@ -5099,13 +5176,7 @@ async def handle_message(
     # apply on the next run. Per-chat /verbose overrides downstream of
     # _resolve_presenter() construct a fresh formatter from these refreshed
     # values, so the override picks up the new defaults too.
-    progress_cfg = _load_progress_settings()
-    refresh = getattr(cfg.presenter, "refresh_progress_settings", None)
-    if callable(refresh):
-        try:
-            refresh(progress_cfg)
-        except Exception:  # noqa: BLE001
-            logger.debug("progress_settings.refresh_failed", exc_info=True)
+    progress_cfg = _refresh_progress_settings(cfg.presenter)
 
     # Resolve effective presenter: check for per-chat verbose override
     effective_presenter = _resolve_presenter(cfg.presenter, incoming.channel_id)
@@ -6119,6 +6190,9 @@ async def handle_message(
             or (evt.action.kind != "note" and not is_collection_action(evt.action))
         ),
         deliver_cancelled=_deliver_turn_cancelled,
+        on_turn_started=lambda: _refresh_progress_settings(
+            cfg.presenter, effective_presenter
+        ),
     )
 
     edits.control_surface_probe = build_control_surface_probe(edits, turn_router)

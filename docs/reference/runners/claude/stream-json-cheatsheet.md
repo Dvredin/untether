@@ -53,6 +53,16 @@ Example (user tool result, array content):
 {"type":"user","session_id":"session_01","message":{"id":"msg_4","type":"message","role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":[{"type":"text","text":"Task completed"}]}]}}
 ```
 
+Example (assistant frame stopped by Anthropic's safeguards, #814 — `message.id`,
+`stop_reason` and `stop_details` are decoded since 0.35.5rc14):
+```json
+{"type":"assistant","session_id":"session_01","parent_tool_use_id":null,"message":{"id":"msg_5","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":"…"}}}
+```
+`stop_details.category` ∈ `cyber` | `bio` | `frontier_llm` | `reasoning_extraction` |
+`general_harms` | `null`. The CLI forwards the API message verbatim; one API response can
+span several frames, so Untether dedupes on `message.id`. A frame truncated by an interrupt
+carries `aborted: true` and no `stop_reason`.
+
 Optional parent field (for nested tool usage):
 ```json
 {"type":"assistant","parent_tool_use_id":"toolu_parent","session_id":"session_01", ...}
@@ -82,6 +92,17 @@ Example (error):
 ```json
 {"type":"result","subtype":"error","session_id":"session_02","total_cost_usd":0.001,"is_error":true,"duration_ms":2000,"duration_api_ms":1800,"num_turns":1,"result":""}
 ```
+
+Turn-ending fields (decoded since 0.35.5rc14, all optional):
+- `terminal_reason`: why the turn ended. `aborted_streaming` / `aborted_tools` mean it was
+  interrupted; the subtype is then usually `success`, sometimes `error_during_execution`
+  with an `[ede_diagnostic]` error, so classify a cancel on `terminal_reason`, never on
+  `subtype` / `is_error` ([#806](https://github.com/littlebearapps/untether/issues/806);
+  `CLAUDE_ABORTED_TERMINAL_REASONS` in `schemas/claude.py`).
+- `origin`: what started the turn, e.g. `{"kind":"task-notification","producer":"session-task"}`
+  for a turn the CLI started itself (a background-task finish or an `asyncRewake` hook, #812).
+  Typed `Any`: readers check it is an object first.
+- `stop_reason`: passed through, typed `Any`.
 
 Optional fields (may appear in upstream Claude Code CLI output but are **not** captured
 by Untether's `StreamResultMessage` schema):
@@ -235,6 +256,155 @@ One line per input command (user line or scheduled wake-up):
 ### Multi-result streams (#776)
 
 In control-channel mode the process does not exit after `result`: background-task completions, Monitor lines, ScheduleWakeup firings and user lines written while idle each produce another `system/init` → … → `result`. `total_cost_usd` is cumulative per session (including across `--resume`); `num_turns` is per result.
+
+### `system` / `status` — permission-mode edges (#383)
+
+Emitted on **every** change of the CLI's permission mode — an approved `ExitPlanMode` (mode becomes `prePlanMode ?? "default"`, so a session started in plan lands in `default`; emitted *before* the tool_result) and a successful `set_permission_mode`. A no-op change emits nothing. (The same subtype also carries `status:"compacting"` during compaction.)
+
+```json
+{"type":"system","subtype":"status","status":null,"permissionMode":"default","uuid":"…","session_id":"…"}
+```
+
+`system/init.permissionMode` reports the mode each turn starts in (live follow-up turns included on 2.1.285). Untether tracks the effective mode from both (`claude.permission_mode.changed`); neither produces an Untether event.
+
+Untether's plan re-arm (host → CLI, handled inline by the CLI's stdin reader, not queued behind a turn) and its answers:
+
+```json
+{"type":"control_request","request_id":"ut_plan_rearm_<sid>_1","request":{"subtype":"set_permission_mode","mode":"plan"}}
+{"type":"control_response","response":{"subtype":"success","request_id":"ut_plan_rearm_<sid>_1","response":{"mode":"plan"}}}
+{"type":"control_response","response":{"subtype":"error","request_id":"…","error":"…","error_code":"invalid_mode"}}
+```
+
+A real change is followed by the `system/status` frame above; `plan` while already `plan` is acked with no status frame. Refusal codes (2.1.285): `invalid_mode`, `bypass_*` (target `bypassPermissions`) and `auto_mode_*` (target `auto`) — `plan` is never refused.
+
+### `control_cancel_request` (CLI → host) — #684
+
+The CLI withdraws a pending `can_use_tool` it no longer needs (interrupt, turn abort). No
+`session_id`, and no reply is expected — a `control_response` that still arrives for that id is
+ignored (CLI 2.1.285, findings 2026-09-30 probe Z4). It is followed by a synthetic rejection
+`tool_result`. Closing stdin with a request pending sends **no** cancel frame (probe Z5).
+
+```json
+{"type":"control_cancel_request","request_id":"<id>"}
+```
+
+Untether retires the request (registries, keyboard, `cancelled` record) and writes nothing; see
+`untether-events.md` §4.1.
+
+### Hook lifecycle (`system` subtypes, `--include-hook-events`) — #812
+
+Emitted only when Untether passes `--include-hook-events` (control-channel mode, CLI lists the
+flag, `[watchdog] hold_for_async_hooks` on). `SessionStart` / `Setup` hook frames are emitted
+even without the flag. Source: `docs/findings/2026-09-29-claude-rc14-cli-surface.md` §A2/§A3.
+
+```json
+{"type":"system","subtype":"hook_started","hook_id":"<uuid>","hook_name":"Stop","hook_event":"Stop","uuid":"…","session_id":"…"}
+{"type":"system","subtype":"hook_progress","hook_id":"<uuid>","hook_name":"Stop","hook_event":"Stop","stdout":"…","stderr":"…","output":"…","uuid":"…","session_id":"…"}
+{"type":"system","subtype":"hook_response","hook_id":"<uuid>","hook_name":"Stop","hook_event":"Stop","outcome":"error","exit_code":2,"stdout":"","stderr":"<findings>","output":"…","uuid":"…","session_id":"…"}
+```
+
+- `hook_id` pairs `hook_started` with `hook_response`. `hook_name` can carry a matcher suffix
+  (`SessionStart:startup`).
+- `outcome`: `success` | `error` | `cancelled`; `exit_code` is omitted when undefined. Exit 2
+  (`outcome: "error"`) is a blocking error, which for an `asyncRewake` hook is the wake signal.
+- **No field marks a hook as async.** A background hook shows up only as a `hook_started` whose
+  `hook_response` arrives after the turn's `result`.
+- A plain `async` hook's `hook_response` is **withheld while the session is idle** and
+  delivered at the next turn or at stdin close, even though its process exited long ago
+  (probed on 2.1.285). `asyncRewake` and synchronous hooks report as soon as they exit.
+- An `asyncRewake` hook that exits 2 while idle starts a new turn with **no**
+  `command_lifecycle` frames: `hook_response{exit_code:2}` → `system/init` →
+  `system/informational` ("Original prompt: `<task-notification>` … Stop hook feedback") → …
+  → `result` with `origin: {"kind":"task-notification"}`.
+- After stdin closes the CLI kills plain `async` hooks (`outcome: "cancelled"`), waits up to
+  30 s for pending `asyncRewake` hooks, and **drops** any rewake they produce.
+
+**Untether handling**: decoded into the flat `StreamSystemMessage` (`hook_id`, `hook_name`,
+`hook_event`, `outcome`, `exit_code`, all typed `Any`; `stdout` / `stderr` / `output` are
+deliberately not declared, so hook output is never held in memory). No Untether events; the
+frames feed the live-session hook hold (see the [runner spec](runner.md), "Async hooks") and
+don't overwrite `JsonlStreamState.last_event_type`.
+
+### Safeguard stops and model fallback (#814)
+
+```json
+{"type":"system","subtype":"informational","content":"Opus 5.5's safeguards stopped the response above · continuing once with that noted","level":"notice","uuid":"…","session_id":"…"}
+{"type":"system","subtype":"model_refusal_fallback","trigger":"refusal","direction":"retry","scope":"session","original_model":"claude-opus-5-5","fallback_model":"claude-opus-4-8","api_refusal_category":"cyber","api_refusal_explanation":"…","content":"…","session_id":"…","uuid":"…"}
+{"type":"system","subtype":"model_refusal_no_fallback","original_model":"claude-opus-5-5","api_refusal_category":"bio","api_refusal_explanation":"…","content":"…","session_id":"…","uuid":"…"}
+{"type":"system","subtype":"model_fallback","trigger":"overloaded","original_model":"claude-opus-5-5","fallback_model":"claude-sonnet-5-5","content":"…","session_id":"…","uuid":"…"}
+```
+
+- `informational` (`SDKInformationalMessage`): `content`, `level` (`info` | `notice` |
+  `suggestion` | `warning`), optional `tool_use_id` / `prevent_continuation`. It is a general
+  banner (hook blocks, notices, …); the safeguard notice is one of these at level `notice`.
+  Its position relative to the turn's `result` is unverified, so Untether parses it on either
+  side (and between turns in a live session).
+- `model_refusal_fallback` / `model_refusal_no_fallback` / `model_fallback` are undocumented
+  in the SDK reference; shapes come from the CLI binary (2.1.284/2.1.285). `scope: "local"` on
+  a refusal fallback means a subagent or side question fell back and the session model is
+  unchanged. Other optional keys seen: `request_id`, `refused_user_message_uuid`,
+  `saw_cyber_refusal`, `retracted_message_uuids`.
+- The drift test (`tests/test_claude_cli_schema_drift.py`) probes the installed binary for
+  these subtypes and the safeguard notice text at zero token cost.
+
+**Untether handling**: all fields decode into `StreamSystemMessage` typed `Any` (about 40
+system subtypes share the struct, so a type clash must never drop the line). Dispatch is
+`_SYSTEM_SUBTYPE_HANDLERS` in `runners/claude.py`; the mapping is in
+[untether-events.md](untether-events.md) §4.1 and the runner spec's "Safeguard stops".
+Source: `docs/findings/2026-09-29-claude-rc14-cli-surface.md` §B.
+
+### Context usage and compaction (#819)
+
+The context-window numbers ride on frames already listed above (CLI 2.1.285; zero-token
+probes in `tests/test_claude_cli_schema_drift.py`, research in
+`docs/findings/2026-09-30-claude-sdk-control-permissions-context.md` Q4/Q5):
+
+```json
+{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":1234,"cache_creation_input_tokens":100,"cache_read_input_tokens":185000,"output_tokens":5},"content":[…]},"parent_tool_use_id":null,"session_id":"…"}
+{"type":"result","subtype":"success",…,"modelUsage":{"claude-haiku-4-5":{"inputTokens":…,"contextWindow":200000,"maxOutputTokens":64000,…}}}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":6336,"post_tokens":277,"cumulative_dropped_tokens":6059,"duration_ms":47},"logical_parent_uuid":"…","session_id":"…"}
+```
+
+- `modelUsage` is keyed by the model id the CLI used; `contextWindow` is the only place the
+  window appears. Decoded as `StreamResultMessage.modelUsage` (`Any`).
+- Assistant `message.usage` decodes as `StreamAssistantMessageBody.usage` (`Any`).
+- All these keys decode as `Any` on `StreamSystemMessage` / `StreamUserMessage`.
+
+Compaction frames as captured on CLI 2.1.285 (Haiku, 2026-10-01; redacted transcripts in
+`tests/fixtures/claude_{compaction,autocompact,compact_empty}_2.1.285.jsonl`):
+
+```json
+{"type":"system","subtype":"status","status":"compacting","session_id":"…"}
+{"type":"system","subtype":"status","status":null,"compact_result":"success","session_id":"…"}
+{"type":"system","subtype":"init",…}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":51305,"post_tokens":2228,"cumulative_dropped_tokens":49077,"duration_ms":21942,"preserved_segment":{…},"preserved_messages":{…}},"logical_parent_uuid":"…","session_id":"…"}
+{"type":"user","isReplay":false,"isSynthetic":true,"message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. …"}}
+{"type":"user","isReplay":true,"message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":0,"duration_api_ms":0,"result":"",…}
+```
+
+- That is a manual `/compact`. The `init` line and the last two lines appear only for
+  `/compact`.
+- **Auto** compaction fires inside a turn, between a `tool_result` and the next API
+  request. It sends no fresh `init`, and the boundary frame has no `session_id`
+  (`{"trigger":"auto","pre_tokens":79267,"post_tokens":15092,…}`). The summary `user`
+  frame has list content, and the turn carries on.
+- `status: "compacting"` is re-sent every 30 s while compacting (drift probe). A 22 s
+  compaction sent none.
+- A failure ends with `status:null`, `compact_result:"failed"` and an optional
+  `compact_error`, with no boundary. A PreCompact-hook skip ends with a plain
+  `status:null`. `status:null` + `permissionMode` is #383's mode-change edge, not
+  compaction.
+- `post_tokens` excludes the system prompt and tools. After this manual compaction the
+  next response's input side was 21 320 against `post_tokens` 2 228.
+- `isCompactSummary` was not on the wire; the summary frame carries `isSynthetic: true`.
+- `/compact` on a session with no history: `init` → a `<synthetic>` assistant
+  `Error: No messages to compact` → a 0-turn, 0-ms result with `result: ""` and
+  `modelUsage: {}`, and no compaction frames.
+
+**Untether handling**: `% ctx` (C2), the `🗜️` rows, the liveness latch and the manual-only
+0-turn exemption. See [untether-events.md](untether-events.md) §6.1 and the runner spec's
+"Context usage" and "Compaction" sections.
 
 ## Message object (`message` field)
 

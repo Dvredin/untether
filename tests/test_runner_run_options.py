@@ -24,8 +24,6 @@ def test_codex_run_options_override_model_and_reasoning() -> None:
         "gpt-4.1-mini",
         "-c",
         "model_reasoning_effort=low",
-        "--ask-for-approval",
-        "never",
         "exec",
         "--json",
         "--skip-git-repo-check",
@@ -47,8 +45,6 @@ def test_codex_run_options_place_images_for_new_and_resumed_sessions() -> None:
         )
 
     assert new_args == [
-        "--ask-for-approval",
-        "never",
         "exec",
         "--json",
         "--skip-git-repo-check",
@@ -60,8 +56,6 @@ def test_codex_run_options_place_images_for_new_and_resumed_sessions() -> None:
         "-",
     ]
     assert resumed_args == [
-        "--ask-for-approval",
-        "never",
         "exec",
         "--json",
         "--skip-git-repo-check",
@@ -88,8 +82,6 @@ def test_codex_run_options_place_images_for_continue_session() -> None:
         )
 
     assert args == [
-        "--ask-for-approval",
-        "never",
         "exec",
         "--json",
         "--skip-git-repo-check",

@@ -134,7 +134,7 @@ permission_mode = "auto"
 ```
 
 !!! warning "`auto` changed meaning in v0.35.5"
-    Before v0.35.5, `permission_mode = "auto"` meant plan mode with the plan gate auto-approved. It now selects Claude Code's own classifier-gated auto mode, which has no plan phase. Existing crons keep running but behave differently — set `"plan-auto"` to restore the previous behaviour. Untether logs a warning at startup when it sees `"auto"` in a config file.
+    Before v0.35.5, `permission_mode = "auto"` meant plan mode with the plan gate auto-approved. It now selects Claude Code's own classifier-gated auto mode, which has no plan phase. Existing crons keep running but behave differently — set `"plan-auto"` to restore the previous behaviour. Untether logs one warning at startup, and again if a config reload changes the list, naming every engine setting and cron that uses `"auto"`. It also warns at startup about crons set to `default`, `manual`, `acceptEdits` or `plan`, which wait for a tap nobody gives, and logs the same warning when a cron or webhook fires into a chat whose mode will ask for approval.
 
 !!! warning "Unattended crons and prompting modes"
     Since v0.35.5, `default`, `manual` and `acceptEdits` really do prompt: any tool call the mode doesn't cover waits for an Approve / Deny tap ([#749](https://github.com/littlebearapps/untether/issues/749)). A cron that fires while you're away will sit on that button. For unattended crons use `plan-auto`, `auto`, `dontAsk` or `bypassPermissions`, or pre-approve the tools the job needs.
@@ -151,7 +151,7 @@ Trigger-initiated runs are visibly distinct from manual ones — every run foote
 
 `/stats` reports a per-engine `(N triggered, M manual)` breakdown next to each engine line and on the totals row when at least one count is nonzero ([#271](https://github.com/littlebearapps/untether/issues/271) Tier 3).
 
-`/config → 📡 Triggers` (`config:tg`) lists every cron and webhook configured for the current chat — for crons: `describe_cron(schedule, timezone)`, project, engine, last-fired relative time; for webhooks: path, auth scheme, project, engine, last-fired. Lists are scoped to the current chat, capped at 10 entries with a `…and N more (see untether.toml)` overflow marker. The page also hosts the master pause/resume toggle (see below). See [Inline settings](inline-settings.md#triggers-page) for the navigation walkthrough.
+`/config → ⏰ Triggers` (`config:tg`) lists every cron and webhook configured for the current chat — for crons: `describe_cron(schedule, timezone)`, project, engine, last-fired relative time; for webhooks: path, auth scheme, project, engine, last-fired. Lists are scoped to the current chat, capped at 10 entries with a `…and N more (see untether.toml)` overflow marker. The page also hosts the master pause/resume toggle (see below). See [Inline settings](inline-settings.md#triggers-page) for the navigation walkthrough.
 
 Last-fired times are persisted to `triggers_history.json` (sibling of `untether.toml`) so the values survive a restart. Renaming a trigger ID in TOML leaves a stale entry that operators can manually delete (no auto-prune to avoid losing data on transient TOML errors).
 
@@ -159,7 +159,7 @@ Last-fired times are persisted to `triggers_history.json` (sibling of `untether.
 
 When you need to silence the bot for maintenance, demos, or a noisy upstream, the master pause toggle suspends all cron firing and webhook dispatch globally without changing your config ([#294](https://github.com/littlebearapps/untether/issues/294)).
 
-* **From `/config`:** open `📡 Triggers` (or use the one-button toggle row on the home page when triggers are configured) and tap **Pause**.
+* **From `/config`:** open `⏰ Triggers` (or use the one-button toggle row on the home page when triggers are configured) and tap **Pause**.
 * **While paused:** the cron scheduler skips its tick (`run_once` crons are not consumed during the pause and fire on the next matching tick after resume); the webhook server returns `503 triggers paused` with `Retry-After: 60` instead of dispatching; `/health` reports `{"status":"paused","paused":true}` for external monitors; `/ping` shows `⏸ triggers paused: … (suspended)`.
 * **Restart auto-resumes** — pause is in-memory only by design; restarting the bot is a safe escape hatch.
 

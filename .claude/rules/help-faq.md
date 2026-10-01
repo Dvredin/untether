@@ -1,3 +1,9 @@
+---
+paths:
+  - "docs/faq/**"
+  - "CHANGELOG.md"
+---
+
 # Help-Centre FAQ Rules (`docs/faq/faq.md`)
 
 `docs/faq/faq.md` is the user-facing FAQ for Untether. It backs the
@@ -66,7 +72,7 @@ Tracking issue: [#477](https://github.com/littlebearapps/untether/issues/477).
 - Phrase as: ends with `?`, OR starts with How / What / Why / When /
   Where / Can / Do / Does / Is / Are / Should / Will.
 - Aim for ≥7 H2 Q/A pairs (the issue's acceptance criterion). Currently
-  ships with 15. Don't drop below 7 without coordinating with the
+  ships with 17. Don't drop below 7 without coordinating with the
   marketing site.
 
 ### Answer style

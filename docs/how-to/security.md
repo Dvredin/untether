@@ -77,7 +77,7 @@ If a new engine or MCP genuinely needs a variable that isn't allowlisted (sympto
 
 2. **For names that benefit every Untether user**: add to `_EXACT_ALLOW` / `_PREFIX_ALLOW` in `src/untether/utils/env_policy.py` and submit a PR. `BWS_ACCESS_TOKEN` (Bitwarden Secrets Manager) was promoted into the built-in defaults in v0.35.3 by exactly this path.
 
-Other engines (Codex, Gemini, OpenCode, AMP) still inherit the full parent env — extending the allowlist to them is tracked in [#332](https://github.com/littlebearapps/untether/issues/332).
+Codex and OpenCode (and the deprecated Gemini and AMP) still inherit Untether's full environment; per-runner filtering for them is tracked in [#375](https://github.com/littlebearapps/untether/issues/375). Codex itself starts its MCP servers with a minimal env, so a credential needs `env_vars` — see [Env for Codex and OpenCode](../reference/env-vars.md#env-codex-opencode).
 
 ### Boundary enforcement on Claude exec ([#361](https://github.com/littlebearapps/untether/issues/361))
 
@@ -93,14 +93,53 @@ The boundary fix and audit confirm Untether's spawn env is clean. **However, Cla
 
 Operator mitigation: keep host-level secrets out of `~/.bashrc` / `~/.profile`. Move them into project-scoped tools that only activate when you opt in (e.g. [direnv](https://direnv.net/) `.envrc`, [bws](https://bitwarden.com/help/secrets-manager-cli/) on demand, per-project `.env` files loaded by your editor's run config). The blast radius is then bounded to projects you explicitly opted into.
 
+## Engine CLI flags (`extra_args`)
+
+`[engines.claude] extra_args` and `[engines.codex] extra_args` pass extra flags straight to the engine CLI. Since v0.35.5 Untether refuses the flags that would bypass Telegram approvals or the Codex sandbox, and the flags it manages itself ([#209](https://github.com/littlebearapps/untether/issues/209)). The check runs at config load and catches every spelling: `--flag=value`, short clusters (`-pc`), attached short values (`-sVALUE`, `-s=VALUE`, `-cKEY=VAL`) and a bare `--`. Error and log text name the **flag only, never its value** (a `-c` value can hold a secret).
+
+| Engine | Refused in `extra_args` |
+|---|---|
+| Claude | Bypass: `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`. Managed: `-p`/`--print`, `--output-format`, `--input-format`, `-r`/`--resume`, `-c`/`--continue`, `--permission-mode`, `--permission-prompt-tool`, `--permission-prompts`, `--allowedTools`/`--allowed-tools` (use `[engines.claude] allowed_tools`, which is permission-mode aware). A bare `--` (it would turn Untether's own flags into prompt text) |
+| Codex | Bypass: `--dangerously-bypass-approvals-and-sandbox`/`--yolo`, `--approve-for-me`/`--not-so-yolo`, `--dangerously-bypass-hook-trust`, `-s`/`--sandbox danger-full-access`, and any `-c`/`--config` value mentioning `danger-full-access`, `:danger`, `bypass` or `dangerously` (sandbox modes, permission profiles, inline tables, `bypass_hook_trust`, the `dangerously_allow_*` keys). Workspace: `-C`/`--cd`, `--worktree` (Untether sets the working directory from the project). Managed: `-a`/`--ask-for-approval`, `--ignore-rules`, `--ignore-user-config`, `--json`, `--color`, `--skip-git-repo-check`, `--output-schema`, `-o`/`--output-last-message`. A bare `--` |
+
+Still allowed, and documented: Codex `-s read-only|workspace-write` (the way to pick a full-auto sandbox; the **safe** approval policy's exec-level `--sandbox read-only` outranks it), `-c sandbox_mode="workspace-write"`, `-c approval_policy=…` (`codex exec` forces `never` anyway), `-c shell_environment_policy.*`, `-c sandbox_workspace_write.*` (except `dangerously_*` keys), `--add-dir`, `--enable`/`--disable`, `--profile`, `--model`, `--oss`; Claude `--add-dir`, `--mcp-config`, `--settings`, `--setting-sources`, `--plugin-dir`, `--chrome`, `--autocompact`, `--include-hook-events` and other upstream flags.
+
+**What happens when a config carries a refused flag:**
+
+- At startup, if the engine is the **default** engine, Untether refuses to start and names the flag. Remove it and restart.
+- At startup or on hot-reload, any **other** engine is disabled: the startup message lists it under `failed to load:`, chats that use it get an "engine unavailable" reply naming the flag, and the log has `setup.warning`. Its other settings are not silently replaced by defaults.
+- On hot-reload of the **default** engine, the reload fails (`config.reload.failed`) and the previous, safe runtime keeps running. An agent that adds a bypass flag to a live config gets no effect, and the attempt is logged (`claude.config.invalid` / `codex.config.invalid`).
+
+**False positives are deliberate.** A *value* that looks like a refused flag (`["--append-system-prompt", "--dangerously-skip-permissions"]`) or a `-c` value that happens to contain `bypass` (`developer_instructions="never bypass review"`) is refused too. Reword it, or move the setting into the engine's own config file. Options that take several values (`--add-dir`, `--allowedTools`, `--mcp-config`, Codex `-i`) are treated the same way.
+
+**What `extra_args` blocking cannot stop.** Several legitimate flags and files can still weaken approvals, and blocking them by content is unreliable:
+
+- Claude: `--settings` (a JSON or file with `permissions.allow` rules or `PreToolUse` hooks that return `allow`), `--setting-sources`, `--plugin-dir`/`--plugin-url` (plugin hooks), `--agents`/`--agent`, `--add-dir`, `--mcp-config`, `--bare`/`--safe-mode`; and the project's own `.claude/settings.json` / `settings.local.json`, which the agent itself can edit.
+- Codex: `--profile` (layers `$CODEX_HOME/<name>.config.toml`), `~/.codex/config.toml` (`sandbox_mode`, `approval_policy`, `shell_environment_policy`, `sandbox_workspace_write.*`, `bypass_hook_trust`), `CODEX_HOME` itself, `--enable`/`--disable` feature toggles, `--add-dir`.
+- The explicit Untether keys `[engines.claude] dangerously_skip_permissions = true` and `permission_mode = "bypassPermissions"` are intentional opt-ins and stay. `dangerously_skip_permissions = true` overrides `permission_mode` and every `/planmode` choice; Untether logs `claude.config.dangerously_skip_permissions` once at startup when it is set.
+- The engine env allowlist admits the `CLAUDE_` and `CLAUDE_CODE_` prefixes, so a `CLAUDE_*` variable set in the service environment is another channel `extra_args` blocking can't see.
+
+Treat write access to `untether.toml`, the engines' config directories or the service environment as equivalent to choosing the permission mode.
+
 ## File transfer deny globs
 
 File transfer includes a deny list that blocks access to sensitive paths. The defaults are:
 
 ```toml title="~/.untether/untether.toml"
 [transports.telegram.files]
-deny_globs = [".git/**", ".env", ".envrc", "**/*.pem", "**/.ssh/**"]
+deny_globs = [
+    ".git/**", ".env", "**/.env", "**/.env.*", ".envrc", "**/.envrc",
+    "**/*.pem", "**/*.key", "**/id_rsa", "**/id_ed25519", "**/.ssh/**",
+    "**/.netrc", "**/.npmrc", "**/.pypirc",
+]
 ```
+
+How patterns match ([#831](https://github.com/littlebearapps/untether/issues/831)):
+
+- `**` matches any number of directories, including none, so `**/*.pem` also covers a `key.pem` at the project root and `**/.ssh/**` covers `.ssh/config` as well as `a/b/.ssh/x/y`.
+- A pattern without a leading `**/` still matches at the end of a path, so `.env` denies `.env` and `app/.env` alike, and `secrets/**` denies everything under any `secrets/` directory.
+- Any `.git` path component is always denied, whatever its case (`.GIT` on macOS counts).
+- A project-root `.env.example` matches `**/.env.*`. Replace that pattern with narrower ones if you need to fetch it.
 
 Add more patterns as needed:
 
@@ -120,8 +159,10 @@ Add more patterns as needed:
     ]
     ```
 
+Deny globs are checked against both the path you type and the path it resolves to after following symlinks inside the project, so a symlink can't be used to reach a denied file (for example `cfg.txt → .env`, or `docs/x → .git/hooks`). Links that leave the project root are always refused ([#390](https://github.com/littlebearapps/untether/issues/390)).
+
 !!! tip "Defence in depth"
-    Deny globs protect against accidental file exfiltration via `/file get`. They do not prevent the coding agent itself from reading files — the agent runs with full filesystem access in the project directory.
+    Deny globs protect against accidental file exfiltration via `/file get` and against uploads (`/file put`, auto-saved uploads and media groups) landing in sensitive places such as `.git/hooks`. They do not prevent the coding agent itself from reading files — the agent runs with full filesystem access in the project directory.
 
 ## Secure webhook endpoints
 

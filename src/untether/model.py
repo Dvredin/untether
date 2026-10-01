@@ -16,6 +16,8 @@ type ActionKind = Literal[
     "note",
     "turn",
     "warning",
+    # #819: a value for the status line (``detail["context_pct"]``), not a
+    # step — ProgressTracker stores it apart from the actions.
     "telemetry",
 ]
 
@@ -32,6 +34,8 @@ type TurnReason = Literal[
     "scheduled_wakeup",
     "monitor_event",
     "followup",
+    # #812: an asyncRewake hook exited 2 and woke the idle session.
+    "hook_rewake",
     "unknown",
 ]
 
@@ -114,6 +118,10 @@ class TurnEvent:
     usage: dict[str, Any] | None = None
     command_uuid: str | None = None
     detail: dict[str, Any] = field(default_factory=dict)
+    # #815 (``started`` only): how long before this event the turn really
+    # began — the CLI announces a follow-up (``command_lifecycle``) before
+    # the frame that opens it. Lets the bridge time the turn from its start.
+    started_ago_s: float | None = None
 
 
 type UntetherEvent = StartedEvent | ActionEvent | CompletedEvent | TurnEvent

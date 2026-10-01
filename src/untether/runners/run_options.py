@@ -25,6 +25,10 @@ class EngineRunOptions:
     # Native, runner-specific attachments. Telegram populates this only after
     # resolving the effective engine to Codex; other runners ignore the field.
     image_paths: tuple[str, ...] = ()
+    # #416 — a stored reasoning level the engine no longer allows, dropped by
+    # ``drop_unsupported_reasoning`` at resolution time. Only carries the
+    # dropped value to the executor's one-line note; runners never read it.
+    ignored_reasoning: str | None = None
 
 
 # Permission modes the Claude Code CLI accepts for ``--permission-mode``.
@@ -74,8 +78,11 @@ CLAUDE_PLAN_AUTO_MODE = "plan-auto"
 # one-shot guard matters: after the rename a user can legitimately *choose*
 # ``auto`` from ``/planmode`` or ``/config``, so a per-read rewrite would make
 # the CLI's own mode unreachable through the UI.  In TOML-authored config the
-# value is NOT rewritten — it now means the CLI's own ``auto`` and a one-shot
-# startup WARN says so.
+# value is NOT rewritten — it now means the CLI's own ``auto``.
+# ``build_runtime_spec`` logs one aggregated
+# ``claude.permission_mode.auto_semantics_changed`` WARN at startup, and again
+# whenever a config reload changes the set of affected entries (engine config
+# and crons); see ``untether.permission_audit`` (#751).  Sunset: 0.36.0.
 LEGACY_CLAUDE_PLAN_AUTO_MODE = "auto"
 
 # Canonical per-engine permission_mode value sets. Used by trigger config
@@ -138,6 +145,11 @@ def is_claude_prompting_mode(mode: str | None) -> bool:
     a stage-6 round-trip Untether approves anyway.  Gating plan mode would buy
     no safety and cost an approval button per tool in the fleet's most-used
     mode.  See docs/findings/2026-08-13-claude-permission-modes.md.
+    **Probe G no longer holds on CLI 2.1.285**: plan mode raises a
+    ``can_use_tool`` (``decision_reason_type: "mode"``) for a non-plan-file
+    ``Write`` instead of blocking it, and this classification lets stage 6
+    approve it — see the 2026-09-30 findings addenda (#383, §Q3a). Open
+    issue; not changed by #751.
 
     ``auto``, ``dontAsk`` and ``bypassPermissions`` are False because each
     resolves permissions elsewhere: ``auto`` at the stage-4 classifier,
@@ -147,6 +159,37 @@ def is_claude_prompting_mode(mode: str | None) -> bool:
     path with no control channel at all, so no stage-6 request can arrive.
     """
     return mode in _CLAUDE_PROMPTING_MODES
+
+
+# Modes in which an unattended run (cron / webhook) stops and waits for a
+# Telegram tap nobody is there to give (#751): the prompting modes wait for a
+# tool approval, and ``plan`` waits for the ``ExitPlanMode`` approval, which
+# is never auto-approved.  ``plan-auto`` is excluded on purpose — its whole
+# point is that the plan gate is rubber-stamped.  Derived from
+# ``_CLAUDE_PROMPTING_MODES`` so the two cannot drift silently.
+CLAUDE_TAP_REQUIRED_MODES: frozenset[str] = _CLAUDE_PROMPTING_MODES | {"plan"}
+
+
+def claude_tap_waits_for(mode: str | None) -> str | None:
+    """What an unattended run in *mode* would wait for, or ``None`` (#751)."""
+    if mode not in CLAUDE_TAP_REQUIRED_MODES:
+        return None
+    return "plan approval" if mode == "plan" else "tool approval"
+
+
+def normalise_claude_cli_mode(mode: str | None) -> str | None:
+    """The mode the CLI reports in ``system/init.permissionMode`` for *mode*.
+
+    ``plan-auto`` → ``plan`` (Untether sugar) and ``manual`` → ``default``
+    (a CLI alias: probe P1b, CLI 2.1.285 — ``--permission-mode manual``
+    reports ``default``).  Every other value is returned unchanged, so a
+    requested and a reported mode compare equal exactly when the CLI honoured
+    the request (#751).
+    """
+    cli_mode = claude_cli_permission_mode(mode)
+    if cli_mode == "manual":
+        return "default"
+    return cli_mode
 
 
 _RUN_OPTIONS: ContextVar[EngineRunOptions | None] = ContextVar(

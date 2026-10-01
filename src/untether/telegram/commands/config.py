@@ -7,10 +7,41 @@ from ...ids import DEPRECATED_ENGINES
 from ...logging import get_logger
 from ...runners.run_options import CLAUDE_PLAN_AUTO_MODE
 from ...transport import RenderedMessage
+from ._permission_mode_text import (
+    APPLY_TIMING_TEXT,
+    BUTTON_MODES,
+    CLAUDE_MODE_TEXT,
+    NO_OVERRIDE_HINT,
+    NO_OVERRIDE_LABEL,
+    NO_OVERRIDE_TEXT,
+    cli_name_suffix,
+    mode_display,
+)
 
 logger = get_logger(__name__)
 
-_DOCS_BASE = "https://littlebearapps.com/tools/untether/how-to/"
+# #296: the help centre is the marketing-site docs sync
+# (littlebearapps.com ``scripts/docs-sync.config.ts``): every top-level page in
+# docs/{tutorials,how-to,reference,explanation,faq} is published flat at
+# ``/help/untether/<file-stem>/``, synced from ``master``.  Anchors are
+# GitHub-slugger heading ids; Zensical ``{#id}`` attr_list ids are NOT
+# honoured there, so never link one.  ``tests/test_config_help_links.py``
+# maps every rendered link to exactly one doc file + heading.
+_HELP_BASE = "https://littlebearapps.com/help/untether/"
+_BUG_REPORT_URL = (
+    "https://github.com/littlebearapps/untether/issues/new?template=bug_report.yml"
+)
+
+
+def _help_url(slug: str, anchor: str | None = None) -> str:
+    """Help-centre URL for a doc file stem (optionally with a heading anchor)."""
+    url = f"{_HELP_BASE}{slug}/"
+    return f"{url}#{anchor}" if anchor else url
+
+
+def _learn_more(slug: str, anchor: str | None = None, label: str = "Learn more") -> str:
+    """``📖 Learn more`` line linking a help-centre page."""
+    return f'📖 <a href="{_help_url(slug, anchor)}">{label}</a>'
 
 
 def _is_callback(ctx: CommandContext) -> bool:
@@ -110,13 +141,12 @@ async def _resolve_effective_engine(
 
 _HOME_HINTS: dict[str, dict[str, str]] = {
     "pm": {
-        "on": "approve actions",
-        "off": "run freely",
-        "plan-auto": "auto-approve plans",
-        "auto": "classifier-gated",
-        "default": "agent decides",
-        "full auto": "all tools approved",
-        "safe": "untrusted tools blocked",
+        # #747: Claude hints come from the shared permission-mode table
+        # (on/off/plan-auto/auto/manual/dontAsk/bypassPermissions).
+        **{text.ui_name: text.hint for text in CLAUDE_MODE_TEXT.values()},
+        NO_OVERRIDE_LABEL: NO_OVERRIDE_HINT,
+        "full auto": "Codex's own sandbox",
+        "safe": "read-only sandbox",
         "full access": "all tools approved",
         "edit files": "files ok, no shell",
         "read-only": "write tools blocked",
@@ -209,6 +239,7 @@ async def _page_home(ctx: CommandContext) -> None:
     followup_label = _followup_default()
     model_label = "default"
     reasoning_label = "default"
+    rs_ignored: str | None = None
     aq_label = "default"
     dp_label = "default"
     cu_label = "default"
@@ -221,16 +252,8 @@ async def _page_home(ctx: CommandContext) -> None:
         engine_override = await prefs.get_engine_override(chat_id, current_engine)
         pm = engine_override.permission_mode if engine_override else None
         if current_engine == "claude":
-            if pm == "plan":
-                pm_label = "on"
-            elif pm == CLAUDE_PLAN_AUTO_MODE:
-                pm_label = "plan-auto"
-            elif pm == "auto":
-                pm_label = "auto"
-            elif pm is not None:
-                pm_label = "off"
-            else:
-                pm_label = "default"
+            # #747: only acceptEdits is "off"; hand-stored modes show their name.
+            pm_label = NO_OVERRIDE_LABEL if pm is None else mode_display(pm)[0]
         elif current_engine == "codex":
             pm_label = "safe" if pm == "safe" else "full auto"
         elif current_engine == "gemini":
@@ -252,9 +275,15 @@ async def _page_home(ctx: CommandContext) -> None:
         if engine_override and engine_override.model:
             model_label = engine_override.model
 
-        # Reasoning override for current engine
+        # Reasoning override for current engine (#416: a retired level
+        # renders as the default it actually runs on)
         if engine_override and engine_override.reasoning:
-            reasoning_label = engine_override.reasoning
+            effective_rs, ignored_rs = _effective_reasoning(
+                current_engine, engine_override.reasoning
+            )
+            if effective_rs:
+                reasoning_label = effective_rs
+            rs_ignored = ignored_rs
 
         # Ask questions override for current engine
         if engine_override and engine_override.ask_questions is not None:
@@ -397,28 +426,25 @@ async def _page_home(ctx: CommandContext) -> None:
         )
         if triggers_has_any:
             state = "⏸ paused" if triggers_paused else "active"
-            triggers_indicator = f"Triggers (cron/webhook): <b>{state}</b>"
+            triggers_indicator = f"⏰ Triggers: <b>{state}</b>"
     if triggers_indicator is not None:
         lines.append(triggers_indicator)
     if show_reasoning:
         home_rs_label = get_reasoning_label(current_engine)
-        if reasoning_label == "default":
+        if rs_ignored is not None:
+            rs_hint = f"  · {rs_ignored} not supported"
+        elif reasoning_label == "default":
             engine_default = get_engine_default_reasoning(current_engine)
             rs_hint = f"  · {engine_default}" if engine_default else ""
         else:
             rs_hint = _home_hint("rs", reasoning_label)
         lines.append(f"{home_rs_label}: <b>{reasoning_label}</b>{rs_hint}")
 
-    _HELP_URL = (
-        "https://github.com/littlebearapps/untether?tab=readme-ov-file#-help-guides"
-    )
-    _BUG_URL = (
-        "https://github.com/littlebearapps/untether?tab=readme-ov-file#-contributing"
-    )
+    # #296 D3: the help-centre index, and the same bug template as About.
     lines.append("")
     lines.append(
-        f'📖 <a href="{_HELP_URL}">Help guides</a>'
-        f' · 🐛 <a href="{_BUG_URL}">Report a bug</a>'
+        f'📖 <a href="{_HELP_BASE}">Help guides</a>'
+        f' · 🐛 <a href="{_BUG_REPORT_URL}">Report a bug</a>'
     )
 
     buttons: list[list[dict[str, str]]] = []
@@ -525,17 +551,22 @@ async def _page_home(ctx: CommandContext) -> None:
         buttons.append(row3)
         buttons.append([{"text": "ℹ️ About", "callback_data": "config:ab"}])
 
-    # #294: master trigger pause toggle row — only when triggers are configured
-    # for this transport. Sits below the per-engine layout so it doesn't
-    # crowd the existing rows. Label reflects current state.
-    if triggers_has_any:
-        if triggers_paused:
-            tg_label = "▶️ Resume triggers"
-            tg_action = "config:tg:resume"
-        else:
-            tg_label = "⏸ Pause triggers"
-            tg_action = "config:tg:pause"
-        buttons.append([{"text": tg_label, "callback_data": tg_action}])
+    # #296: a ⏰ Triggers navigation button whenever triggers are enabled
+    # (even with none configured, D2 — the page explains how to add one),
+    # next to #294's one-tap pause/resume toggle when any are configured.
+    # No row when [triggers] is disabled (no manager).
+    if ctx.trigger_manager is not None:
+        tg_row = [{"text": "⏰ Triggers", "callback_data": "config:tg"}]
+        if triggers_has_any:
+            if triggers_paused:
+                tg_row.append(
+                    {"text": "▶️ Resume triggers", "callback_data": "config:tg:resume"}
+                )
+            else:
+                tg_row.append(
+                    {"text": "⏸ Pause triggers", "callback_data": "config:tg:pause"}
+                )
+        buttons.append(tg_row)
 
     await _respond(ctx, "\n".join(lines), buttons)
 
@@ -706,33 +737,27 @@ async def _page_planmode(ctx: CommandContext, action: str | None = None) -> None
     pm = override.permission_mode if override else None
 
     if engine == "claude":
-        if pm == "plan":
-            current_label = "on"
-        elif pm == CLAUDE_PLAN_AUTO_MODE:
-            current_label = "plan-auto"
-        elif pm == "auto":
-            current_label = "auto"
-        elif pm is not None:
-            current_label = "off"
-        else:
-            current_label = "default"
+        current_label = NO_OVERRIDE_LABEL if pm is None else mode_display(pm)[0]
 
+        # #747: bullets come from the shared table, in button order.
+        bullets = [
+            f"• <b>{CLAUDE_MODE_TEXT[stored].ui_name}</b>{cli_name_suffix(stored)}"
+            f" — {CLAUDE_MODE_TEXT[stored].summary}"
+            for stored in BUTTON_MODES
+        ]
         lines = [
             "<b>📋 Permission mode</b>",
             "",
             "How much Claude checks with you before acting.",
             "",
-            "• <b>off</b> — run freely, no approval needed",
-            "• <b>on</b> — plan mode; approve the plan before edits",
-            "• <b>plan-auto</b> — plan mode, plan approved automatically",
-            "• <b>auto</b> — Claude Code's own auto mode: a classifier"
-            " approves routine work and blocks risky actions",
+            *bullets,
             "",
-            "ℹ️ <i>Default: uses Claude Code's own permission mode</i>",
+            f"ℹ️ <i>Clear override → {NO_OVERRIDE_LABEL}: {NO_OVERRIDE_TEXT}</i>",
+            f"ℹ️ <i>Changes apply from your next message. {APPLY_TIMING_TEXT}</i>",
             "",
             f"Current: <b>{current_label}</b>",
             "",
-            f'📖 <a href="{_DOCS_BASE}plan-mode/">Learn more</a>',
+            _learn_more("plan-mode"),
         ]
 
         buttons = [
@@ -768,15 +793,18 @@ async def _page_planmode(ctx: CommandContext, action: str | None = None) -> None
         lines = [
             "<b>📋 Approval policy</b>",
             "",
-            "Control which tools Codex can use.",
-            "Codex runs non-interactively — approval is set before the run.",
+            "Codex runs unattended — it never stops to ask."
+            " This picks its sandbox before the run.",
             "",
-            "• <b>full auto</b> — all tools approved (default)",
-            "• <b>safe</b> — only trusted commands run, untrusted denied",
+            "• <b>full auto</b> — uses your Codex sandbox setting; for a trusted"
+            " project that usually means it can edit files there (default)",
+            "• <b>safe</b> — read-only: Codex can read files and run read-only"
+            " commands; edits, writes and network access are blocked — including"
+            " caches and /tmp, so tests, builds and installs will fail",
             "",
             f"Current: <b>{current_label}</b>",
             "",
-            f'📖 <a href="{_DOCS_BASE}inline-settings/">Learn more</a>',
+            _learn_more("interactive-approval", "codex-cli--approval-policy"),
         ]
 
         buttons = [
@@ -815,7 +843,7 @@ async def _page_planmode(ctx: CommandContext, action: str | None = None) -> None
             "",
             f"Current: <b>{current_label}</b>",
             "",
-            f'📖 <a href="{_DOCS_BASE}inline-settings/">Learn more</a>',
+            _learn_more("interactive-approval", "gemini-cli--approval-mode"),
         ]
 
         buttons = [
@@ -951,7 +979,8 @@ async def _page_loop(ctx: CommandContext, action: str | None = None) -> None:
         f"subscription quota. A 24h <code>/loop 1m</code> can fire up to "
         f"1440 times. Set a budget in 💰 Cost &amp; usage <i>before</i> "
         f"turning Loop mode on — the same daily cost cap applies to loop "
-        f"fires automatically."
+        f"fires automatically.\n\n"
+        f"{_learn_more('schedule-tasks', 'loop-mode')}"
     )
     buttons = [
         [
@@ -1017,7 +1046,7 @@ async def _page_verbose(ctx: CommandContext, action: str | None = None) -> None:
         "",
         f"Current: <b>{current_label}</b>",
         "",
-        f'📖 <a href="{_DOCS_BASE}verbose-progress/">Learn more</a>',
+        _learn_more("verbose-progress"),
     ]
 
     is_on = current == "verbose"
@@ -1124,7 +1153,8 @@ async def _page_engine(ctx: CommandContext, action: str | None = None) -> None:
 
     lines += [
         "",
-        f'📖 <a href="{_DOCS_BASE}switch-engines/">Learn more</a>',
+        f'📖 <a href="{_help_url("switch-engines")}">Engines</a>'
+        f' · <a href="{_help_url("model-reasoning")}">Models</a>',
     ]
 
     engine_buttons = [
@@ -1203,7 +1233,7 @@ async def _page_trigger(ctx: CommandContext, action: str | None = None) -> None:
         "",
         f"Current: <b>{current_label}</b>",
         "",
-        f'📖 <a href="{_DOCS_BASE}group-chat/">Learn more</a>',
+        _learn_more("group-chat", "set-listen-mode-for-groups"),
     ]
 
     buttons = [
@@ -1298,7 +1328,7 @@ async def _page_followup(ctx: CommandContext, action: str | None = None) -> None
             f"⚠️ Steer is Claude Code only — <b>{current_engine}</b> runs "
             "always queue follow-ups.",
         ]
-    lines += ["", f'📖 <a href="{_DOCS_BASE}steer-follow-ups/">Learn more</a>']
+    lines += ["", _learn_more("steer-follow-ups")]
 
     buttons = [
         [
@@ -1368,8 +1398,9 @@ async def _page_model(ctx: CommandContext, action: str | None = None) -> None:
 # Reasoning
 # ---------------------------------------------------------------------------
 
+# #416: no `min` — Codex `minimal` is retired. A stale `config:rs:min` from a
+# pre-upgrade message falls through to the page render (nothing persisted).
 _RS_ACTIONS: dict[str, str] = {
-    "min": "minimal",
     "low": "low",
     "med": "medium",
     "hi": "high",
@@ -1378,6 +1409,23 @@ _RS_ACTIONS: dict[str, str] = {
 }
 
 _RS_LABELS: dict[str, str] = {v: k for k, v in _RS_ACTIONS.items()}
+
+
+def _effective_reasoning(
+    engine: str, stored: str | None
+) -> tuple[str | None, str | None]:
+    """#416: ``(effective, ignored)`` for a stored reasoning level.
+
+    A level the engine no longer allows runs on the engine default, so it is
+    shown as the default with the ignored value named alongside.
+    """
+    from ..engine_overrides import allowed_reasoning_levels, supports_reasoning
+
+    if not stored:
+        return None, None
+    if supports_reasoning(engine) and stored not in allowed_reasoning_levels(engine):
+        return None, stored
+    return stored, None
 
 
 async def _page_reasoning(ctx: CommandContext, action: str | None = None) -> None:
@@ -1475,9 +1523,13 @@ async def _page_reasoning(ctx: CommandContext, action: str | None = None) -> Non
     from ..engine_overrides import get_engine_default_reasoning
 
     override = await prefs.get_engine_override(chat_id, current_engine)
-    reasoning = override.reasoning if override else None
+    reasoning, ignored = _effective_reasoning(
+        current_engine, override.reasoning if override else None
+    )
     if reasoning:
         current_label = reasoning
+    elif ignored:
+        current_label = f"default ({ignored} not supported \N{EM DASH} ignored)"
     else:
         engine_default = get_engine_default_reasoning(current_engine)
         current_label = f"default ({engine_default})" if engine_default else "default"
@@ -1485,8 +1537,6 @@ async def _page_reasoning(ctx: CommandContext, action: str | None = None) -> Non
     levels = allowed_reasoning_levels(current_engine)
 
     level_descriptions: list[str] = []
-    if "minimal" in levels:
-        level_descriptions.append("• <b>minimal</b> — fastest responses")
     if "low" in levels or "medium" in levels or "high" in levels:
         present = [f"<b>{lv}</b>" for lv in ("low", "medium", "high") if lv in levels]
         level_descriptions.append(f"• {' · '.join(present)} — balanced options")
@@ -1513,12 +1563,11 @@ async def _page_reasoning(ctx: CommandContext, action: str | None = None) -> Non
         f"Engine: <b>{current_engine}</b>",
         f"Current: <b>{current_label}</b>",
         "",
-        f'📖 <a href="{_DOCS_BASE}model-reasoning/">Learn more</a>',
+        _learn_more("model-reasoning", "set-reasoning-level"),
     ]
 
     # Build level buttons dynamically based on engine
     _LEVEL_BUTTON_MAP: dict[str, tuple[str, str]] = {
-        "minimal": ("Minimal", "min"),
         "low": ("Low", "low"),
         "medium": ("Medium", "med"),
         "high": ("High", "hi"),
@@ -1662,7 +1711,7 @@ async def _page_ask_questions(ctx: CommandContext, action: str | None = None) ->
         "",
         f"Current: <b>{current_label}</b>",
         "",
-        f'📖 <a href="{_DOCS_BASE}inline-settings/">Learn more</a>',
+        _learn_more("interactive-approval", "answering-questions"),
     ]
 
     buttons = [
@@ -1789,7 +1838,7 @@ async def _page_diff_preview(ctx: CommandContext, action: str | None = None) -> 
         "",
         f"Current: <b>{current_label}</b>",
         "",
-        f'📖 <a href="{_DOCS_BASE}interactive-approval/">Learn more</a>',
+        _learn_more("interactive-approval", "diff-previews"),
     ]
 
     buttons = [
@@ -1844,7 +1893,8 @@ async def _page_cost_usage(ctx: CommandContext, action: str | None = None) -> No
                 "<b>💰 Cost & usage</b>\n\n"
                 f"Not available for <b>{current_engine}</b>.\n"
                 "API cost works with Claude Code and OpenCode.\n"
-                "Subscription usage works with Claude Code."
+                "Subscription usage works with Claude Code.\n"
+                "Send /usage for this chat's last-session token totals."
             ),
             [[{"text": "← Back", "callback_data": "config:home"}]],
         )
@@ -1951,7 +2001,7 @@ async def _page_cost_usage(ctx: CommandContext, action: str | None = None) -> No
     lines.append("  Set limits in untether.toml [cost_budget] section.")
     lines.append("")
 
-    lines.append(f'📖 <a href="{_DOCS_BASE}cost-budgets/">Learn more</a>')
+    lines.append(_learn_more("cost-budgets"))
 
     # Determine budget defaults from global config
     budget_default_enabled = budget_cfg.enabled if budget_cfg is not None else False
@@ -2086,7 +2136,7 @@ async def _page_resume_line(ctx: CommandContext, action: str | None = None) -> N
         "Reply to continue in Telegram, or copy-paste into your",
         "terminal to pick up the session in CLI.",
         "",
-        f'📖 <a href="{_DOCS_BASE}conversation-modes/">Learn more</a>',
+        _learn_more("conversation-modes", "resume-lines-in-chat-mode"),
     ]
 
     buttons = [
@@ -2128,7 +2178,7 @@ async def _page_about(ctx: CommandContext, action: str | None = None) -> None:
     lines.append("")
     lines.append(
         f'🔗 <a href="{_REPO_URL}">GitHub</a>'
-        f' · <a href="{_REPO_URL}/issues/new?template=bug_report.yml">Report a bug</a>'
+        f' · <a href="{_BUG_REPORT_URL}">Report a bug</a>'
         f' · <a href="{_REPO_URL}/issues/new?template=feature_request.yml">Feature request</a>'
     )
 
@@ -2175,8 +2225,9 @@ def _truncate_field(value: str | None, limit: int = 24) -> str:
 async def _page_triggers(ctx: CommandContext, action: str | None = None) -> None:
     """Triggers control + per-chat visibility page.
 
-    Lives on its own ``/config`` page distinct from ``/config → 📡 Trigger``
-    (which is the listen-mode all/mentions chat-routing setting). Pause/resume
+    Lives on its own ``/config`` page distinct from ``/config → 📡 Listen``
+    (the all/mentions chat-routing setting, renamed from Trigger in #297).
+    Reached from the ``⏰ Triggers`` home button (#296). Pause/resume
     is the master kill-switch (#294). Below the controls, when triggers are
     configured for the current chat, the page lists each cron and webhook
     with its schedule/path, project, engine, and last-fired timestamp (#271
@@ -2192,7 +2243,9 @@ async def _page_triggers(ctx: CommandContext, action: str | None = None) -> None
     if mgr is None:
         await _respond(
             ctx,
-            "<b>⏰ Triggers</b>\n\nUnavailable (transport has no trigger support).",
+            "<b>⏰ Triggers</b>\n\nUnavailable: set <code>[triggers] enabled = true</code>"
+            " in <code>untether.toml</code> and restart to use crons and webhooks.\n\n"
+            + _learn_more("webhooks-and-cron"),
             [[{"text": "← Back", "callback_data": "config:home"}]],
         )
         return
@@ -2224,7 +2277,7 @@ async def _page_triggers(ctx: CommandContext, action: str | None = None) -> None
             "No crons or webhooks configured.",
             "",
             "Add <code>[[triggers.crons]]</code> or <code>[[triggers.webhooks]]</code> "
-            "entries to <code>untether.toml</code> — see the trigger docs.",
+            "entries to <code>untether.toml</code>.",
         ]
     else:
         if is_paused:
@@ -2292,6 +2345,8 @@ async def _page_triggers(ctx: CommandContext, action: str | None = None) -> None
                     lines.append(
                         f"…and {overflow} more (see <code>untether.toml</code>)"
                     )
+
+    lines += ["", _learn_more("webhooks-and-cron")]
 
     buttons: list[list[dict[str, str]]] = []
     if has_any:
@@ -2365,9 +2420,9 @@ class ConfigCommand:
             return None  # Sub-page navigation only
         _TOAST_LABELS: dict[str, dict[str, str]] = {
             "pm": {
-                "on": "Plan mode: on",
-                "off": "Plan mode: off",
-                "pa": "Plan mode: plan-auto",
+                "on": "Permission mode: on (plan)",
+                "off": "Permission mode: off (acceptEdits)",
+                "pa": "Permission mode: plan-auto",
                 "auto": "Permission mode: auto",
                 "clr": "Permission mode: cleared",
                 "fa": "Approval policy: full auto",
@@ -2398,7 +2453,6 @@ class ConfigCommand:
             },
             "md": {"clr": "Model: cleared"},
             "rs": {
-                "min": "Reasoning: minimal",
                 "low": "Reasoning: low",
                 "med": "Reasoning: medium",
                 "hi": "Reasoning: high",

@@ -157,7 +157,58 @@ _RESULT_EVENT_TYPE = "result"
 # requests like mcp_status). Skip when computing last_event_type so the
 # session.summary reflects the last *stream* event, not the last frame
 # the parser saw. recent_events still records them for diagnostics.
-_CONTROL_CHANNEL_EVENT_TYPES = frozenset({"control_request", "control_response"})
+# #684: ``control_cancel_request`` (the CLI withdrawing a request) is control
+# traffic too — it must never become ``last_event_type``.
+_CONTROL_CHANNEL_EVENT_TYPES = frozenset(
+    {"control_request", "control_response", "control_cancel_request"}
+)
+
+# #812: Claude's ``--include-hook-events`` lifecycle frames
+# (``{"type":"system","subtype":"hook_started|hook_progress|hook_response"}``)
+# can land after the turn's ``result`` (an async hook finishing while the
+# session idles). Like control traffic they must not overwrite
+# ``last_event_type`` — a trailing ``system`` would break the #470
+# post-result check and the auto-continue predicate — but unlike it they are
+# genuine liveness (a hook doing work), so they still count towards
+# ``last_stdout_at`` / ``event_count``. Ring label: ``hook:<subtype>``.
+_HOOK_FRAME_SUBTYPE_PREFIX = "hook_"
+
+
+def _hook_frame_subtype(raw: dict[str, Any], etype: str) -> str | None:
+    if etype != "system":
+        return None
+    subtype = raw.get("subtype")
+    if isinstance(subtype, str) and subtype.startswith(_HOOK_FRAME_SUBTYPE_PREFIX):
+        return subtype
+    return None
+
+
+# #819: Claude's compaction frames get the same treatment as #812's hook
+# frames. An auto-compaction starts right after a ``tool_result`` (last type
+# ``user``); if the CLI dies mid-compaction the auto-continue predicate must
+# still see ``user``, and the #470 post-result check must not see a trailing
+# ``system``. ``system/status`` also carries #383's permission-mode edges,
+# which arrive while a live session idles — same reasoning.
+_LIVENESS_ONLY_SYSTEM_SUBTYPES = frozenset({"status", "compact_boundary"})
+
+
+def _liveness_only_label(raw: dict[str, Any], etype: str) -> str | None:
+    """Ring label for a frame that counts as liveness (``last_stdout_at``,
+    ``event_count``) but must never become ``last_event_type`` — None for
+    every other frame."""
+    hook_subtype = _hook_frame_subtype(raw, etype)
+    if hook_subtype is not None:
+        return f"hook:{hook_subtype}"
+    if etype != "system":
+        return None
+    subtype = raw.get("subtype")
+    if subtype not in _LIVENESS_ONLY_SYSTEM_SUBTYPES:
+        return None
+    if subtype == "status":
+        status = raw.get("status")
+        return f"status:{status}" if isinstance(status, str) else "status:null"
+    return str(subtype)
+
 
 # #526 rc20 follow-up: shared with runner_bridge.py for paced
 # ``subprocess.approval_pending`` INFO emission. The user-side stall
@@ -172,7 +223,11 @@ _APPROVAL_PENDING_REFIRE_S = 1800.0
 # the turn ended, or Claude answered on the control channel. Every other
 # label (``rate_limit_event``, ``assistant``, ``tool:*``, ``system``) is
 # transparent to the backward scan below.
-_APPROVAL_RESOLVING_EVENT_LABELS = frozenset({"control_response", "user", "result"})
+# #684: a ``control_cancel_request`` resolves the wait as well — the CLI
+# withdrew the request, so nothing is pending any more.
+_APPROVAL_RESOLVING_EVENT_LABELS = frozenset(
+    {"control_response", "control_cancel_request", "user", "result"}
+)
 
 
 def _approval_pending(stream: JsonlStreamState, logger: Any = None) -> bool:
@@ -327,15 +382,23 @@ class BaseRunner(SessionLockMixin):
     async def run_locked(
         self, prompt: str, resume: ResumeToken | None
     ) -> AsyncIterator[UntetherEvent]:
-        if resume is not None:
+        # A /continue token carries no session id (``value == ""``), so locking
+        # it up front would key every /continue of this engine on one shared
+        # ``"<engine>:"`` lock. Treat it like a new run instead: lock the real
+        # session id once the StartedEvent names it (#817).
+        if resume is not None and not resume.is_continue:
             async for evt in self.run_with_resume_lock(prompt, resume, self.run_impl):
                 yield evt
             return
+        if resume is not None and resume.engine != self.engine:
+            raise RuntimeError(
+                f"resume token is for engine {resume.engine!r}, not {self.engine!r}"
+            )
 
         lock: anyio.Semaphore | None = None
         acquired = False
         try:
-            async for evt in self.run_impl(prompt, None):
+            async for evt in self.run_impl(prompt, resume):
                 if lock is None and isinstance(evt, StartedEvent):
                     lock = self.lock_for(evt.resume)
                     await lock.acquire()
@@ -1068,14 +1131,20 @@ class JsonlSubprocessRunner(BaseRunner):
             # #502: skip control-channel events when updating last_event_type
             # so session.summary reflects the last stream event, not stdin/stdout
             # permission-flow traffic. recent_events still records them.
-            if etype not in _CONTROL_CHANNEL_EVENT_TYPES:
+            # #812: hook lifecycle frames are skipped the same way, and so
+            # are #819's compaction / status frames.
+            liveness_label = _liveness_only_label(raw_dict, etype)
+            if etype not in _CONTROL_CHANNEL_EVENT_TYPES and liveness_label is None:
                 stream.last_event_type = etype
                 stream.last_event_tool = etool
             # #716: latch the terminal frame separately from the running
             # ``last_event_type``. Set-only — never cleared.
             if etype == _RESULT_EVENT_TYPE:
                 stream.saw_result = True
-            label = f"tool:{etool}" if etool else etype
+            if liveness_label is not None:
+                label = liveness_label
+            else:
+                label = f"tool:{etool}" if etool else etype
             stream.recent_events.append((now, label))
             # Stuck-after-tool_result tracking (#322). The latch persists across
             # intervening "other" events (attachments, system hooks) and is

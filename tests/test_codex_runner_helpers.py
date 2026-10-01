@@ -270,3 +270,233 @@ def test_codex_build_runner_configs(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError):
         build_runner({"profile": 123}, tmp_path)
+
+
+# --- #830: safe-mode footer + argv-rejection diagnostics ---
+
+
+def test_codex_meta_permission_mode_safe_unchanged() -> None:
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+
+    runner = CodexRunner(codex_cmd="codex", extra_args=[])
+    state = runner.new_state("hi", None)
+    with apply_run_options(EngineRunOptions(permission_mode="safe")):
+        out = runner.translate(
+            codex_schema.ThreadStarted(thread_id="sess-safe"),
+            state=state,
+            resume=None,
+            found_session=None,
+        )
+    started = out[0]
+    assert isinstance(started, StartedEvent)
+    assert started.meta is not None
+    assert started.meta["permissionMode"] == "safe"
+
+
+_CLAP_UNTRUSTED = [
+    "error: invalid value 'untrusted' for '--ask-for-approval <APPROVAL_POLICY>'",
+    "  [possible values: on-request, never]",
+]
+
+
+def test_process_error_events_logs_argv_rejected() -> None:
+    from structlog.testing import capture_logs
+
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+
+    runner = CodexRunner(codex_cmd="codex", extra_args=["-c", "notify=[]"])
+    state = runner.new_state("hi", None)
+    with apply_run_options(EngineRunOptions(permission_mode="safe")):
+        runner.build_args("hi", None, state=state)
+    with capture_logs() as logs:
+        out = runner.process_error_events(
+            2,
+            resume=None,
+            found_session=None,
+            state=state,
+            stderr_lines=list(_CLAP_UNTRUSTED),
+        )
+    events = [e["event"] for e in logs]
+    assert "codex.argv.rejected" in events
+    assert "codex.process.failed" in events
+    rejected = next(e for e in logs if e["event"] == "codex.argv.rejected")
+    assert rejected["log_level"] == "error"
+    assert rejected["rc"] == 2
+    assert rejected["first_error_line"].startswith("error: invalid value 'untrusted'")
+    assert rejected["args"][:2] == ["-c", "notify=[]"]
+    completed = out[-1]
+    assert isinstance(completed, CompletedEvent)
+    assert "invalid value 'untrusted'" in (completed.error or "")
+
+
+def test_process_error_events_argv_rejected_unexpected_argument() -> None:
+    from structlog.testing import capture_logs
+
+    runner = CodexRunner(codex_cmd="codex", extra_args=[])
+    state = runner.new_state("hi", None)
+    with capture_logs() as logs:
+        runner.process_error_events(
+            2,
+            resume=None,
+            found_session=None,
+            state=state,
+            stderr_lines=["error: unexpected argument '--full-auto' found"],
+        )
+    rejected = [e for e in logs if e["event"] == "codex.argv.rejected"]
+    assert len(rejected) == 1
+    assert rejected[0]["args"] is None  # build_args never ran for this state
+
+
+def test_process_error_events_no_argv_event_for_api_errors() -> None:
+    from structlog.testing import capture_logs
+
+    runner = CodexRunner(codex_cmd="codex", extra_args=[])
+    state = runner.new_state("hi", None)
+    with capture_logs() as logs:
+        runner.process_error_events(
+            1,
+            resume=None,
+            found_session=None,
+            state=state,
+            stderr_lines=["stream error: 500"],
+        )
+        # rc=2 without a clap line is not an argv rejection either.
+        runner.process_error_events(
+            2,
+            resume=None,
+            found_session=None,
+            state=state,
+            stderr_lines=["stream error: 500"],
+        )
+    events = [e["event"] for e in logs]
+    assert "codex.argv.rejected" not in events
+    assert events.count("codex.process.failed") == 2
+
+
+# --- #419: web-search titles + five usage fields -----------------------------
+
+
+def _ws(phase: str, **fields: object) -> codex_schema.ThreadEvent:
+    item = codex_schema.WebSearchItem(**fields)  # type: ignore[arg-type]
+    if phase == "started":
+        return codex_schema.ItemStarted(item=item)
+    return codex_schema.ItemCompleted(item=item)
+
+
+def _translate_one(event: codex_schema.ThreadEvent) -> ActionEvent:
+    out = translate_codex_event(event, title="Codex", factory=EventFactory("codex"))
+    assert len(out) == 1
+    assert isinstance(out[0], ActionEvent)
+    return out[0]
+
+
+def test_web_search_started_empty_query_placeholder() -> None:
+    evt = _translate_one(
+        _ws("started", id="ws_abc", query="", action={"type": "other"})
+    )
+    assert evt.phase == "started"
+    assert evt.action.title == "web search"
+    assert evt.action.detail["action_type"] == "other"
+    assert evt.action.detail["query"] == ""
+
+
+@pytest.mark.parametrize(
+    ("fields", "title", "action_type"),
+    [
+        (
+            {"query": "", "action": {"type": "search", "query": "codex release"}},
+            "codex release",
+            "search",
+        ),
+        (
+            {"query": "", "action": {"type": "search", "queries": ["a", "b"]}},
+            "a · b",
+            "search",
+        ),
+        (
+            {
+                "query": "",
+                "action": {"type": "search", "queries": ["a", "b", "c", "d", "e"]},
+            },
+            "a · b · c (+2 more)",
+            "search",
+        ),
+        (
+            {"query": "", "action": {"type": "open_page", "url": "https://x.io/r"}},
+            "https://x.io/r",
+            "open_page",
+        ),
+        (
+            {
+                "query": "",
+                "action": {
+                    "type": "find_in_page",
+                    "url": "https://x.io/r",
+                    "pattern": "pat",
+                },
+            },
+            '"pat" in https://x.io/r',
+            "find_in_page",
+        ),
+        ({"query": "legacy query"}, "legacy query", "search"),
+        ({"query": "", "action": {"type": "brand_new"}}, "web search", "other"),
+    ],
+)
+def test_web_search_completed_title_from_action(
+    fields: dict[str, object], title: str, action_type: str
+) -> None:
+    evt = _translate_one(_ws("completed", id="ws", **fields))
+    assert evt.phase == "completed"
+    assert evt.ok is True
+    assert evt.action.title == title
+    assert evt.action.detail["action_type"] == action_type
+
+
+def test_web_search_started_and_completed_share_action_id() -> None:
+    started = _translate_one(
+        _ws("started", id="ws_abc", query="", action={"type": "other"})
+    )
+    completed = _translate_one(
+        _ws(
+            "completed",
+            id="ws_abc",
+            query="q",
+            action={"type": "search", "query": "q"},
+        )
+    )
+    assert started.action.id == completed.action.id == "ws_abc"
+
+
+def test_web_search_detail_has_result_count_not_results() -> None:
+    evt = _translate_one(
+        _ws(
+            "completed",
+            id="ws",
+            query="q",
+            action={"type": "open_page", "url": "https://x.io"},
+            results=[{"url": "https://x.io", "content": "big"}, {"url": "y"}],
+        )
+    )
+    assert evt.action.detail["result_count"] == 2
+    assert evt.action.detail["url"] == "https://x.io"
+    assert "results" not in evt.action.detail
+
+
+def test_turn_completed_usage_carries_five_fields() -> None:
+    runner = CodexRunner(codex_cmd="codex", extra_args=[])
+    state = runner.new_state("hi", None)
+    event = codex_schema.TurnCompleted(
+        usage=codex_schema.Usage(
+            input_tokens=100,
+            cached_input_tokens=40,
+            output_tokens=20,
+            cache_write_input_tokens=5,
+            reasoning_output_tokens=7,
+        )
+    )
+    out = runner.translate(event, state=state, resume=None, found_session=None)
+    completed = out[-1]
+    assert isinstance(completed, CompletedEvent)
+    assert completed.usage is not None
+    assert completed.usage["reasoning_output_tokens"] == 7
+    assert completed.usage["cache_write_input_tokens"] == 5

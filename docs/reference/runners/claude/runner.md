@@ -60,6 +60,8 @@ Key control channel features:
 * `ExitPlanMode` requests silently auto-approved in `plan-auto` mode (no buttons shown)
 * Text-based outline gate on ExitPlanMode after "Pause & Outline Plan" — retries without written outline text are auto-denied; the former time-based progressive cooldown was retired in [#570](https://github.com/littlebearapps/untether/issues/570) (upstream retry loop fixed in Claude Code ≥ 2.1.215)
 * `📋 Plan (approved)` re-emit (#508): each `ExitPlanMode` control request is recorded per `request_id` (`ClaudeStreamState.exitplanmode_plans`) and settled only by a decision on that request. Its body becomes `last_exitplanmode_plan`, the prepend source, only when the request is approved: by Telegram Approve (`write_control_response`), by the `plan-auto` stamp, or by the post-outline `_DISCUSS_APPROVED` auto-approve. It is dropped on any denial or timeout. **The plan file is the source of truth, not `input.plan`.** On plan-file CLIs (seen on 2.1.284) Claude issues the plan-file `Write` and `ExitPlanMode` in the same message, and the CLI reads `input.plan` before the Write lands, so the input carries the *previous* plan. Untether tracks the parent's `Write`/`Edit`/`MultiEdit` calls to `<config dir>/plans/*.md` (`~/.claude` or `$CLAUDE_CONFIG_DIR`; subagent writes are ignored) in `plan_file_path` / `plan_file_content`. At decision time the body is the last full `Write`'s content if there is one, otherwise the file read from disk (at most 256 KiB, and only if it still resolves to a plan file, so a symlink can't point it elsewhere), otherwise `input.plan` as a fallback for CLIs without plan files. When the input disagrees with the file, Untether logs `claude.plan.stale_input` (INFO: `decision`, `plan_source`, `input_chars`, `file_chars`) and uses the file. On the input-only fallback, bodies you explicitly deny (❌ Deny) are remembered for the process, and an approved input identical to one of them logs `claude.plan.stale_input reason=matches_rejected` and prepends nothing. Pause & Outline and Let's discuss denials pass `rejects_plan=False`: they are procedural, not a verdict on the plan ([#793](https://github.com/littlebearapps/untether/issues/793))
+* Truthful late taps ([#685](https://github.com/littlebearapps/untether/issues/685)): the CLI silently ignores a second answer to the same request, so "was this already answered?" comes from Untether's own state. `_HANDLED_REQUESTS` (LRU, 200) records *how* and *where* each request was resolved (`HandledControl`: `action`, `outcome` = answered / cancelled / expired, `channel_id`), and `classify_control_request()` maps a tap to `pending` / `in_flight` / `already_handled` / `cancelled` / `not_found`. Only a `pending` request is answered (`respond_to_control_request()`); the dispatcher reserves it synchronously in the early-toast hook (`_INFLIGHT_CONTROL_RESPONSES`, released in the dispatch `finally`), so of two concurrent taps only the first writes. A late tap toasts `Already answered` / `No longer needed` / `This request has expired`, posts a silent `ℹ️ Already answered — <what the first tap did>` line and never logs `claude_control.sent`. The synthetic `da:<session>` buttons classify before acting too, so a Deny → Approve double tap can't flip the verdict. A `cancelled` or `expired` record is never overwritten by a later answer; the 5-minute sweep records `timeout`/`expired`, drops the request from `_REQUEST_TO_SESSION`, strips its buttons and skips a request whose answer is in flight. `send_claude_control_response()` stays as a bool wrapper for the AskUserQuestion callers (`True` for sent or already answered, `False` for not found / failed / cancelled)
+* CLI-withdrawn requests and unanswerable requests ([#684](https://github.com/littlebearapps/untether/issues/684)): the CLI has **no deadline** on a permission prompt (a request can wait indefinitely), and it withdraws one it no longer needs — interrupt, turn abort — with `{"type":"control_cancel_request","request_id":"<id>"}` (no `session_id`, no reply expected; any late answer is ignored). Untether writes nothing and retires the request from the run's own state: registries cleared, its action completed (`⏹️ Permission request withdrawn — Claude Code no longer needs an answer`, which drops the keyboard on the next render), the record marked `cancelled` so a tap toasts `No longer needed`, and a pending AskUserQuestion stops capturing the chat's next message. A cancel that lands while a tap is writing its answer leaves the registries to that writer and the tap reports `⏹️ Claude Code withdrew this request`. A held-open Pause & Outline request keeps its outline-message buttons until the run ends; a tap answers `No longer needed`. Logs `control_request.cancelled_by_cli` (INFO: `kind` = tool / ask / outline_hold, `age_s`, `had_action`, `inflight`); an id already answered or unknown logs DEBUG `cancel_after_answer` / `cancel_unknown`. The 5-minute auto-deny (`CONTROL_REQUEST_TIMEOUT_SECONDS`) is Untether policy that only runs when **another** interactive request arrives, so a lone request never expires. Instead, the run-level progress monitor logs **`control_request.unanswerable`** (WARN, once per request) for a request pending past `[watchdog] tool_timeout` when nothing can answer it: no `claude_control:` / `aq:` button on the run's live messages (turn 1's progress message until its result, the open follow-up/wake turn's, or an outline message) and no text-reply route (`no_keyboard`), or no stdin writer for the session (`no_session_writer`). Detect-only: no auto-deny, no chat message, the live-session hold is unchanged; `session.summary` carries `unanswerable_control_requests`. Kill switch `[watchdog] detect_unanswerable_control_requests = false`. When the same session's real ExitPlanMode is held open after an outline-guard auto-deny, the earlier `da:<session>` escalation button is retired (`control_request.da_superseded`; a tap reads "This request has expired — replaced by the outlined plan") so it can't pause the live session until the 4 h cap
 
 **Safety note:** `-p/--print` skips the workspace trust dialog; only use this flag in trusted directories.
 
@@ -107,7 +109,7 @@ Notes:
 * If `allowed_tools` is omitted, Untether defaults to `["Bash", "Read", "Edit", "Write"]`.
 * Untether reads `model`, `permission_mode`, `allowed_tools`, `extra_args`, `dangerously_skip_permissions`, and `use_api_billing` from `[claude]`.
 * `permission_mode` is validated at config load against the same allowlist crons use ([#742](https://github.com/littlebearapps/untether/issues/742)); an unknown value raises a `ConfigError` instead of failing at subprocess spawn. See "Permission modes" below.
-* `extra_args` lets you pass additional upstream `claude` CLI flags that Untether doesn't expose directly — for example `["--chrome"]` opts into the Claude-in-Chrome extension (otherwise gated off by Claude Code 2.1.x), or `["--strict-mcp-config"]` / `["--mcp-config", "path"]` for MCP tweaks. Flags Untether manages internally (`-p`, `--print`, `--output-format`, `--input-format`, `--resume`/`-r`, `--continue`/`-c`, `--permission-mode`, `--permission-prompt-tool`) are rejected at config-load with a `ConfigError`. Mirrors `codex.extra_args` and `pi.extra_args`. `--include-hook-events` is **not** reserved: Untether adds it itself in control-channel mode (see "Async hooks" under Live sessions) and skips its own copy when `extra_args` already carries it, so configs that already pass it keep working ([#812](https://github.com/littlebearapps/untether/issues/812)).
+* `extra_args` lets you pass additional upstream `claude` CLI flags that Untether doesn't expose directly — for example `["--chrome"]` opts into the Claude-in-Chrome extension (otherwise gated off by Claude Code 2.1.x), or `["--strict-mcp-config"]` / `["--mcp-config", "path"]` for MCP tweaks. Flags Untether manages internally (`-p`, `--print`, `--output-format`, `--input-format`, `--resume`/`-r`, `--continue`/`-c`, `--permission-mode`, `--permission-prompt-tool`, `--permission-prompts`, `--allowedTools`/`--allowed-tools`) and the approval bypasses (`--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, a bare `--`) are rejected at config-load with a `ConfigError` naming the flag (never its value), in every spelling — `--flag=value` and short clusters such as `-pc` included ([#209](https://github.com/littlebearapps/untether/issues/209); see [Security → Engine CLI flags](../../../how-to/security.md#engine-cli-flags-extra_args)). A default engine with a refused flag won't start; any other engine is disabled (`failed to load`). Mirrors `codex.extra_args`. `--include-hook-events` is **not** reserved: Untether adds it itself in control-channel mode (see "Async hooks" under Live sessions) and skips its own copy when `extra_args` already carries it, so configs that already pass it keep working ([#812](https://github.com/littlebearapps/untether/issues/812)).
 * By default Untether strips `ANTHROPIC_API_KEY` from the subprocess environment so Claude Code uses subscription billing. Set `use_api_billing = true` to keep the key.
 
 ### Permission modes
@@ -139,18 +141,85 @@ reaches the CLI verbatim.
 > rename `auto` is a value the user can legitimately *choose* from the UI, and
 > a per-read rewrite would make the new mode permanently unreachable. A TOML
 > `permission_mode = "auto"` is never rewritten: it now means the CLI's auto
-> mode and logs a one-shot `claude.permission_mode.auto_semantics_changed`
-> WARN.
+> mode. See "Config audit" below for the WARN that says so.
+
+**Config audit ([#751](https://github.com/littlebearapps/untether/issues/751), 0.35.5rc15).**
+`build_runtime_spec` runs `untether.permission_audit` against the *parsed*
+config at startup and on every config reload (`config_watch` passes
+`reason="reload"`). Crons are resolved to their engine the way the dispatcher
+does (`engine` → the project's `default_engine` → the default engine) and only
+Claude ones count; crons are skipped while `[triggers] enabled = false`. Three
+WARNs, each logged once per change of its entry set (an unrelated reload is
+silent; a reload that adds an entry re-emits the whole list; a reload that
+clears it resets silently), and TOML is never rewritten:
+
+* `claude.permission_mode.auto_semantics_changed` — `entries`
+  (`engines.claude`, `triggers.crons[<id>]`; capped at 50, `count` is the
+  total), `reason` (`startup` / `reload`), `config_path`, `note`. Log-only;
+  it is kept through 0.35.x and removed in 0.36.0. It replaces the old
+  one-shot WARN in `_validate_permission_mode`, whose process latch swallowed
+  every reload and which never saw crons.
+* `trigger.unattended_approval_risk phase=config` — crons whose explicit mode
+  waits for a tap nobody gives: `default` / `manual` / `acceptEdits`
+  (`waits_for="tool approval"`) and `plan` (`"plan approval"`; its
+  `ExitPlanMode` is never auto-approved). `plan-auto`, `auto`, `dontAsk` and
+  `bypassPermissions` never warn (`CLAUDE_TAP_REQUIRED_MODES` in
+  `run_options.py`). Spent `run_once` crons are skipped (they no longer fire).
+  A cron without a mode inherits the chat's `/planmode` or engine config,
+  which the static audit doesn't guess at: `telegram/loop.py` logs the same
+  event with `phase=dispatch`, `trigger`, `mode` and `source`
+  (`cron` / `chat_pref` / `engine_config`) when a `cron:` or `webhook:` run
+  reaches Claude in one of those modes, once per (trigger, mode) per process.
+  `/at` and `/loop` runs are excluded — a person scheduled them from the chat.
+* `trigger.cron.permission_mode_invalid` — a cron with no `engine` that
+  resolves to Claude and whose mode Claude doesn't accept (e.g.
+  `"bogus-typo"`). The cron validator can't catch this without knowing the
+  default engine, and a `ConfigError` would disable every trigger, so it is a
+  WARN; the run would fail at spawn.
+
+**Requested vs effective mode ([#751](https://github.com/littlebearapps/untether/issues/751), security).**
+The CLI does not warn when it can't honour `--permission-mode`: `auto` on a
+model that doesn't support it (Haiku) silently runs as `default`, with nothing
+on stderr (findings Q3, probe Z9). `new_state` records the mode the first
+`system/init.permissionMode` should report
+(`ClaudeStreamState.requested_permission_mode`: `plan-auto` → `plan`,
+`manual` → `default` — probe P1b shows `--permission-mode manual` reports
+`default` — and `bypassPermissions` whenever
+`dangerously_skip_permissions = true`, which overrides the mode). On the
+**first** init of the process only (compaction and live turns re-emit `init`;
+mode changes after start arrive as `system/status`), a difference logs
+`claude.permission_mode.mismatch` (`requested`, `effective`, `model`,
+`resumed`, `prompting_rearmed`) and adds a warning row after the
+`StartedEvent`: `⚠️ Asked for <requested> mode — Claude Code is running
+<effective>`, plus ` (auto mode isn't available for this model)` when `auto`
+was asked for. Resumed runs are checked too: a `--resume` reports the flag's
+mode, not the stored one (probe P1). If the effective mode is a prompting mode
+(`default` / `acceptEdits`) and the run was classed autonomous,
+`state.prompting_mode` is **re-armed** (row suffix `; approvals will be
+requested`): every later stage-6 `can_use_tool` routes to Telegram instead of
+being blanket-approved. `system/init` precedes every control request, so no
+request slips through first. A gate is never disarmed on a CLI report (e.g.
+`default` asked, `bypassPermissions` reported). **Residual (#835):** the
+default `--allowedTools Bash,Read,Edit,Write` still goes out for `auto`, so on
+a downgraded run those four tools stay pre-approved at stage 5. Probe P2
+(zero-token, CLI 2.1.285) showed the allowlist does *not* bypass auto mode's
+classifier on a supported model — an allowlisted `rm -rf` outside the project
+was sent to the classifier exactly as without the flag — so dropping it for
+`auto` would buy nothing there, and the flag is kept.
 
 **Interaction with `--permission-prompt-tool stdio`.** Untether passes the
 prompt tool alongside *every* mode, and the two compose rather than conflict:
 
-* Modes that prompt (`default`, `manual`, `plan`) raise a `control_request`
-  for each gated tool, which becomes a Telegram approval.
-* Modes that don't prompt for routine work (`acceptEdits`, `auto`) raise no
-  `control_request` for the actions they auto-approve. `diff_preview` is
-  therefore inert in those modes — it has been inert under `acceptEdits`
-  since it shipped, and `auto` behaves the same way.
+* Prompting modes (`default`, `manual`, `acceptEdits`) raise a
+  `control_request` for every tool the mode doesn't cover; each becomes a
+  Telegram approval (with a diff preview for Edit/Write). Autonomous modes
+  (`plan`, `plan-auto`, `auto`, `dontAsk`, `bypassPermissions`) only surface
+  `ExitPlanMode` and `AskUserQuestion`; see the table below
+  ([#749](https://github.com/littlebearapps/untether/issues/749)). `/planmode`
+  and `/config` describe each mode from one table,
+  `telegram/commands/_permission_mode_text.py`, whose wording is tied to
+  `is_claude_prompting_mode()` by a test
+  ([#747](https://github.com/littlebearapps/untether/issues/747)).
 * **`AskUserQuestion` still raises a `can_use_tool` control_request in `auto`
   mode** (probed on 2.1.228 against Untether's exact argv), so ask-mode option
   buttons keep working. This was the load-bearing question for
@@ -164,10 +233,13 @@ prompt tool alongside *every* mode, and the two compose rather than conflict:
   supplies a prompt tool, that fallback surfaces as a normal Telegram
   approval rather than a silently dropped action.
 
+**Plan re-arm in live sessions ([#383](https://github.com/littlebearapps/untether/issues/383), 0.35.5rc15).** An approved `ExitPlanMode` moves the CLI to `prePlanMode ?? "default"` — `default` for a session started in plan — and reports it as `system/status{status:null,permissionMode:"default"}`. A live session (#776) used to stay there for every later turn. The runner now tracks the effective mode (`ClaudeStreamState.effective_permission_mode`, from every `system/init.permissionMode`, `system/status` frames with a `permissionMode`, and the ack of its own request; `claude.permission_mode.changed`) and, in a chat whose configured mode maps to CLI `plan` (`plan`, `plan-auto`), sends the parent-initiated `{"type":"control_request","request_id":"ut_plan_rearm_<sid>_<n>","request":{"subtype":"set_permission_mode","mode":"plan"}}` when the session has left plan. Never for prompting modes (`default` / `manual` / `acceptEdits`) or the other autonomous modes (`auto` / `dontAsk` / `bypassPermissions`), never outside a live session, and never unless the CLI reported `plan` at least once in this process (so it can't fight `--dangerously-skip-permissions`, which overrides `plan`). One request in flight at a time. `plan-auto` is re-armed before follow-ups and idle steers only, not at the idle boundary (Decision 6: its rubber stamp would approve a planned wake turn anyway, so planning it costs a plan-model call and an `ExitPlanMode` round trip for no check). Logs `claude.permission_mode.rearm_sent` (`reason` = `idle` / `followup` / `steer`), `rearm_ack`, `rearm_failed` (WARN; the session is closed once idle and the next message resumes a fresh `--permission-mode plan` process), `rearm_write_failed`. Kill switch `[watchdog] rearm_plan_mode = false`. Plan mode switches a haiku session's model to `claude-sonnet-5-5` while planning, so re-planned follow-ups cost what they did before live sessions. **Known limit (CLI 2.1.285):** plan mode no longer blocks a `Write` internally — it raises `can_use_tool` with `decision_reason_type:"mode"`, which Untether's autonomous-mode stage-6 handler approves; the model's plan-mode instructions are what hold it back (see the findings addendum in `docs/findings/2026-09-30-claude-sdk-control-permissions-context.md`).
+
 Auto mode requires a supported model (Opus 4.6+/Sonnet 4.6+/Fable 5) and an
-organisation that has not set `permissions.disableAutoMode`. Where it is
-unavailable the CLI rejects `--permission-mode auto` at startup with rc=1 and
-a stderr message, which Untether surfaces through the normal fatal-error path.
+organisation that has not set `permissions.disableAutoMode`. On CLI 2.1.285
+an unsupported model does **not** fail the run: the CLI starts in `default`
+and says so only in `system/init.permissionMode`, which Untether compares
+with the request (see "Requested vs effective mode" above).
 
 #### The six-stage permission pipeline, and where Untether sits ([#749](https://github.com/littlebearapps/untether/issues/749))
 
@@ -216,7 +288,7 @@ contradict the mode.
 |---|---|---|
 | `default` | ✗ | every tool prompts |
 | `manual` | ✗ | every tool prompts |
-| `acceptEdits` | ✗ | in-scope edits auto-run in the CLI; out-of-scope writes prompt |
+| `acceptEdits` | ✗ | reads, in-scope edits and common filesystem commands auto-run in the CLI; every other tool prompts |
 | `plan` | ✓ | reads pre-approved; writes blocked internally by plan mode |
 | `plan-auto` | ✓ | as `plan`, plus `ExitPlanMode` rubber-stamped |
 | `auto` | ✓ | classifier decides at stage 4; stage 6 is the fallback path |
@@ -337,6 +409,41 @@ Claude Code's `rate_limit_event` is a **quota-status snapshot** (`status` = `all
 
 When an API call fails with a retryable error (429/529/5xx/connection), Claude Code emits `system/api_retry` with `attempt`, `max_retries`, `retry_delay_ms`, `error_status` and an `error` category before backing off. The runner renders one updating note per retry sequence (`🔁 API error 529 (overloaded) — retrying in 8s (attempt 2/10)`) and latches `api_retry_wait_until` so the bridge's stall monitor treats the back-off as an expected wait (`awaiting_api_retry()`, reason `api_retry_waiting`) rather than a hang. `claude.api_retry` logs at INFO, WARN on the final attempt. Shapes in the [stream-json cheatsheet](stream-json-cheatsheet.md).
 
+### Context usage ([#819](https://github.com/littlebearapps/untether/issues/819))
+
+The progress, final and live-turn header lines end with Claude's context-window use: `done · claude · 1m 36s · step 10 · 62% ctx`. No emoji and no footer segment; the segment is omitted whenever the value is unknown. Research: [`docs/findings/2026-09-30-claude-sdk-control-permissions-context.md`](../../../findings/2026-09-30-claude-sdk-control-permissions-context.md) Q5.
+
+- **Numerator** — `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` of the latest **main-thread** assistant `message.usage` (frames with a `parent_tool_use_id` and `<synthetic>` frames are skipped, as the CLI's own `/context` skips them). This is the usage part of `/context`'s total; `/context` also adds a local estimate of messages after the last response (tool results, queued input), so **during a tool loop the header reads lower than `/context`** and converges at each new response.
+- **Denominator** — `result.modelUsage.<model>.contextWindow`, learned per model on each `result` and cached per process (`claude.context.window_learned`, INFO, once per model). A model id ending in `[1m]` (the session's `system/init` model, or the frame's) with the other id equal to its base resolves to 1 000 000 before any cache hit. Dated ids are never fuzzy-matched to a base id: a miss logs `claude.context.window_miss` (DEBUG) and shows nothing. So the first turn on a model not seen since the last restart gets its `% ctx` only at the final.
+- **Rounding** — `Math.round` half-up in integer maths, matching `/context`. A value over 100 is shown as 100 after one `claude.context.over_window` WARN per (session, model).
+- **After a compaction** (`system/compact_boundary`) the segment disappears until the next main-thread response (`post_tokens` excludes the system prompt and tools, so it would under-report).
+- **Configured autocompact windows** (`--autocompact` in `extra_args`, settings `autoCompactWindow`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW`) are not read: the header divides by the model window, `/context` by the configured one, so ours reads lower. Exact parity via the `get_context_usage` control request is [#833](https://github.com/littlebearapps/untether/issues/833).
+
+The value travels as an `ActionEvent` of kind `telemetry` (id `claude.context`, phase `updated`, `detail.context_pct` / `context_used` / `context_window` / `model`), emitted only when the integer percentage changes. `ProgressTracker` stores it apart from the actions (no step, never a running tool, never folded or exported). In a live session the runner re-emits the current value right after each `TurnEvent(started)` (a turn's tracker starts empty), holds changes that arrive between turns until the next turn opens, and forwards result-time telemetry before the `TurnEvent(completed)`. `usage["context"]` (`pct`, `used`, `window`, `model`) rides on the result for the `runner.completed context_pct=` log field only. Display switch: `[progress] show_context_usage` (default `true`, re-read per run). Claude only; the Codex half is [#832](https://github.com/littlebearapps/untether/issues/832).
+
+### Compaction ([#819](https://github.com/littlebearapps/untether/issues/819))
+
+When Claude Code compacts the conversation, automatically as the context fills or on a `/compact` command, the progress message shows one `🗜️` row for it. The row counts as one step. Frame shapes are in the [stream-json cheatsheet](stream-json-cheatsheet.md#context-usage-and-compaction-819); real transcripts from CLI 2.1.285 are in `tests/fixtures/claude_{compaction,autocompact,compact_empty}_2.1.285.jsonl`.
+
+| Frame | Row |
+|---|---|
+| `system/status {"status":"compacting"}` | `▸ 🗜️ Compacting context…` (the CLI re-sends it every 30 s while compacting, which updates the same row) |
+| `system/status {"status":null,"compact_result":"success"}` | `✓ 🗜️ Context compacted` |
+| `system/compact_boundary {"compact_metadata":{…}}` | the same row becomes `✓ 🗜️ Context compacted · 182k → 41k tokens (auto)` (no arrow without `post_tokens`) |
+| `system/status {"status":null,"compact_result":"failed","compact_error":…}` | `🗜️ Compaction failed · <error>` (warning, `claude.compaction.failed` WARN) |
+| `system/status {"status":null}` with a row open | `🗜️ Compaction skipped` (a PreCompact hook skipped it) |
+| `system/status {"status":null,"permissionMode":…}` with no row open | nothing (#383's mode-change edge) |
+
+Both subtypes go through the one `status` / `compact_boundary` registration in `_SYSTEM_SUBTYPE_HANDLERS`. Each boundary logs `claude.compaction` (`trigger`, `pre_tokens`, `post_tokens`, `cumulative_dropped_tokens`, `duration_ms`, `result`), clears `% ctx` until the next response, and marks the next non-tool_result `user` frame as the compaction summary. That summary is not a fresh prompt, so it doesn't reset the #544/#333 per-turn scalars. The flag also clears at every result and turn open.
+
+**What the capture showed (2026-10-01, Haiku).** Auto compaction **does** fire in `-p` stream-json mode. The earlier probe (Z11) never reached the threshold, because the CLI's `Read` dedupe keeps a re-read file out of the context. It runs between a `tool_result` and the next API request, inside the turn, sends no fresh `init`, and its boundary frame has no `session_id`. A manual `/compact` sends a fresh `init` between the `status` and the boundary frame, then a replayed `<local-command-stdout>Compacted </local-command-stdout>` (`isReplay: true`) and a result with `num_turns: 0`, `duration_api_ms: 0` and an empty `result`. `/compact` on a session with no history sends no compaction frames at all: the answer is a `<synthetic>` "Error: No messages to compact". The summary frame carries `isSynthetic: true`; `isCompactSummary` was not on the wire. `message.model` equals the `modelUsage` key (`claude-haiku-4-5-20251001` for both).
+
+**Liveness.** `runner.py` counts `system/status` and `system/compact_boundary` frames as liveness (`last_stdout_at`, `event_count`), but they never become `last_event_type`, the same rule as #812's hook frames. A CLI that dies mid-compaction after a `tool_result` still looks like `user` to auto-continue. Ring labels: `status:<value|null>`, `compact_boundary`. Each `compacting` frame latches `compaction_wait_until` for 120 s (`awaiting_compaction()`). The bridge's stall chooser picks the `compacting` expected wait (reason `compacting`, demoted `subprocess.approval_pending` INFO, no auto-cancel) ahead of `running_tool`, and the stuck-after-tool_result detector stands down (`progress_edits.stuck_after_tool_result.suppressed reason=compacting`). The latch is bounded: four missed heartbeats and a wedged compaction is an ordinary stall again. `/export` keeps one start and one finish per compaction (the heartbeats are skipped).
+
+**The `/compact` 0-turn result.** A successful manual compaction ends in a 0-turn, 0-ms, empty result, the same shape as the [#596](https://github.com/littlebearapps/untether/issues/596) empty resume. The segment's compactions ride on `usage["compaction"]` (`count`, last `trigger` / `pre_tokens` / `post_tokens` / `result`, `manual_success`) on both the `CompletedEvent` and a live `TurnEvent`. `manual_success` is narrow: every compaction recorded in the segment is `manual` with `compact_result: success` (so it reached a boundary), and the result is not an error. Only then does the bridge skip the #596/#631 anomaly (decided on the raw answer first). The final gets the body `🗜️ Context compacted · 51k → 2.2k tokens (manual)` and status `done`, and the session stays live. An auto or failed compaction followed by a 0-turn result still takes the quarantine-and-fresh path, because a poisoned session can auto-compact on resume and *then* return the empty result. The #776 resume guard never absorbs a compaction's result. `runner.completed` logs `compactions=` and `compaction_trigger=`.
+
+**`/compact` from Telegram.** Inside a live session's idle window it is injected raw, so it compacts. The runner opens the follow-up turn at the `compacting` frame, which gives the rows their own message. Outside the window the run is resumed with the preamble-prefixed text, so the CLI treats it as prose. A bare `/compact` there is [#834](https://github.com/littlebearapps/untether/issues/834).
+
 ### Safeguard stops ([#814](https://github.com/littlebearapps/untether/issues/814))
 
 Anthropic's safeguards can stop a response (HTTP 200, `stop_reason: "refusal"`). Claude Code then either re-runs it once on the same model (unless `CLAUDE_CODE_DISABLE_REFUSAL_RETRY` is set), switches to a fallback model (`switchModelsOnFlag`), or ends the turn. Before 0.35.5rc14 none of this was visible: the assistant frame's `stop_reason` wasn't decoded and `system/informational` was dropped. CLI facts: [`docs/findings/2026-09-29-claude-rc14-cli-surface.md`](../../../findings/2026-09-29-claude-rc14-cli-surface.md) §B.
@@ -362,6 +469,8 @@ Once the CLI emits any task event, the native map is authoritative for Monitor /
 ### Live sessions ([#776](https://github.com/littlebearapps/untether/issues/776))
 
 In control-channel mode (a permission mode is set) the Claude CLI keeps running after a `result`: a finished background task, each Monitor line and a firing ScheduleWakeup each start a new turn by themselves, and a user line written to stdin while idle runs as another turn. Before 0.35.5rc11 Untether stopped reading at the first `result` and closed stdin, so those turns ran invisibly (or died — closing stdin stops background work), and SIGTERM/quarantine later sent the next follow-up to a fresh session. Probe evidence: [`docs/findings/2026-09-27-claude-live-session-probes.md`](../../../findings/2026-09-27-claude-live-session-probes.md).
+
+A pending control request pauses the idle-close timers (only the 4 h cap applies); a request the CLI withdraws (`control_cancel_request`) is retired at once and no longer pauses them ([#684](https://github.com/littlebearapps/untether/issues/684)).
 
 **Stream.** The run is still `StartedEvent → ActionEvent* → CompletedEvent` (turn 1, the user's message). The runner keeps reading; every later turn is a `TurnEvent(started) → ActionEvent* → TurnEvent(completed)` segment with a `reason`:
 
@@ -395,7 +504,35 @@ Background subagent events (tagged `parent_tool_use_id`) arriving while the pare
 
 Kill switch: `[watchdog] hold_for_async_hooks = false` passes no flag and holds nothing (pre-rc14 behaviour).
 
-**Lifecycle** (`_live_session_lifecycle`, per run). While idle: nothing live for `post_result_limbo_grace` (60 s) → close stdin; background work still live `post_result_bg_max_hold` (1800 s, re-armed each turn) after the last turn → notice + close; `live_session_max_s` (4 h) from spawn → notice + close; a pending approval/ask or an injected line not yet started pauses the timers. Closing stdin makes the CLI stop its tasks and exit rc=0 (graceful — nothing quarantined); only if it hasn't exited 15 s later (35 s when a background hook is evident, #812) does Untether log a process snapshot (`claude.live_session.close_grace_expired`: state, wchan, CPU across the grace, FDs, TCP, children with redacted cmdlines) and escalate — SIGINT (the CLI's Ctrl-C path), then SIGTERM/SIGKILL 5 s later. The session is quarantined (`forced_teardown_after_result`) only when the close was not clean: a close of an idle turn with no live background work leaves a complete transcript, so it is not quarantined even if the CLI needed a signal ([#791](https://github.com/littlebearapps/untether/issues/791)); #631 empty-resume recovery remains the backstop. `/cancel`, `/new` and drain/restart close idle live sessions the same way with a notice naming the stopped tasks; a turn in progress is still killed by `/cancel`.
+**Plan approvals are turn-scoped ([#383](https://github.com/littlebearapps/untether/issues/383), 0.35.5rc15).** Approving `ExitPlanMode` (or a plan-gated diff-preview tool) adds the session to `_PLAN_EXIT_APPROVED`, which skips the opt-in diff-preview gate for the rest of that reply (#283/#369). Until rc15 it was cleared only at process end, so under live sessions one approval covered every follow-up and wake turn for up to 4 h. `_open_followup_turn` now clears it at **every** turn open, whatever the reason (`claude.plan_approval.cleared reason=turn_boundary`); a mid-turn steer fold (`_absorb_injected`) is not a boundary. An unconsumed post-outline approval (`_DISCUSS_APPROVED`, the `da:` **✅ Approve Plan** button) survives exactly one boundary — `_DISCUSS_CARRY` records the first one (`claude.plan_approval.carried`) and the second clears it — so "outline → Approve Plan → go ahead" needs one tap; consuming it discards both. The ExitPlanMode approval shows **✅ Approve Plan** and, in plan / plan-auto chats, the caption *Approving lets Claude carry out this plan without further prompts.* (prompting-mode chats: *Approving ends planning; Claude still asks before each action.*). The *Plan mode resumes when this reply ends, or after the background agents it starts have finished.* clause is added only when it is true — the re-arm below is on, or live sessions are off (every message respawns with `--permission-mode plan`). **Re-arm timing.** At every live turn close (whatever the outcome: ok, error, interrupted, cancelled) the runner sets `plan_rearm_pending` and writes the re-arm **before** yielding the turn-closing `CompletedEvent` / `TurnEvent(completed)` — the bridge's shielded `on_completed` and turn router run inside that yield and can hold it for up to 60 s, while a wake turn the CLI starts from an already-queued notification needs no stdin line. Follow-up injection (`inject_when_idle`) and idle steers write it again under `live.lock` immediately before the user line if it is still needed (FIFO on stdin: the CLI applies it before that line's turn; a `plan` request can't be refused on 2.1.285, so there is no ack wait). Seeing `plan` again clears `_PLAN_EXIT_APPROVED`. Residual window (probe P-6): when the notification is already queued as the result is emitted, the CLI starts the wake turn ~20 ms later, before it reads the re-arm — that turn's first model call is unplanned and its first tool call is permission-checked in plan. **Agent deferral (C4).** Running background subagents inherit the parent's live mode (probe P-3: after a re-arm a subagent's `Write` raises `can_use_tool` with `decision_reason_type:"mode"` and its next model call carries the plan reminder), so re-arming under the agents the approved reply launched would switch its workers back into planning. `_claim_plan_rearm` therefore defers while a live `local_agent` task that `holds_session` has `origin_turn == plan_exit_turn` (`_exit_turn_agents`); background Bash and Monitor tasks never defer, and agents from an earlier (planning) turn don't count. Keyed on the turn, not start time, so it can't chain: agents a later unplanned turn launches carry a later `origin_turn`, and a #801 revival re-stamps it. Bound (plan 21 D7, `_rearm_deferral`): the deferral ends when those agents are gone (`agents_done`), when none has shown activity for `post_result_bg_max_hold` (`latest_background_progress(state, task_ids)` — a `task_progress` frame, a subagent tool starting/ending, or a live subagent-owned foreground tool; `agents_idle`; `0` = no inactivity bound), or `live_session_max_s` after the plan exit (`ceiling`). `claude.permission_mode.rearm_deferred` (INFO, `reason=live_agents`, `agents`, `plan_exit_turn`, `trigger`) is logged once per boundary and `rearm_deferral_ended` (`reason`, `deferred_s`) when it lifts. It is re-checked at every turn close, on the exit-turn agent's end frame while idle (`_note_plan_deferral_task_end` → `plan_rearm_pending_reason="agents_done"` → the post-line drain writes it ahead of the wake turn the CLI starts for the finish, same residual window as P-6), by the lifecycle while idle (`_lift_idle_plan_deferral`, for `agents_idle` / `ceiling`), and before each follow-up / idle steer. A follow-up or idle steer written meanwhile is recorded in `state.unplanned_commands`, and its turn — like a wake turn opened during the deferral in a `plan` chat — carries `TurnEvent.detail["plan_deferred"] = {"agents": N}`; the bridge adds `⚠️ Not re-planned: the approved plan's background agents are still running. Plan mode resumes when they finish.` under the turn header. Holding the follow-up instead was rejected (it would re-create the #647 queue delay).
+
+**Lifecycle** (`_live_session_lifecycle`, per run). While idle: nothing live for `post_result_limbo_grace` (60 s) → close stdin; background work still live but **quiet** for `post_result_bg_max_hold` (1800 s) → notice + close; `live_session_max_s` (4 h) from spawn → notice + close; a pending approval/ask or an injected line not yet started pauses the timers.
+
+**Background hold = quiet time** ([#829](https://github.com/littlebearapps/untether/issues/829)). The hold counts from the newest background activity, not from the last turn. Activity is read from the native task map (`latest_background_progress`) and comes from:
+
+- a turn, or a task starting or being revived (#801);
+- any `task_progress` frame for a live background agent. The CLI emits one per subagent tool call, with usage rising every time; a frame for an ended task id never counts;
+- a subagent-owned foreground tool (`owned_by_subagent`, not backgrounded) starting or ending. While one is live its agent counts as active, because the CLI sends no `task_progress` during a long foreground tool. The owned task registers about 3 s into the tool and ends with a `task_notification`;
+- a background Bash's output file being written. The file is named in the Bash tool_result (`Output is being written to: …/tasks/<id>.output`). It's checked only when the hold would expire, off-thread, from its mtime. `local_bash` has no progress frames, and Monitors never count.
+
+A silent command (`sleep 600`) and an agent that has stopped reporting still close after the hold. Re-arms log `claude.live_session.hold_rearmed source=task_progress|agent_tool|bash_output|task_started` (the first of each idle period, then at most every 5 min); `stdin_closed` and `close_grace_expired` carry `last_progress_age_s`. Kill switch `[watchdog] bg_hold_rearm_on_progress = false` (read per spawn) restores the turn-based hold. Evidence: [`docs/findings/2026-09-30-claude-bg-agent-activity-and-eof.md`](../../../findings/2026-09-30-claude-bg-agent-activity-and-eof.md).
+
+**Close and quarantine.** Closing stdin makes the CLI stop background **Bash** and exit rc=0 (graceful, nothing quarantined). Background **agents ignore EOF**: the CLI lets them run to completion, even running their wake turns with stdin closed. So a close over a live agent waits the grace: 15 s, or 35 s when a background hook is evident (#812). Untether then logs a process snapshot (`claude.live_session.close_grace_expired`: state, wchan, CPU across the grace, FDs, TCP, children with redacted cmdlines) and escalates: SIGINT (the CLI's Ctrl-C path), then SIGTERM/SIGKILL 5 s later.
+
+The session is quarantined (`forced_teardown_after_result`) only when the close was not clean:
+
+- a close of an idle turn with no live background work leaves a complete transcript, so it isn't quarantined even if the CLI needed a signal ([#791](https://github.com/littlebearapps/untether/issues/791));
+- **#829 B2:** an Untether-initiated close (`max_hold`, `cancel`, `new`, `drain`, `options_changed`) of a session whose turn was closed isn't quarantined when the CLI exits **rc 0 on the SIGINT**. Probed 6/6 resumable, no dangling `tool_use`. It logs `claude.live_session.exited_after_sigint stopped_clean=True`, and the decision is taken after the SIGINT wait;
+- `abs_cap` (it can close mid-turn), the `error` close, a non-zero exit and a CLI that also ignores SIGINT (the SIGTERM path) keep the quarantine.
+
+#631 empty-resume recovery remains the backstop. `/cancel`, `/new` and drain/restart close idle live sessions the same way with a notice naming the stopped tasks; a turn in progress is still killed by `/cancel`.
+
+**Notices.** The `closing` notice never promises "reply to continue". Examples: `⏳ Closing session — 2 background tasks still running with no progress for 30 min: A, B. Stopping them.`, `⏹ Stopped 1 background task: A.`, `⏳ Untether is restarting — stopping …`. Once the process has gone, the lifecycle emits one `closed` event (`{"reason", "quarantined", "tasks"}`, logged as `claude.live_session.closed`). If the closing notice named tasks, the bridge follows it with one silent line:
+
+- not quarantined: `↩️ Reply to continue in the same session.`
+- quarantined: `⚠️ The session didn't stop cleanly, so your next message starts a fresh session (Claude won't remember this run). Partial work may be left in the working tree.`
+
+After `options_changed` only the warning is sent, because the queued message already resumes.
 
 **Resume guard.** On `--resume` of a session whose previous process ended with background work still live, the CLI replays `task_notification{stopped}` and answers it with a 0-turn result before running the real turn. That result is absorbed (`claude.resume_guard.absorbed`), not delivered — no empty-resume quarantine or resend.
 

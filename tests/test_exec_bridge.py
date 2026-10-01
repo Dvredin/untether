@@ -2,6 +2,8 @@ import contextlib
 import os
 import sys
 import uuid
+from types import SimpleNamespace
+from typing import Any
 
 import anyio
 import pytest
@@ -1559,6 +1561,334 @@ async def test_cost_footer_shown_on_success_run(monkeypatch) -> None:
     # Cost footer (money bag emoji) SHOULD appear on success runs
     assert "\U0001f4b0" in final_text
     assert "$1.25" in final_text
+
+
+# ===========================================================================
+# #419: Codex thread-cumulative token usage → per-run delta
+# ===========================================================================
+
+
+async def _run_codex_usage(
+    usage: dict, *, session_id: str, resume: bool, transport: "FakeTransport"
+) -> None:
+    runner = ScriptRunner(
+        [Return(answer="done", usage=usage)],
+        engine=CODEX_ENGINE,
+        resume_value=session_id,
+    )
+    cfg = ExecBridgeConfig(
+        transport=transport, presenter=MarkdownPresenter(), final_notify=True
+    )
+    await handle_message(
+        cfg,
+        runner=runner,
+        incoming=IncomingMessage(channel_id=123, message_id=10, text="go"),
+        resume_token=(
+            ResumeToken(engine=CODEX_ENGINE, value=session_id) if resume else None
+        ),
+    )
+
+
+@pytest.mark.anyio
+async def test_codex_resumed_run_accounts_token_delta() -> None:
+    from untether.session_costs import get_session_cost_ledger
+
+    sid = f"codex-419-{uuid.uuid4().hex[:8]}"
+    transport = FakeTransport()
+    with structlog.testing.capture_logs() as logs:
+        await _run_codex_usage(
+            {"input_tokens": 100, "cached_input_tokens": 0, "output_tokens": 10},
+            session_id=sid,
+            resume=False,
+            transport=transport,
+        )
+        await _run_codex_usage(
+            {"input_tokens": 250, "cached_input_tokens": 0, "output_tokens": 30},
+            session_id=sid,
+            resume=True,
+            transport=transport,
+        )
+    deltas = [e for e in logs if e["event"] == "usage.token_delta"]
+    assert [e["source"] for e in deltas] == ["new_session", "ledger"]
+    assert deltas[1]["input_delta"] == 150
+    assert deltas[1]["cumulative_input"] == 250
+    completed = [e for e in logs if e["event"] == "runner.completed"]
+    assert completed[-1]["input_tokens"] == 150
+    assert completed[-1]["token_delta_source"] == "ledger"
+    assert "turn_cost_usd" not in completed[-1]
+    tokens = get_session_cost_ledger().session_tokens(CODEX_ENGINE, sid)
+    assert tokens is not None
+    assert (tokens.totals["input_tokens"], tokens.totals["output_tokens"]) == (
+        250,
+        30,
+    )
+    assert tokens.runs == 2
+
+
+@pytest.mark.anyio
+async def test_codex_usage_accounted_once_per_run() -> None:
+    from untether.session_costs import get_session_cost_ledger
+
+    sid = f"codex-419-{uuid.uuid4().hex[:8]}"
+    await _run_codex_usage(
+        {"input_tokens": 100, "cached_input_tokens": 0, "output_tokens": 10},
+        session_id=sid,
+        resume=False,
+        transport=FakeTransport(),
+    )
+    tokens = get_session_cost_ledger().session_tokens(CODEX_ENGINE, sid)
+    assert tokens is not None and tokens.runs == 1
+
+
+# ===========================================================================
+# #417: token footer for flat (Codex) usage, 🔢 prefix, thread-total label
+# ===========================================================================
+
+
+class TestFormatRunCostTokenShapes:
+    def test_format_run_cost_flat_codex_tokens(self):
+        usage = {"input_tokens": 12300, "cached_input_tokens": 0, "output_tokens": 400}
+        assert _format_run_cost(usage) == "12.3k/400"
+
+    @pytest.mark.parametrize(
+        ("usage", "expected"),
+        [
+            (
+                {
+                    "total_cost_usd": 0.15,
+                    "num_turns": 3,
+                    "usage": {"input_tokens": 72500, "output_tokens": 120},
+                },
+                "$0.15 · 3 tn · 72.5k/120",
+            ),
+            (
+                {"usage": {"input_tokens": 5000, "output_tokens": 300}},
+                "5.0k/300",
+            ),
+        ],
+    )
+    def test_format_run_cost_nested_shape_unchanged(self, usage, expected):
+        assert _format_run_cost(usage) == expected
+
+    @pytest.mark.parametrize(
+        ("source", "thread_cumulative", "suffix"),
+        [
+            ("baseline_unknown", True, True),
+            (None, True, True),
+            ("ledger", True, False),
+            ("new_session", True, False),
+            (None, False, False),
+        ],
+    )
+    def test_format_run_cost_thread_total_suffix(
+        self, source, thread_cumulative, suffix
+    ):
+        usage = {"input_tokens": 1000, "output_tokens": 10}
+        if source is not None:
+            usage["token_delta_source"] = source
+        out = _format_run_cost(usage, thread_cumulative=thread_cumulative)
+        assert out is not None
+        assert out.endswith("· thread total") is suffix
+
+    def test_format_run_cost_zero_tokens_is_none(self):
+        assert (
+            _format_run_cost(
+                {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+            )
+            is None
+        )
+
+
+async def _run_footer(
+    runner: ScriptRunner,
+    *,
+    resume_token: ResumeToken | None = None,
+) -> str:
+    transport = FakeTransport()
+    cfg = ExecBridgeConfig(
+        transport=transport, presenter=MarkdownPresenter(), final_notify=True
+    )
+    await handle_message(
+        cfg,
+        runner=runner,
+        incoming=IncomingMessage(channel_id=123, message_id=10, text="go"),
+        resume_token=resume_token,
+    )
+    return transport.send_calls[-1]["message"].text
+
+
+@pytest.mark.anyio
+async def test_codex_footer_shows_per_run_delta_on_resume(monkeypatch) -> None:
+    """#417 + #419 end to end: the footer shows this run's tokens, not the
+    thread's running total, and never the money emoji."""
+    _force_show_api_cost(monkeypatch)
+    sid = f"codex-417-{uuid.uuid4().hex[:8]}"
+    first = await _run_footer(
+        ScriptRunner(
+            [
+                Return(
+                    answer="one",
+                    usage={
+                        "input_tokens": 100000,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 1000,
+                    },
+                )
+            ],
+            engine=CODEX_ENGINE,
+            resume_value=sid,
+        )
+    )
+    assert "\U0001f522100.0k/1.0k" in first
+    second = await _run_footer(
+        ScriptRunner(
+            [
+                Return(
+                    answer="two",
+                    usage={
+                        "input_tokens": 112300,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 1400,
+                    },
+                )
+            ],
+            engine=CODEX_ENGINE,
+            resume_value=sid,
+        ),
+        resume_token=ResumeToken(engine=CODEX_ENGINE, value=sid),
+    )
+    assert "\U0001f52212.3k/400" in second
+    assert "112.3k" not in second
+    assert "thread total" not in second
+    assert "\U0001f4b0" not in first
+    assert "\U0001f4b0" not in second
+
+
+@pytest.mark.anyio
+async def test_codex_continue_without_thread_started_labels_thread_total(
+    monkeypatch,
+) -> None:
+    from untether.session_costs import get_session_cost_ledger
+
+    _force_show_api_cost(monkeypatch)
+    usage = {"input_tokens": 50000, "cached_input_tokens": 0, "output_tokens": 500}
+    runner = ScriptRunner(
+        [
+            Emit(
+                CompletedEvent(
+                    engine=CODEX_ENGINE,
+                    resume=ResumeToken(engine=CODEX_ENGINE, value=""),
+                    ok=True,
+                    answer="continued",
+                    usage=usage,
+                )
+            )
+        ],
+        engine=CODEX_ENGINE,
+    )
+    final = await _run_footer(
+        runner,
+        resume_token=ResumeToken(engine=CODEX_ENGINE, value="", is_continue=True),
+    )
+    assert "50.0k/500 · thread total" in final
+    assert get_session_cost_ledger().session_tokens(CODEX_ENGINE, "") is None
+
+
+@pytest.mark.anyio
+async def test_footer_prefix_money_only_with_cost(monkeypatch) -> None:
+    _force_show_api_cost(monkeypatch)
+    with_cost = await _run_footer(
+        ScriptRunner(
+            [
+                Return(
+                    answer="a",
+                    usage={
+                        "total_cost_usd": 0.05,
+                        "usage": {"input_tokens": 900, "output_tokens": 9},
+                    },
+                )
+            ],
+            engine="opencode",
+        )
+    )
+    assert "\U0001f4b0$0.05" in with_cost
+    token_only = await _run_footer(
+        ScriptRunner(
+            [
+                Return(
+                    answer="b",
+                    usage={"usage": {"input_tokens": 900, "output_tokens": 9}},
+                )
+            ],
+            engine="opencode",
+        )
+    )
+    assert "\U0001f522900/9" in token_only
+    assert "\U0001f4b0" not in token_only
+
+
+@pytest.mark.anyio
+async def test_codex_footer_hidden_when_show_api_cost_false(monkeypatch) -> None:
+    from untether.settings import FooterSettings
+
+    monkeypatch.setattr(
+        "untether.runner_bridge._load_footer_settings",
+        lambda: FooterSettings(show_api_cost=False),
+    )
+    final = await _run_footer(
+        ScriptRunner(
+            [
+                Return(
+                    answer="quiet",
+                    usage={
+                        "input_tokens": 1000,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 10,
+                    },
+                )
+            ],
+            engine=CODEX_ENGINE,
+        )
+    )
+    assert "\U0001f522" not in final
+    assert "1.0k/10" not in final
+
+
+@pytest.mark.anyio
+async def test_opencode_runs_accumulate_session_total(monkeypatch) -> None:
+    from untether.session_costs import get_session_cost_ledger
+
+    _force_show_api_cost(monkeypatch)
+    sid = f"oc-417-{uuid.uuid4().hex[:8]}"
+    finals = []
+    for i, (inp, out) in enumerate([(5000, 300), (2000, 100)]):
+        finals.append(
+            await _run_footer(
+                ScriptRunner(
+                    [
+                        Return(
+                            answer=f"run {i}",
+                            usage={
+                                "usage": {"input_tokens": inp, "output_tokens": out}
+                            },
+                        )
+                    ],
+                    engine="opencode",
+                    resume_value=sid,
+                ),
+                resume_token=(ResumeToken(engine="opencode", value=sid) if i else None),
+            )
+        )
+    assert "\U0001f5225.0k/300" in finals[0]
+    assert "\U0001f5222.0k/100" in finals[1]
+    tokens = get_session_cost_ledger().session_tokens("opencode", sid)
+    assert tokens is not None
+    assert (tokens.totals["input_tokens"], tokens.totals["output_tokens"]) == (
+        7000,
+        400,
+    )
+    assert tokens.runs == 2
+    assert tokens.last_source == "per_run"
 
 
 # ===========================================================================
@@ -9402,3 +9732,710 @@ async def test_810_final_path_still_unregisters_once(progress_store) -> None:
     assert [(r["reason"], r["message_id"]) for r in _810_released(logs)] == [
         ("final", progress_id)
     ]
+
+
+# ---------------------------------------------------------------------------
+# #684: detect-only control_request.unanswerable (run-level monitor)
+# ---------------------------------------------------------------------------
+
+
+def _snap_684(
+    request_id: str = "r-1",
+    *,
+    age_s: float = 700.0,
+    kind: str = "tool",
+    answerable_by_text: bool = False,
+    writer_ok: bool = True,
+):
+    from untether.runners.claude import ControlRequestSnapshot
+
+    return ControlRequestSnapshot(
+        request_id=request_id,
+        session_id="sess-684",
+        age_s=age_s,
+        tool_name="Bash",
+        kind=kind,
+        answerable_by_text=answerable_by_text,
+        writer_ok=writer_ok,
+    )
+
+
+def _edits_684(snaps, visible=frozenset(), *, run_level=True):
+    edits = _make_edits(FakeTransport(), _KeyboardPresenter())
+    edits.run_level = run_level
+    edits._STALL_THRESHOLD_TOOL = 600.0
+    calls = {"probe": 0}
+
+    def _snapshot(now=None):
+        calls["probe"] += 1
+        return list(snaps)
+
+    edits.stream = _make_stream(
+        engine_state=_make_engine_state(control_request_snapshot=_snapshot)
+    )
+    if visible is not None:
+        edits.control_surface_probe = lambda: frozenset(visible)
+    return edits, calls
+
+
+def _unanswerable(logs):
+    return [e for e in logs if e.get("event") == "control_request.unanswerable"]
+
+
+def test_684_unanswerable_warns_once_without_keyboard() -> None:
+    edits, _ = _edits_684([_snap_684()])
+    with structlog.testing.capture_logs() as logs:
+        edits._check_unanswerable_control_requests()
+        edits._check_unanswerable_control_requests()
+    hits = _unanswerable(logs)
+    assert len(hits) == 1
+    assert hits[0]["log_level"] == "warning"
+    assert hits[0]["reasons"] == ["no_keyboard"]
+    assert hits[0]["request_id"] == "r-1" and hits[0]["kind"] == "tool"
+    assert hits[0]["visible_buttons"] == 0
+    assert edits._unanswerable_warned == {"r-1"}
+
+
+def test_684_no_warn_when_keyboard_visible() -> None:
+    edits, _ = _edits_684([_snap_684()], {"claude_control:approve:r-1"})
+    with structlog.testing.capture_logs() as logs:
+        edits._check_unanswerable_control_requests()
+    assert _unanswerable(logs) == []
+
+
+def test_684_no_warn_when_newer_request_shows_buttons() -> None:
+    edits, _ = _edits_684(
+        [_snap_684("r-old", age_s=900.0), _snap_684("r-new", age_s=650.0)],
+        {"claude_control:approve:r-new"},
+    )
+    with structlog.testing.capture_logs() as logs:
+        edits._check_unanswerable_control_requests()
+    assert _unanswerable(logs) == []
+
+
+def test_684_no_warn_below_threshold() -> None:
+    edits, _ = _edits_684([_snap_684(age_s=599.0)])
+    with structlog.testing.capture_logs() as logs:
+        edits._check_unanswerable_control_requests()
+    assert _unanswerable(logs) == []
+
+
+def test_684_ask_answerable_by_text_not_flagged() -> None:
+    edits, _ = _edits_684([_snap_684(kind="ask", answerable_by_text=True)])
+    with structlog.testing.capture_logs() as logs:
+        edits._check_unanswerable_control_requests()
+    assert _unanswerable(logs) == []
+
+
+def test_684_no_session_writer_flagged_even_with_keyboard() -> None:
+    edits, _ = _edits_684([_snap_684(writer_ok=False)], {"claude_control:approve:r-1"})
+    with structlog.testing.capture_logs() as logs:
+        edits._check_unanswerable_control_requests()
+    (hit,) = _unanswerable(logs)
+    assert hit["reasons"] == ["no_session_writer"]
+
+
+def test_684_no_probe_only_writer_reason_can_fire() -> None:
+    edits, _ = _edits_684([_snap_684()], visible=None)
+    with structlog.testing.capture_logs() as logs:
+        edits._check_unanswerable_control_requests()
+    assert _unanswerable(logs) == []
+
+
+def test_684_turn_level_edits_never_check() -> None:
+    edits, calls = _edits_684([_snap_684()], run_level=False)
+    with structlog.testing.capture_logs() as logs:
+        edits._check_unanswerable_control_requests()
+    assert calls["probe"] == 0 and _unanswerable(logs) == []
+
+
+def test_684_kill_switch() -> None:
+    edits, calls = _edits_684([_snap_684()])
+    edits._detect_unanswerable = False
+    with structlog.testing.capture_logs() as logs:
+        edits._check_unanswerable_control_requests()
+    assert calls["probe"] == 0 and _unanswerable(logs) == []
+
+
+def test_684_non_claude_engine_noop() -> None:
+    edits = _make_edits(FakeTransport(), _KeyboardPresenter())
+    edits.run_level = True
+    edits.stream = _make_stream(engine_state=_make_engine_state())
+    edits.control_surface_probe = frozenset
+    with structlog.testing.capture_logs() as logs:
+        edits._check_unanswerable_control_requests()
+    assert _unanswerable(logs) == []
+
+
+@pytest.mark.anyio
+async def test_684_fires_while_live_idle() -> None:
+    """The check runs before the live-idle ``continue``, so a live session
+    held open by a request nobody can answer is reported."""
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(FakeTransport(), _KeyboardPresenter(), clock=clock)
+    edits.run_level = True
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 600.0
+    edits._STALL_THRESHOLD_APPROVAL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL_FIRST = 0.05
+    edits.stream = _make_stream(
+        last_event_type="result",
+        engine_state=_make_engine_state(
+            live_mode=True,
+            completed_turns=1,
+            turn_open=False,
+            awaiting_user_approval=lambda: True,
+            control_request_snapshot=lambda now=None: [_snap_684()],
+        ),
+    )
+    edits.control_surface_probe = frozenset
+
+    with structlog.testing.capture_logs() as logs:
+        async with anyio.create_task_group() as tg:
+
+            async def drive() -> None:
+                clock.set(110.0)
+                await anyio.sleep(0.2)
+                edits.signal_send.close()
+
+            tg.start_soon(edits.run)
+            tg.start_soon(drive)
+
+    (hit,) = _unanswerable(logs)
+    assert hit["live_idle"] is True and hit["holds_live_session"] is True
+    events = [e.get("event") for e in logs]
+    assert "progress_edits.stall_live_idle_suppressed" in events
+
+
+@pytest.mark.anyio
+async def test_684_probe_exception_does_not_kill_monitor() -> None:
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(FakeTransport(), _KeyboardPresenter(), clock=clock)
+    edits.run_level = True
+    edits._stall_check_interval = 0.01
+    ticks = {"n": 0}
+
+    def _boom(now=None):
+        ticks["n"] += 1
+        raise RuntimeError("boom")
+
+    edits.stream = _make_stream(
+        engine_state=_make_engine_state(control_request_snapshot=_boom)
+    )
+    with structlog.testing.capture_logs() as logs:
+        async with anyio.create_task_group() as tg:
+
+            async def drive() -> None:
+                await anyio.sleep(0.1)
+                edits.signal_send.close()
+
+            tg.start_soon(edits.run)
+            tg.start_soon(drive)
+
+    assert ticks["n"] >= 2  # the loop kept ticking
+    assert any(
+        e.get("event") == "progress_edits.unanswerable_probe_failed" for e in logs
+    )
+
+
+def _outline_edits_684():
+    from untether.runner_bridge import (
+        _OUTLINE_REGISTRY,
+        _OUTLINE_REGISTRY_TS,
+        build_control_surface_probe,
+    )
+
+    edits = _make_edits(FakeTransport(), _KeyboardPresenter())
+    edits.run_level = True
+    edits._STALL_THRESHOLD_TOOL = 600.0
+    ref = MessageRef(channel_id=123, message_id=77)
+    edits._outline_refs.append(ref)
+    _OUTLINE_REGISTRY["sess-684"] = (FakeTransport(), edits._outline_refs)
+    _OUTLINE_REGISTRY_TS["sess-684"] = 0.0
+    edits.stream = _make_stream(
+        engine_state=_make_engine_state(
+            completed_turns=0,
+            control_request_snapshot=lambda now=None: [
+                _snap_684(age_s=4000.0, kind="outline_hold")
+            ],
+        )
+    )
+    edits.control_surface_probe = build_control_surface_probe(
+        edits, SimpleNamespace(current=None)
+    )
+    return edits
+
+
+def test_684_outline_reader_over_one_hour_not_flagged() -> None:
+    from untether.runner_bridge import _OUTLINE_REGISTRY, sweep_stale_registries
+
+    edits = _outline_edits_684()
+    sweep_stale_registries(now=3601.0)
+    assert "sess-684" not in _OUTLINE_REGISTRY
+    assert edits.has_outline_messages
+    assert "outline" in edits.control_surface_probe()
+    with structlog.testing.capture_logs() as logs:
+        edits._check_unanswerable_control_requests()
+    assert _unanswerable(logs) == []
+
+
+def test_684_outline_deleted_then_flagged() -> None:
+    from untether.runner_bridge import _OUTLINE_REGISTRY, _OUTLINE_REGISTRY_TS
+
+    edits = _outline_edits_684()
+    edits._outline_refs.clear()
+    _OUTLINE_REGISTRY.pop("sess-684", None)
+    _OUTLINE_REGISTRY_TS.pop("sess-684", None)
+    with structlog.testing.capture_logs() as logs:
+        edits._check_unanswerable_control_requests()
+    (hit,) = _unanswerable(logs)
+    assert hit["reasons"] == ["no_keyboard"] and hit["kind"] == "outline_hold"
+
+
+def test_684_surface_probe_reads_turn_edits_after_result() -> None:
+    from untether.runner_bridge import build_control_surface_probe
+
+    run_edits = _make_edits(FakeTransport(), _KeyboardPresenter())
+    run_edits.last_rendered = RenderedMessage(
+        text="x",
+        extra={
+            "reply_markup": {
+                "inline_keyboard": [
+                    [{"text": "A", "callback_data": "claude_control:approve:old"}]
+                ]
+            }
+        },
+    )
+    run_edits.stream = _make_stream(engine_state=_make_engine_state(completed_turns=1))
+    turn_edits = _make_edits(FakeTransport(), _KeyboardPresenter())
+    turn_edits.last_rendered = RenderedMessage(
+        text="y",
+        extra={
+            "reply_markup": {
+                "inline_keyboard": [[{"text": "o", "callback_data": "aq:opt:0"}]]
+            }
+        },
+    )
+    router = SimpleNamespace(current=SimpleNamespace(edits=turn_edits))
+    probe = build_control_surface_probe(run_edits, router)
+    # After the run's result the run message's (stale) keyboard is ignored.
+    assert probe() == frozenset({"aq:opt:0"})
+    router.current = None
+    assert probe() == frozenset()
+
+
+def test_684_control_callbacks_in() -> None:
+    from untether.runner_bridge import control_callbacks_in
+
+    assert control_callbacks_in(None) == frozenset()
+    assert control_callbacks_in(RenderedMessage(text="x")) == frozenset()
+    msg = RenderedMessage(
+        text="x",
+        extra={
+            "reply_markup": {
+                "inline_keyboard": [
+                    [
+                        {"text": "A", "callback_data": "claude_control:approve:r"},
+                        {"text": "D", "callback_data": "claude_control:deny:r"},
+                    ],
+                    [{"text": "o", "callback_data": "aq:opt:0"}],
+                    [{"text": "Cancel", "callback_data": "untether:cancel"}],
+                    [{"text": "no data"}],
+                ]
+            }
+        },
+    )
+    assert control_callbacks_in(msg) == frozenset(
+        {"claude_control:approve:r", "claude_control:deny:r", "aq:opt:0"}
+    )
+
+
+# ── #819: compaction is an expected wait ───────────────────────────────────
+
+
+def test_819_compaction_probe() -> None:
+    transport = FakeTransport()
+    edits = _make_edits(transport, _KeyboardPresenter())
+    edits.stream = _make_stream(
+        engine_state=_make_engine_state(awaiting_compaction=lambda: True)
+    )
+    assert edits._is_compacting() is True
+    assert edits._is_api_retry_waiting() is False
+    edits.stream = _make_stream(engine_state=_make_engine_state())
+    assert edits._is_compacting() is False  # engine without the probe
+    edits.stream = _make_stream(engine_state=None)
+    assert edits._is_compacting() is False
+
+
+def test_819_compaction_probe_survives_exception() -> None:
+    def _boom() -> bool:
+        raise RuntimeError("engine state exploded")
+
+    transport = FakeTransport()
+    edits = _make_edits(transport, _KeyboardPresenter())
+    edits.stream = _make_stream(
+        engine_state=_make_engine_state(awaiting_compaction=_boom)
+    )
+    assert edits._is_compacting() is False
+
+
+def test_819_real_claude_state_drives_the_probe() -> None:
+    from untether.runners.claude import ClaudeStreamState, translate_claude_event
+    from untether.schemas import claude as claude_schema
+
+    state = ClaudeStreamState()
+    edits = _make_edits(FakeTransport(), _KeyboardPresenter())
+    edits.stream = _make_stream(engine_state=state)
+    assert edits._is_compacting() is False
+    for raw in (
+        b'{"type":"system","subtype":"status","status":"compacting","session_id":"s"}',
+    ):
+        translate_claude_event(
+            claude_schema.decode_stream_json_line(raw),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+    assert edits._is_compacting() is True
+    translate_claude_event(
+        claude_schema.decode_stream_json_line(
+            b'{"type":"system","subtype":"status","status":null,'
+            b'"compact_result":"success","session_id":"s"}'
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert edits._is_compacting() is False
+
+
+async def _run_stall_window(edits: ProgressEdits, clock: _FakeClock) -> list[dict]:
+    with structlog.testing.capture_logs() as logs:
+        async with anyio.create_task_group() as tg:
+
+            async def drive() -> None:
+                clock.set(110.0)
+                await anyio.sleep(0.25)
+                edits.signal_send.close()
+
+            tg.start_soon(edits.run)
+            tg.start_soon(drive)
+    return logs
+
+
+def _stall_edits(**engine_fields: Any) -> tuple[ProgressEdits, _FakeClock]:
+    transport = FakeTransport()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, _KeyboardPresenter(), clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL_FIRST = 0.05
+    edits._stall_repeat_seconds = 0.02
+    edits.stream = _make_stream(
+        last_event_type="user", engine_state=_make_engine_state(**engine_fields)
+    )
+    return edits, clock
+
+
+@pytest.mark.anyio
+async def test_819_stall_threshold_reason_compacting() -> None:
+    edits, clock = _stall_edits(awaiting_compaction=lambda: True)
+    logs = await _run_stall_window(edits, clock)
+    selected = [
+        e for e in logs if e["event"] == "progress_edits.stall_threshold_selected"
+    ]
+    assert selected and selected[0]["reason"] == "compacting"
+
+
+@pytest.mark.anyio
+async def test_819_compacting_is_expected_wait_no_auto_cancel() -> None:
+    edits, clock = _stall_edits(awaiting_compaction=lambda: True)
+    logs = await _run_stall_window(edits, clock)
+    events = [entry.get("event") for entry in logs]
+    assert "progress_edits.stall_detected" not in events
+    assert "progress_edits.stall_auto_cancel" not in events
+    pending = [e for e in logs if e.get("event") == "subprocess.approval_pending"]
+    assert pending and pending[0]["reason"] == "compacting"
+    assert edits._total_stall_warn_count == 0
+
+
+@pytest.mark.anyio
+async def test_819_compaction_latch_lapsed_stall_warns_again() -> None:
+    """Negative: once the latch lapses (no heartbeat for 120 s) a wedged
+    compaction is an ordinary stall again."""
+    edits, clock = _stall_edits(awaiting_compaction=lambda: False)
+    logs = await _run_stall_window(edits, clock)
+    selected = [
+        e for e in logs if e["event"] == "progress_edits.stall_threshold_selected"
+    ]
+    assert selected and all(e["reason"] != "compacting" for e in selected)
+    assert "progress_edits.stall_detected" in [e.get("event") for e in logs]
+
+
+class TestStuckAfterToolResultCompaction:
+    def test_819_stuck_after_tool_result_suppressed_while_compacting(self) -> None:
+        from types import SimpleNamespace
+
+        edits, clock = TestStuckAfterToolResultDetector._prepare(
+            last_tool_result_at=600.0, frozen_ring_count=3
+        )
+        clock.set(1000.0)
+        assert edits._detect_stuck_after_tool_result(cpu_active=True) is True
+        edits.stream.engine_state = SimpleNamespace(awaiting_compaction=lambda: True)
+        with structlog.testing.capture_logs() as logs:
+            assert edits._detect_stuck_after_tool_result(cpu_active=True) is False
+        suppressed = [
+            e
+            for e in logs
+            if e["event"] == "progress_edits.stuck_after_tool_result.suppressed"
+        ]
+        assert suppressed and suppressed[0]["reason"] == "compacting"
+
+
+def test_819_export_records_one_compaction_start_and_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from untether.model import Action, ActionEvent, ResumeToken
+    from untether.runner_bridge import _record_export_event
+    from untether.telegram.commands import export as export_mod
+
+    recorded: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        export_mod,
+        "record_session_event",
+        lambda session_id, event, **_: recorded.append(event),
+    )
+    resume = ResumeToken(engine="claude", value="s-export")
+
+    def _row(phase: str, title: str) -> ActionEvent:
+        return ActionEvent(
+            engine="claude",
+            action=Action(id="claude.compaction.3", kind="note", title=title),
+            phase=phase,  # type: ignore[arg-type]
+        )
+
+    for evt in (
+        _row("started", "🗜️ Compacting context…"),
+        _row("updated", "🗜️ Compacting context…"),
+        _row("updated", "🗜️ Compacting context…"),
+        _row("completed", "🗜️ Context compacted"),
+        _row("completed", "🗜️ Context compacted · 6.3k → 277 tokens (manual)"),
+    ):
+        _record_export_event(evt, resume)
+    phases = [e["phase"] for e in recorded]
+    assert phases == ["started", "completed", "completed"]
+
+
+# ── #819: the manual-/compact 0-turn result (narrow exemption) ─────────────
+
+
+def _compaction(
+    trigger: str | None = "manual",
+    result: str | None = "success",
+    *,
+    manual_success: bool = True,
+) -> dict[str, Any]:
+    return {
+        "count": 1,
+        "trigger": trigger,
+        "pre_tokens": 182_000,
+        "post_tokens": 41_000,
+        "result": result,
+        "manual_success": manual_success,
+    }
+
+
+async def _run_single(
+    usage: dict[str, Any],
+    *,
+    resume_value: str = "sess-819",
+    answer: str = "",
+) -> tuple[FakeTransport, Any, list[dict[str, Any]]]:
+    from structlog.testing import capture_logs
+
+    transport = FakeTransport()
+    runner = ScriptRunner(
+        [Return(answer=answer, usage=usage)],
+        engine=CODEX_ENGINE,
+        resume_value=resume_value,
+    )
+    cfg = ExecBridgeConfig(
+        transport=transport, presenter=MarkdownPresenter(), final_notify=False
+    )
+    with capture_logs() as logs:
+        await handle_message(
+            cfg,
+            runner=runner,
+            incoming=IncomingMessage(channel_id=123, message_id=10, text="/compact"),
+            resume_token=ResumeToken(engine=CODEX_ENGINE, value=resume_value),
+        )
+    return transport, runner, logs
+
+
+@pytest.mark.anyio
+async def test_819_manual_compaction_zero_turn_result_is_not_empty_result_anomaly(
+    quarantine_store,
+) -> None:
+    usage = {"num_turns": 0, "duration_api_ms": 0, "compaction": _compaction()}
+    transport, runner, logs = await _run_single(usage)
+    events = [r.get("event") for r in logs]
+    assert "runner.empty_result" not in events
+    assert "session.quarantined" not in events
+    assert "session.auto_resend_fresh" not in events
+    assert len(runner.calls) == 1
+    assert quarantine_store.is_quarantined(CODEX_ENGINE, "sess-819") is False
+    final_text = transport.edit_calls[-1]["message"].text
+    assert final_text.startswith("done")
+    assert "🗜️ Context compacted · 182k → 41k tokens (manual)" in final_text
+    completed = [r for r in logs if r.get("event") == "runner.completed"]
+    assert completed and completed[0]["compactions"] == 1
+    assert completed[0]["compaction_trigger"] == "manual"
+
+
+@pytest.mark.anyio
+async def test_819_auto_compaction_then_zero_turn_result_stays_anomalous(
+    quarantine_store,
+) -> None:
+    """The #596 poisoned session that auto-compacts on resume and then
+    returns the 0-turn result must still reach #631 quarantine + fresh."""
+    import dataclasses
+
+    from structlog.testing import capture_logs
+
+    class _AutoCompactThenAnswer(_EmptyThenAnswerRunner):
+        async def run(self, prompt, resume):
+            async for evt in super().run(prompt, resume):
+                if isinstance(evt, CompletedEvent) and len(self.calls) == 1:
+                    evt = dataclasses.replace(
+                        evt,
+                        usage={
+                            **(evt.usage or {}),
+                            "compaction": _compaction(
+                                "auto", "success", manual_success=False
+                            ),
+                        },
+                    )
+                yield evt
+
+    transport = FakeTransport()
+    runner = _AutoCompactThenAnswer(resume_value="sess-poisoned-819")
+    cfg = ExecBridgeConfig(
+        transport=transport, presenter=MarkdownPresenter(), final_notify=False
+    )
+    cleared: list[str] = []
+
+    async def on_resume_failed(tok: ResumeToken) -> None:
+        cleared.append(tok.value)
+
+    with capture_logs() as logs:
+        await handle_message(
+            cfg,
+            runner=runner,
+            incoming=IncomingMessage(channel_id=123, message_id=10, text="go on"),
+            resume_token=ResumeToken(engine=CODEX_ENGINE, value="sess-poisoned-819"),
+            on_resume_failed=on_resume_failed,
+        )
+    events = [r.get("event") for r in logs]
+    assert "runner.empty_result" in events
+    assert "session.auto_resend_fresh" in events
+    assert quarantine_store.is_quarantined(CODEX_ENGINE, "sess-poisoned-819")
+    assert len(runner.calls) == 2 and runner.calls[1][1] is None
+    assert "Here is the real result." in transport.edit_calls[-1]["message"].text
+
+
+@pytest.mark.anyio
+async def test_819_failed_manual_compaction_zero_turn_stays_anomalous(
+    monkeypatch,
+) -> None:
+    _disable_empty_resend(monkeypatch)
+    usage = {
+        "num_turns": 0,
+        "duration_api_ms": 0,
+        "compaction": _compaction(None, "failed", manual_success=False),
+    }
+    transport, _, logs = await _run_single(usage)
+    assert any(r.get("event") == "runner.empty_result" for r in logs)
+    final_text = transport.edit_calls[-1]["message"].text
+    assert "Context compacted" not in final_text
+    assert "empty result" in final_text
+
+
+@pytest.mark.anyio
+async def test_819_manual_compaction_with_error_result_not_exempt() -> None:
+    from structlog.testing import capture_logs
+
+    from untether.runners.mock import ErrorReturn
+
+    transport = FakeTransport()
+    runner = ScriptRunner(
+        [
+            ErrorReturn(
+                error="boom",
+                usage={
+                    "num_turns": 0,
+                    "duration_api_ms": 0,
+                    "compaction": _compaction(manual_success=False),
+                },
+            )
+        ],
+        engine=CODEX_ENGINE,
+        resume_value="sess-819e",
+    )
+    cfg = ExecBridgeConfig(
+        transport=transport, presenter=MarkdownPresenter(), final_notify=False
+    )
+    with capture_logs():
+        await handle_message(
+            cfg,
+            runner=runner,
+            incoming=IncomingMessage(channel_id=123, message_id=10, text="/compact"),
+            resume_token=ResumeToken(engine=CODEX_ENGINE, value="sess-819e"),
+        )
+    final_text = transport.edit_calls[-1]["message"].text
+    assert final_text.startswith("error")
+    assert "Context compacted" not in final_text
+
+
+@pytest.mark.anyio
+async def test_819_anomaly_computed_before_compaction_body(monkeypatch) -> None:
+    """The compaction body is synthesised only after the anomaly decision —
+    and only for ``manual_success``: a spy on the exemption predicate sees
+    the raw (empty) run."""
+    from untether import runner_bridge
+
+    seen: list[Any] = []
+    real = runner_bridge._compaction_manual_success
+
+    def _spy(usage):
+        seen.append(dict(usage or {}))
+        return real(usage)
+
+    monkeypatch.setattr(runner_bridge, "_compaction_manual_success", _spy)
+    usage = {"num_turns": 0, "duration_api_ms": 0, "compaction": _compaction()}
+    transport, _, logs = await _run_single(usage)
+    assert seen and seen[0]["compaction"]["manual_success"] is True
+    assert not any(r.get("event") == "runner.empty_result" for r in logs)
+    assert "Context compacted" in transport.edit_calls[-1]["message"].text
+
+
+@pytest.mark.anyio
+async def test_819_genuine_zero_turn_result_still_anomalous(monkeypatch) -> None:
+    _disable_empty_resend(monkeypatch)
+    transport, _, logs = await _run_single({"num_turns": 0, "duration_api_ms": 0})
+    assert any(r.get("event") == "runner.empty_result" for r in logs)
+    assert "Context compacted" not in transport.edit_calls[-1]["message"].text
+
+
+def test_819_compaction_empty_body_shapes() -> None:
+    from untether.runner_bridge import _compaction_empty_body
+
+    assert _compaction_empty_body(_compaction()) == (
+        "🗜️ Context compacted · 182k → 41k tokens (manual)"
+    )
+    assert _compaction_empty_body({"pre_tokens": 6336, "trigger": "manual"}) == (
+        "🗜️ Context compacted · 6.3k tokens before (manual)"
+    )
+    assert _compaction_empty_body({"pre_tokens": True}) == "🗜️ Context compacted"

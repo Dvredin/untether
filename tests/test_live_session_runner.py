@@ -31,6 +31,14 @@ _ENV = (
     "FAKE_CLAUDE_SESSION_ID",
     "FAKE_CLAUDE_TASK_END",
     "FAKE_CLAUDE_FOLLOWUP_DELAY_S",
+    # #383
+    "FAKE_CLAUDE_START_MODE",
+    "FAKE_CLAUDE_REARM_ERROR",
+    "FAKE_CLAUDE_NO_STATUS",
+    "FAKE_CLAUDE_WAKE_AFTER_RESULT_S",
+    "FAKE_CLAUDE_STDIN_LOG",
+    # #751
+    "FAKE_CLAUDE_INIT_PERMISSION_MODE",
 )
 
 
@@ -54,11 +62,12 @@ async def _collect(
     resume: ResumeToken | None = None,
     on_event: Any = None,
     timeout: float = 15.0,
+    runner: ClaudeRunner | None = None,
 ) -> list[Any]:
     """Run the fake scenario and collect events until ``until`` completions
     (the run's CompletedEvent counts as 1, each TurnEvent(completed) as 1)."""
     os.environ["FAKE_CLAUDE_SCENARIO"] = scenario
-    runner = _runner()
+    runner = runner if runner is not None else _runner()
     events: list[Any] = []
     done = 0
     with anyio.fail_after(timeout):
@@ -504,3 +513,562 @@ async def test_816_stream_end_and_error_cleanup_keep_a_newer_owner(hook: str) ->
         assert not claude_mod.is_session_alive(sid)
     finally:
         claude_mod._cleanup_session_registries(sid)
+
+
+# ── #383: a plan approval must not outlive its turn ─────────────────────────
+
+
+def _plan_runner(
+    mode: str = "plan", cls: type[ClaudeRunner] = _LiveRunner
+) -> ClaudeRunner:
+    return cls(claude_cmd=str(FAKE_CLI), permission_mode=mode)
+
+
+def _plan_env(tmp_path: Path, **extra: str) -> Path:
+    log = tmp_path / "stdin.log"
+    os.environ["FAKE_CLAUDE_START_MODE"] = "plan"
+    os.environ["FAKE_CLAUDE_STDIN_LOG"] = str(log)
+    os.environ.update(extra)
+    return log
+
+
+def _stdin_kinds(log: Path) -> list[str]:
+    if not log.exists():
+        return []
+    return [line.split(" ", 1)[1] for line in log.read_text().splitlines()]
+
+
+def _answers(events: list[Any]) -> list[str | None]:
+    """Turn answers without #793's `📋 Plan (approved)` preamble."""
+    return [
+        (t.answer or "").rsplit("---\n\n", 1)[-1]
+        for t in _turns(events)
+        if t.phase == "completed"
+    ]
+
+
+async def _answer_plans(evt: Any, *, approve: bool = True) -> None:
+    """Tap Approve (or Deny) on every ExitPlanMode approval that surfaces."""
+    action = getattr(evt, "action", None)
+    if action is None or getattr(evt, "phase", None) != "started":
+        return
+    detail = action.detail or {}
+    request_id = detail.get("request_id")
+    if request_id and "ExitPlanMode" in (action.title or ""):
+        from untether.runners.claude import send_claude_control_response
+
+        assert await send_claude_control_response(request_id, approve)
+
+
+def _followup_after(n_completions: int, *, approve: bool = True) -> Any:
+    """on_event: answer plans; after ``n_completions`` turn closes, inject one
+    follow-up via the queue path (it writes at once: the session is idle)."""
+    seen = {"done": 0}
+
+    async def on_event(evt: Any, runner: ClaudeRunner) -> None:
+        await _answer_plans(evt, approve=approve)
+        if isinstance(evt, CompletedEvent) or (
+            isinstance(evt, TurnEvent) and evt.phase == "completed"
+        ):
+            seen["done"] += 1
+            if seen["done"] == n_completions:
+                assert await claude_mod.inject_when_idle(
+                    SID, "next", command_uuid=str(uuid.uuid4())
+                )
+
+    return on_event
+
+
+def _rearm_logs(logs: list[dict[str, Any]], event: str = "rearm_sent") -> list[Any]:
+    return [e for e in logs if e["event"] == f"claude.permission_mode.{event}"]
+
+
+async def test_383_followup_after_approval_runs_in_plan(tmp_path: Path) -> None:
+    log = _plan_env(tmp_path)
+    with capture_logs() as logs:
+        events = await _collect(
+            "plan_approve_followup",
+            until=2,
+            on_event=_followup_after(1),
+            runner=_plan_runner(),
+        )
+    completed = next(e for e in events if isinstance(e, CompletedEvent))
+    assert completed.answer.endswith("PLANNED")  # (#793 re-shows the plan)
+    assert _answers(events) == ["MODE: plan"]
+    kinds = _stdin_kinds(log)
+    rearm = kinds.index("control_request:set_permission_mode")
+    assert rearm < len(kinds) - 1 - kinds[::-1].index("user")  # before the follow-up
+    sent = _rearm_logs(logs)
+    assert [e["reason"] for e in sent] == ["idle"]
+    assert _rearm_logs(logs, "rearm_ack")
+    assert SID not in claude_mod._PLAN_EXIT_APPROVED
+
+
+async def test_383_wake_turn_after_approval_runs_in_plan(tmp_path: Path) -> None:
+    _plan_env(tmp_path)
+
+    async def on_event(evt: Any, runner: ClaudeRunner) -> None:
+        await _answer_plans(evt)
+
+    with capture_logs() as logs:
+        events = await _collect(
+            "plan_approve_bg_bash_wake",
+            until=2,
+            on_event=on_event,
+            runner=_plan_runner(),
+        )
+    starts = [t for t in _turns(events) if t.phase == "started"]
+    assert starts[0].reason == "task_finished"
+    assert _answers(events) == ["MODE: plan"]
+    assert [e["reason"] for e in _rearm_logs(logs)] == ["idle"]
+
+
+class _LateRearmRunner(_LiveRunner):
+    """The rejected placement (#383 §4 alt. 10): the idle re-arm only goes
+    out with the post-yield drains, i.e. after the bridge's on_completed."""
+
+    async def _drain_plan_rearm_pre_yield(
+        self, state: Any, *, stdin: Any = None
+    ) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("cls", "expected"),
+    [(_LiveRunner, "MODE: plan"), (_LateRearmRunner, "MODE: default")],
+)
+async def test_383_queued_wake_beats_a_slow_consumer(
+    tmp_path: Path, cls: type[ClaudeRunner], expected: str
+) -> None:
+    """The wake-turn race: the CLI starts a queued wake turn 50 ms after the
+    result, reading no stdin line first, while the bridge sits in
+    on_completed for 2 s. Only the pre-yield re-arm wins; the negative
+    control proves the test detects the late placement."""
+    log = _plan_env(tmp_path, FAKE_CLAUDE_WAKE_AFTER_RESULT_S="0.05")
+
+    async def on_event(evt: Any, runner: ClaudeRunner) -> None:
+        await _answer_plans(evt)
+        if isinstance(evt, CompletedEvent):
+            await anyio.sleep(2.0)  # the bridge's on_completed
+
+    events = await _collect(
+        "plan_approve_queued_wake",
+        until=2,
+        on_event=on_event,
+        runner=_plan_runner(cls=cls),
+    )
+    assert _answers(events) == [expected]
+    lines = log.read_text().splitlines()
+    rearm_at = next(float(ln.split()[0]) for ln in lines if "set_permission_mode" in ln)
+    wake_at = next(float(ln.split()[0]) for ln in lines if "turn_start:" in ln)
+    assert (rearm_at < wake_at) is (expected == "MODE: plan")
+
+
+async def test_383_errored_turn_still_rearms(tmp_path: Path) -> None:
+    _plan_env(tmp_path)
+    seen = {"done": 0}
+
+    async def on_event(evt: Any, runner: ClaudeRunner) -> None:
+        await _answer_plans(evt)
+        if isinstance(evt, CompletedEvent) or (
+            isinstance(evt, TurnEvent) and evt.phase == "completed"
+        ):
+            seen["done"] += 1
+            if seen["done"] in (1, 2):
+                assert await claude_mod.inject_when_idle(
+                    SID, f"msg {seen['done']}", command_uuid=str(uuid.uuid4())
+                )
+
+    events = await _collect(
+        "plan_approve_error_turn", until=3, on_event=on_event, runner=_plan_runner()
+    )
+    finals = [t for t in _turns(events) if t.phase == "completed"]
+    assert finals[0].ok is False  # the approved turn errored
+    assert finals[1].answer == "MODE: plan"
+
+
+async def test_383_monitor_ticks_after_approval_run_in_plan(tmp_path: Path) -> None:
+    _plan_env(tmp_path)
+
+    async def on_event(evt: Any, runner: ClaudeRunner) -> None:
+        await _answer_plans(evt)
+
+    events = await _collect(
+        "plan_approve_monitor_ticks",
+        until=4,
+        on_event=on_event,
+        runner=_plan_runner(),
+    )
+    assert _answers(events) == [
+        "TICK 1 MODE: plan",
+        "TICK 2 MODE: plan",
+        "TICK 3 MODE: plan",
+    ]
+
+
+async def test_383_plan_auto_monitor_ticks(tmp_path: Path) -> None:
+    """Decision 6: plan-auto ticks are not re-armed (no gate to add, only
+    cost); the user's follow-up is."""
+    _plan_env(tmp_path)
+    with capture_logs() as logs:
+        events = await _collect(
+            "plan_approve_monitor_ticks",
+            until=5,
+            on_event=_followup_after(4),
+            runner=_plan_runner("plan-auto"),
+        )
+    assert _answers(events) == [
+        "TICK 1 MODE: default",
+        "TICK 2 MODE: default",
+        "TICK 3 MODE: default",
+        "MODE: plan",
+    ]
+    assert [e["reason"] for e in _rearm_logs(logs)] == ["followup"]
+
+
+async def test_383_denied_plan_sends_no_rearm(tmp_path: Path) -> None:
+    log = _plan_env(tmp_path)
+    events = await _collect(
+        "plan_deny_followup",
+        until=2,
+        on_event=_followup_after(1, approve=False),
+        runner=_plan_runner(),
+    )
+    assert _answers(events) == ["MODE: plan"]
+    assert "control_request:set_permission_mode" not in _stdin_kinds(log)
+
+
+async def test_383_bypass_chat_sends_no_rearm(tmp_path: Path) -> None:
+    log = tmp_path / "stdin.log"
+    os.environ["FAKE_CLAUDE_STDIN_LOG"] = str(log)
+
+    async def inject(evt: Any, runner: ClaudeRunner) -> None:
+        if isinstance(evt, CompletedEvent):
+            assert await claude_mod.inject_when_idle(
+                SID, "second", command_uuid=str(uuid.uuid4())
+            )
+
+    await _collect("followup", until=2, on_event=inject)
+    kinds = _stdin_kinds(log)
+    assert kinds.count("user") == 2
+    assert "control_request:set_permission_mode" not in kinds
+
+
+async def test_383_no_status_frames_still_rearms(tmp_path: Path) -> None:
+    _plan_env(tmp_path, FAKE_CLAUDE_NO_STATUS="1")
+    with capture_logs() as logs:
+        events = await _collect(
+            "plan_approve_followup",
+            until=2,
+            on_event=_followup_after(1),
+            runner=_plan_runner(),
+        )
+    assert _answers(events) == ["MODE: plan"]
+    acks = _rearm_logs(logs, "rearm_ack")
+    assert acks and acks[0]["mode"] == "plan"
+    assert not [
+        e
+        for e in logs
+        if e["event"] == "claude.permission_mode.changed" and e["source"] == "status"
+    ]
+
+
+async def test_383_rearm_error_closes_live_session_when_idle(tmp_path: Path) -> None:
+    _plan_env(tmp_path, FAKE_CLAUDE_REARM_ERROR="1")
+    runner = _plan_runner()
+    runner._live_poll_s = 0.05
+
+    async def on_event(evt: Any, runner: ClaudeRunner) -> None:
+        await _answer_plans(evt)
+
+    with capture_logs() as logs:
+        events = await _collect(
+            "plan_approve_followup", until=99, on_event=on_event, runner=runner
+        )
+    failed = _rearm_logs(logs, "rearm_failed")
+    assert failed and failed[0]["log_level"] == "warning"
+    closed = [e for e in logs if e["event"] == "claude.live_session.stdin_closed"]
+    assert [e["reason"] for e in closed] == ["plan_rearm_failed"]
+    completed = next(e for e in events if isinstance(e, CompletedEvent))
+    assert completed.ok
+    assert not [e for e in logs if e["event"] == "session.quarantined"]
+
+
+class _NoRearmRunner(_LiveRunner):
+    def new_state(self, prompt: str, resume: ResumeToken | None) -> Any:
+        state = super().new_state(prompt, resume)
+        state.rearm_plan_mode = False  # `[watchdog] rearm_plan_mode = false`
+        return state
+
+
+async def test_383_kill_switch(tmp_path: Path) -> None:
+    log = _plan_env(tmp_path)
+    events = await _collect(
+        "plan_approve_followup",
+        until=2,
+        on_event=_followup_after(1),
+        runner=_plan_runner(cls=_NoRearmRunner),
+    )
+    assert _answers(events) == ["MODE: default"]
+    assert "control_request:set_permission_mode" not in _stdin_kinds(log)
+
+
+# ── #383 C4: the approved plan's background agents defer the re-arm ────────
+
+
+def _inject_at(*completions: int) -> Any:
+    """on_event: answer plans; after each listed turn-close count, inject one
+    follow-up via the queue path (the session is idle, so it writes at once)."""
+    seen = {"done": 0}
+
+    async def on_event(evt: Any, runner: ClaudeRunner) -> None:
+        await _answer_plans(evt)
+        if isinstance(evt, CompletedEvent) or (
+            isinstance(evt, TurnEvent) and evt.phase == "completed"
+        ):
+            seen["done"] += 1
+            if seen["done"] in completions:
+                assert await claude_mod.inject_when_idle(
+                    SID, f"msg {seen['done']}", command_uuid=str(uuid.uuid4())
+                )
+
+    return on_event
+
+
+def _starts(events: list[Any]) -> list[TurnEvent]:
+    return [t for t in _turns(events) if t.phase == "started"]
+
+
+async def test_383_agent_wake_deferred_then_rearmed(tmp_path: Path) -> None:
+    """P-3: a running subagent inherits the parent's mode, so the re-arm
+    waits for the agent the approved turn launched. A follow-up meanwhile
+    runs unplanned and says so; the agent's own wake turn and later
+    follow-ups are planned again."""
+    log = _plan_env(tmp_path, FAKE_CLAUDE_WAKE_S="1.5")
+    with capture_logs() as logs:
+        events = await _collect(
+            "plan_approve_agent_wake",
+            until=4,
+            on_event=_inject_at(1, 3),
+            runner=_plan_runner(),
+        )
+    assert _answers(events) == ["MODE: default", "MODE: plan", "MODE: plan"]
+    starts = _starts(events)
+    assert [t.reason for t in starts] == ["followup", "task_finished", "followup"]
+    assert starts[0].detail["plan_deferred"] == {"agents": 1}
+    assert not any("plan_deferred" in t.detail for t in starts[1:])
+    kinds = _stdin_kinds(log)
+    # The approved agent ran to the end unplanned; the re-arm followed its
+    # end and beat the wake turn the CLI started by itself.
+    assert "agent_end:a1:default" in kinds
+    rearm = kinds.index("control_request:set_permission_mode")
+    assert kinds.index("agent_end:a1:default") < rearm
+    assert rearm < kinds.index("turn_start:plan")
+    assert kinds.count("control_request:set_permission_mode") == 1
+    deferred = _rearm_logs(logs, "rearm_deferred")
+    assert deferred and deferred[0]["reason"] == "live_agents"
+    assert deferred[0]["agents"] == 1
+    assert [e["reason"] for e in _rearm_logs(logs)] == ["agents_done"]
+
+
+async def test_383_deferral_does_not_chain(tmp_path: Path) -> None:
+    """The unplanned follow-up launches a second agent; once the approved
+    turn's agent ends, plan mode comes back although the second still runs."""
+    log = _plan_env(tmp_path, FAKE_CLAUDE_WAKE_S="1.5")
+    with capture_logs() as logs:
+        events = await _collect(
+            "plan_approve_agent_chain",
+            until=4,
+            on_event=_inject_at(1),
+            runner=_plan_runner(),
+        )
+    assert _answers(events) == ["MODE: default", "MODE: plan", "MODE: plan"]
+    kinds = _stdin_kinds(log)
+    assert "agent_end:a1:default" in kinds
+    assert "agent_end:a2:plan" in kinds  # a later turn's agent: not deferred for
+    assert [e["reason"] for e in _rearm_logs(logs)] == ["agents_done"]
+
+
+async def test_383_agent_before_approval_not_deferred(tmp_path: Path) -> None:
+    """An agent launched in an earlier, planning turn ran under plan mode
+    anyway: the approved turn's close re-arms at once."""
+    _plan_env(tmp_path, FAKE_CLAUDE_WAKE_S="1.5")
+    with capture_logs() as logs:
+        events = await _collect(
+            "plan_approve_agent_before",
+            until=4,
+            on_event=_inject_at(1, 2),
+            runner=_plan_runner(),
+        )
+    assert _answers(events) == ["PLANNED", "MODE: plan", "MODE: plan"]
+    assert not _rearm_logs(logs, "rearm_deferred")
+    assert [e["reason"] for e in _rearm_logs(logs)] == ["idle"]
+
+
+# ---------------------------------------------------------------------------
+# #684: a withdrawn request in a follow-up turn
+# ---------------------------------------------------------------------------
+
+
+async def test_684_cancel_in_followup_turn_records_channel() -> None:
+    """A follow-up turn is translated by the run's reader tasks, which inherit
+    the run's chat (``get_run_channel_id`` ContextVar, set by the executor
+    around ``handle_message``) — so a withdrawn request's record is scoped to
+    the right chat and a late tap there reads "No longer needed"."""
+    from untether.runners.claude import ControlRequestStatus, classify_control_request
+    from untether.utils.paths import reset_run_channel_id, set_run_channel_id
+
+    cmd = str(uuid.uuid4())
+
+    async def inject(evt: Any, runner: ClaudeRunner) -> None:
+        if isinstance(evt, CompletedEvent):
+            assert await write_user_message(SID, "do it", command_uuid=cmd)
+
+    runner = _LiveRunner(claude_cmd=str(FAKE_CLI), permission_mode="default")
+    token = set_run_channel_id(68_400)
+    try:
+        with capture_logs() as logs:
+            events = await _collect(
+                "control_cancel_followup", until=2, on_event=inject, runner=runner
+            )
+    finally:
+        reset_run_channel_id(token)
+
+    start, end = [t for t in _turns(events) if t.phase in ("started", "completed")]
+    assert end.answer == "Stopped."
+    withdrawn = [
+        e
+        for e in events[events.index(start) : events.index(end)]
+        if getattr(e, "phase", None) == "completed"
+        and "withdrawn" in getattr(getattr(e, "action", None), "title", "")
+    ]
+    assert len(withdrawn) == 1
+    record = claude_mod._HANDLED_REQUESTS["req-cancel-1"]
+    assert record is not None
+    assert (record.outcome, record.channel_id) == ("cancelled", 68_400)
+    lookup = classify_control_request("req-cancel-1", channel_id=68_400)
+    assert lookup.status is ControlRequestStatus.CANCELLED
+    assert any(e["event"] == "control_request.cancelled_by_cli" for e in logs)
+
+
+async def test_751_fake_cli_init_reports_different_mode() -> None:
+    """`auto` requested, the CLI's first init reports `default` (as on
+    Haiku): a warning row right after StartedEvent, the gate re-armed, and no
+    re-check on the follow-up turn's init."""
+    from untether.model import ActionEvent
+
+    os.environ["FAKE_CLAUDE_INIT_PERMISSION_MODE"] = "default"
+    runner = _LiveRunner(claude_cmd=str(FAKE_CLI), permission_mode="auto")
+    cmd = str(uuid.uuid4())
+
+    async def inject(evt: Any, _runner: ClaudeRunner) -> None:
+        if isinstance(evt, CompletedEvent):
+            assert await write_user_message(SID, "second", command_uuid=cmd)
+
+    with capture_logs() as logs:
+        events = await _collect("followup", until=2, on_event=inject, runner=runner)
+    assert isinstance(events[0], StartedEvent)
+    rows = [
+        e
+        for e in events
+        if isinstance(e, ActionEvent)
+        and e.action.id.startswith("claude.permission_mode_mismatch")
+    ]
+    assert [r.phase for r in rows] == ["started", "completed"]
+    assert events.index(rows[0]) == 1
+    assert rows[-1].action.title.endswith("approvals will be requested")
+    assert any(isinstance(e, CompletedEvent) for e in events)
+    assert _turns(events)[-1].answer == "ECHO: second"
+    mismatch = [e for e in logs if e["event"] == "claude.permission_mode.mismatch"]
+    assert len(mismatch) == 1
+    assert mismatch[0]["prompting_rearmed"] is True
+
+
+# ── #819: compaction over the fake ─────────────────────────────────────────
+
+
+@pytest.fixture
+def _fake_window():
+    claude_mod._CONTEXT_WINDOWS["claude-haiku-fake"] = 200_000
+    yield
+    claude_mod._CONTEXT_WINDOWS.pop("claude-haiku-fake", None)
+
+
+def _compaction_rows(events: list[Any]) -> list[Any]:
+    from untether.model import ActionEvent
+
+    return [
+        e
+        for e in events
+        if isinstance(e, ActionEvent)
+        and str(e.action.id).startswith("claude.compaction.")
+    ]
+
+
+def _pcts(events: list[Any]) -> list[Any]:
+    from untether.model import ActionEvent
+
+    return [
+        e.action.detail["context_pct"]
+        for e in events
+        if isinstance(e, ActionEvent) and e.action.kind == "telemetry"
+    ]
+
+
+@pytest.mark.usefixtures("_fake_window")
+async def test_819_auto_compact_mid_turn_single_turn() -> None:
+    with capture_logs() as logs:
+        events = await _collect("auto_compact_mid_turn", until=1)
+    completed = [e for e in events if isinstance(e, CompletedEvent)]
+    assert len(completed) == 1 and completed[0].answer == "done reading"
+    assert _turns(events) == []  # compaction never opens a turn of its own
+    rows = _compaction_rows(events)
+    assert [r.phase for r in rows] == [
+        "started",
+        "updated",
+        "updated",
+        "completed",
+        "completed",
+    ]
+    assert rows[-1].action.title == "🗜️ Context compacted · 170k → 30k tokens (auto)"
+    assert _pcts(events) == [75, None, 20]
+    assert completed[0].usage["compaction"]["trigger"] == "auto"
+    assert completed[0].usage["compaction"]["manual_success"] is False
+    assert any(e["event"] == "claude.compaction" for e in logs)
+    # One StartedEvent resume (auto compaction sends no fresh init).
+    assert len({e.resume.value for e in events if isinstance(e, StartedEvent)}) == 1
+
+
+@pytest.mark.usefixtures("_fake_window")
+async def test_819_live_compact_followup_is_its_own_turn() -> None:
+    compact_cmd, next_cmd = str(uuid.uuid4()), str(uuid.uuid4())
+
+    async def inject(evt: Any, runner: ClaudeRunner) -> None:
+        if isinstance(evt, CompletedEvent):
+            assert await write_user_message(SID, "/compact", command_uuid=compact_cmd)
+        if isinstance(evt, TurnEvent) and evt.phase == "completed" and evt.turn == 2:
+            assert await write_user_message(SID, "after", command_uuid=next_cmd)
+
+    with capture_logs() as logs:
+        events = await _collect("compact_followup", until=3, on_event=inject)
+    turns = _turns(events)
+    assert [(t.turn, t.phase) for t in turns] == [
+        (2, "started"),
+        (2, "completed"),
+        (3, "started"),
+        (3, "completed"),
+    ]
+    compact_start, compact_end = turns[0], turns[1]
+    assert compact_start.reason == "followup"
+    assert compact_start.command_uuid == compact_cmd
+    between = events[events.index(compact_start) + 1 : events.index(compact_end)]
+    rows = _compaction_rows(between)
+    assert rows and rows[-1].action.title.endswith("(manual)")
+    assert compact_end.ok is True and compact_end.answer == ""
+    assert compact_end.usage["compaction"]["manual_success"] is True
+    # % ctx: 30 % before, cleared by the boundary, 10 % after.
+    assert _pcts(events) == [30, 30, None, 10]
+    assert turns[3].answer == "ECHO: after"
+    assert not any(
+        e["event"] == "claude.live_session.closed_after_result" for e in logs
+    )

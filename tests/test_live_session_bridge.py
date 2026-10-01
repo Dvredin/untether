@@ -599,20 +599,27 @@ def test_turn_headers(reason: str, detail: dict, expected: str | None) -> None:
 @pytest.mark.parametrize(
     ("reason", "tasks", "expected"),
     [
+        # #829: no closing text promises "reply to continue" any more — the
+        # "closed" follow-up says whether the session continues.
         (
             "cancel",
             ["a"],
-            "\N{BLACK SQUARE FOR STOP} Stopped 1 background task: a. Reply to continue.",
+            "\N{BLACK SQUARE FOR STOP} Stopped 1 background task: a.",
         ),
         (
             "drain",
             ["a", "b"],
-            "\N{HOURGLASS WITH FLOWING SAND} Untether is restarting — stopping 2 background tasks: a, b. Reply to continue.",
+            "\N{HOURGLASS WITH FLOWING SAND} Untether is restarting — stopping 2 background tasks: a, b.",
         ),
         (
             "max_hold",
             ["a"],
-            "\N{HOURGLASS WITH FLOWING SAND} Closing session — 1 background task still running at the background hold limit: a. Stopping it; reply to continue.",
+            "\N{HOURGLASS WITH FLOWING SAND} Closing session — 1 background task still running at the background hold limit: a. Stopping it.",
+        ),
+        (
+            "abs_cap",
+            ["a", "b"],
+            "\N{HOURGLASS WITH FLOWING SAND} Closing session — 2 background tasks still running at the session time limit: a, b. Stopping them.",
         ),
     ],
 )
@@ -620,6 +627,55 @@ def test_live_closing_notice_wording(
     reason: str, tasks: list[str], expected: str
 ) -> None:
     assert rb._live_closing_notice(reason, tasks) == expected
+
+
+@pytest.mark.parametrize(
+    ("tasks", "max_hold_s", "rearm", "expected"),
+    [
+        (
+            ["A", "B"],
+            1800.0,
+            True,
+            "\N{HOURGLASS WITH FLOWING SAND} Closing session — 2 background tasks still running with no progress for 30 min: A, B. Stopping them.",
+        ),
+        (
+            ["A"],
+            60.0,
+            True,
+            "\N{HOURGLASS WITH FLOWING SAND} Closing session — 1 background task still running with no progress for 1 min: A. Stopping it.",
+        ),
+        (
+            ["A"],
+            45.0,
+            True,
+            "\N{HOURGLASS WITH FLOWING SAND} Closing session — 1 background task still running with no progress for 45 s: A. Stopping it.",
+        ),
+        (
+            ["A"],
+            1800.0,
+            False,  # kill switch: the hold counted from the turn, not activity
+            "\N{HOURGLASS WITH FLOWING SAND} Closing session — 1 background task still running at the background hold limit: A. Stopping it.",
+        ),
+    ],
+)
+def test_829_max_hold_notice_names_the_quiet_time(
+    tasks: list[str], max_hold_s: float, rearm: bool, expected: str
+) -> None:
+    text = rb._live_closing_notice(
+        "max_hold", tasks, max_hold_s=max_hold_s, rearm_on_progress=rearm
+    )
+    assert text == expected
+    assert "reply to continue" not in text.lower()
+
+
+def test_829_closed_notice_wording() -> None:
+    assert rb._live_closed_notice(False) == (
+        "\N{LEFTWARDS ARROW WITH HOOK}\N{VARIATION SELECTOR-16} Reply to "
+        "continue in the same session."
+    )
+    warning = rb._live_closed_notice(True)
+    assert warning.startswith("\N{WARNING SIGN}")
+    assert "fresh session" in warning and "Partial work" in warning
 
 
 async def test_router_tracks_last_reply_anchor_for_notices() -> None:
@@ -1229,6 +1285,68 @@ def test_812_hook_rewake_header_without_event() -> None:
     )
 
 
+_NOT_REPLANNED = (
+    "\N{WARNING SIGN}\N{VARIATION SELECTOR-16} Not re-planned: the approved"
+    " plan's background agents are still running. Plan mode resumes when they"
+    " finish."
+)
+
+
+@pytest.mark.parametrize(
+    ("reason", "detail", "expected"),
+    [
+        # A follow-up has no header of its own: the line is the header.
+        ("followup", {"plan_deferred": {"agents": 1}}, _NOT_REPLANNED),
+        (
+            "task_finished",
+            {"tasks": ["lint"], "plan_deferred": {"agents": 2}},
+            "\N{BELL} Background task finished — lint\n" + _NOT_REPLANNED,
+        ),
+        (
+            "monitor_event",
+            {"plan_deferred": {"agents": 1}},
+            "\N{SATELLITE ANTENNA} Monitor\n" + _NOT_REPLANNED,
+        ),
+        # Without the flag, headers are unchanged.
+        ("followup", {}, None),
+        (
+            "task_finished",
+            {"tasks": ["lint"]},
+            "\N{BELL} Background task finished — lint",
+        ),
+    ],
+)
+def test_383_turn_header_shows_not_replanned_line(
+    reason: str, detail: dict, expected: str | None
+) -> None:
+    """#383 C4: a turn that runs unplanned because the approved plan's
+    agents are still working says so under its header."""
+    assert rb._turn_header(_turn("started", reason=reason, detail=detail)) == expected
+
+
+async def test_383_deferred_followup_final_carries_the_line() -> None:
+    rec = _Recorder()
+    anchor = MessageRef(channel_id=1, message_id=55)
+    router = _router(rec, anchors={"cmd-1": (anchor, None)})
+    detail = {"plan_deferred": {"agents": 1}}
+    await router.on_turn(
+        _turn("started", reason="followup", command_uuid="cmd-1", detail=detail)
+    )
+    await router.on_turn(
+        _turn(
+            "completed",
+            reason="followup",
+            command_uuid="cmd-1",
+            ok=True,
+            answer="12:04",
+            detail=detail,
+        )
+    )
+    _turn_no, _ok, _answer, header, _notify, reply = rec.delivered[0]
+    assert header == _NOT_REPLANNED
+    assert reply == 55
+
+
 _HG = "\N{HOURGLASS WITH FLOWING SAND} Closing session — "
 
 
@@ -1352,3 +1470,65 @@ async def test_815_tool_using_turn_elapsed_unchanged() -> None:
     )
     assert "· 5s" in final
     assert final.count(TURN_COMPLETE_MARKER) == 1
+
+
+# ── #819: context-window use in turn headers ───────────────────────────────
+
+
+def _telemetry(pct: int | None) -> ActionEvent:
+    return ActionEvent(
+        engine="claude",
+        action=Action(
+            id="claude.context",
+            kind="telemetry",
+            title="context",
+            detail={"context_pct": pct},
+        ),
+        phase="updated",
+    )
+
+
+async def test_819_telemetry_does_not_force_turn_progress() -> None:
+    """A status-line value never opens a wake turn's progress message (the
+    lazy progress and #785 folding stay intact) but is still noted."""
+    from untether.background_status import count_substantive_actions
+
+    rec = _Recorder()
+    router = _router(rec)
+    await router.on_turn(_turn("started", detail={"tasks": ["build"]}))
+    await router.on_event(_telemetry(30))
+    assert rec.created == []
+    assert router.current is not None
+    tracker = router.current.tracker
+    assert tracker.context_pct == 30
+    assert tracker.action_count == 0
+    assert count_substantive_actions(a.action for a in tracker.snapshot().actions) == 0
+    await router.on_event(_action())
+    assert rec.created == [2]
+
+
+async def test_819_turn_final_header_shows_context_pct() -> None:
+    transport, run_progress = await _run_with_turn(
+        Emit(_turn("started", reason="followup")),
+        Emit(_telemetry(30)),
+        Emit(_action()),
+        Emit(_telemetry(34)),
+        Emit(_turn("completed", reason="followup", ok=True, answer="TURN-2-ANSWER")),
+    )
+    final, progress = _turn_texts(transport, run_progress, "TURN-2-ANSWER")
+    header = final.splitlines()[0]
+    assert header.endswith("· 34% ctx")
+    assert "ctx" not in final.split("\n", 1)[1].replace("TURN-2-ANSWER", "")
+    assert any("% ctx" in t.splitlines()[0] for t in progress)
+
+
+def test_819_export_skips_telemetry_keeps_other_actions(monkeypatch) -> None:
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        "untether.telegram.commands.export.record_session_event",
+        lambda session_id, event, channel_id=0: recorded.append(event),
+    )
+    rb._record_export_event(_telemetry(40), _TOKEN)
+    assert recorded == []
+    rb._record_export_event(_action(), _TOKEN)
+    assert [e["action"]["kind"] for e in recorded] == ["command"]

@@ -37,6 +37,17 @@ Fields listed as **restart-required** trigger a warning in the Telegram chat
 when edited. Everything else hot-reloads silently with a matching
 `config.reload.transport_config_hot_reloaded` INFO event.
 
+Separately from the watcher, the per-run settings (`[footer]`, `[progress]`,
+`[watchdog]`, `[preamble]`, `[cost_budget]`, `[auto_continue]`, `[security]`, …)
+are re-read on every use, even with `watch_config = false`, so an edit applies on
+the next run or the next turn of a live session
+([#269](https://github.com/littlebearapps/untether/issues/269)). Since 0.35.5 the
+file is only re-parsed when its contents (or the `UNTETHER__*` env vars) change,
+and each real parse logs one INFO `config.loaded reason=first_load|content_changed|env_changed`
+line ([#506](https://github.com/littlebearapps/untether/issues/506)). Set
+`UNTETHER_SETTINGS_CACHE=0` to turn the cache off (see
+[environment variables](env-vars.md)).
+
 The authoritative list lives on each settings model as `RESTART_REQUIRED_FIELDS`
 (see `src/untether/settings.py`) so code, docs, and UI can't drift. Editing
 `untether.toml` to update one of these while the service runs logs the warning
@@ -85,11 +96,11 @@ systemctl --user restart untether-dev    # dev
 | `voice_transcription` | bool | `false` | Enable voice note transcription. |
 | `voice_max_bytes` | int | `10485760` | Max voice note size (bytes). |
 | `voice_transcription_model` | string | `"gpt-4o-mini-transcribe"` | OpenAI transcription model name. |
-| `voice_transcription_base_url` | string\|null | `null` | Override base URL for voice transcription only. **SSRF-validated ([#381](https://github.com/littlebearapps/untether/issues/381)):** the resolved host must be public — loopback/private endpoints (e.g. a local Whisper server at `http://localhost:8000/v1`) are **rejected** unless allowlisted via `voice_transcription_url_allowlist`. Unset (the default public `api.openai.com` path) skips validation. |
+| `voice_transcription_base_url` | string\|null | `null` | Override base URL for voice transcription only. **SSRF-validated ([#381](https://github.com/littlebearapps/untether/issues/381)):** the resolved host must be public — loopback/private endpoints (e.g. a local Whisper server at `http://localhost:8000/v1`) are **rejected** unless allowlisted via `voice_transcription_url_allowlist`. Unset (the default public `api.openai.com` path) skips validation. A refused endpoint is logged at startup and after a hot-reload as `voice.base_url.not_permitted` (WARNING, naming the host and the allowlist entry to add), and a refused voice note's reply names the same fix ([#679](https://github.com/littlebearapps/untether/issues/679)). |
 | `voice_transcription_url_allowlist` | string[] | `[]` | ([#381](https://github.com/littlebearapps/untether/issues/381)) CIDR/IP allowlist that opts specific private/loopback transcription endpoints back in past the SSRF guard — e.g. `["127.0.0.0/8"]` for a local Whisper server, or an Azure private-link range. Only consulted when `voice_transcription_base_url` is set. |
 | `voice_transcription_api_key` | string\|null | `null` | Override API key for voice transcription only. |
 | `voice_transcription_language` | string\|null | `null` | ([#638](https://github.com/littlebearapps/untether/issues/638)) Optional ISO-639-1 language hint (e.g. `"en"`) passed to the Whisper `language` param — stops wrong-language guesses on short voice notes. Unset = provider auto-detect. Hot-reloadable. |
-| `voice_transcription_prompt` | string\|null | `null` (→ built-in) | ([#691](https://github.com/littlebearapps/untether/issues/691), [#703](https://github.com/littlebearapps/untether/issues/703)) Vocabulary-bias prompt (≤1000 chars) passed to the transcription `prompt` param — steers the decoder toward domain proper nouns (`"Trello, Untether, Claude Code"`). Effect is model-dependent; keep it to high-frequency nouns (overstuffing can induce hallucinated terms). **Unset = a shipped product-generic default** (engine + tool names, plus `CLAUDE.md` / `AGENTS.md` since [#789](https://github.com/littlebearapps/untether/issues/789)); a value **replaces** that default; `""` disables the bias and omits the parameter. Hot-reloadable. |
+| `voice_transcription_prompt` | string\|null | `null` (→ built-in) | ([#691](https://github.com/littlebearapps/untether/issues/691), [#703](https://github.com/littlebearapps/untether/issues/703)) Vocabulary-bias prompt (≤1000 chars) passed to the transcription `prompt` param — steers the decoder toward domain proper nouns (`"Trello, Untether, Claude Code"`). Effect is model-dependent; keep it to high-frequency nouns (overstuffing can induce hallucinated terms). **Unset = a shipped product-generic default** (a bare `Claude`, Claude Code, `CLAUDE.md`, `AGENTS.md`, Codex, OpenCode and Untether's own nouns — [#789](https://github.com/littlebearapps/untether/issues/789)); keep an override under Whisper's ~224-token window; a value **replaces** that default; `""` disables the bias and omits the parameter. Hot-reloadable. |
 | `session_mode` | `"stateless"`\|`"chat"` | `"stateless"` | 🔄 Auto-resume mode. See [workflow modes](modes.md) — `"chat"` for assistant/workspace, `"stateless"` for handoff. Restart-required. |
 | `show_resume_line` | bool | `true` | Show resume line in message footer. See [workflow modes](modes.md) — `false` for assistant/workspace, `true` for handoff. |
 | `followup_mode` | `"queue"`\|`"steer"` | `"queue"` | ([#775](https://github.com/littlebearapps/untether/issues/775)) Default for messages sent while a Claude Code run is working: `queue` waits for the turn to end; `steer` writes the message into the running turn. Overridden per chat (`/config` → Follow-up, bare `/steer` / `/queue`), per forum topic (bare `/steer` / `/queue` in the topic) and per message (`/steer <text>`, `/queue <text>`). Claude Code only — other engines always queue. Hot-reloadable. See [steer follow-ups](../how-to/steer-follow-ups.md). |
@@ -114,7 +125,7 @@ When `allowed_user_ids` is set, updates without a sender id (for example, some c
 | `auto_put_mode` | `"upload"`\|`"prompt"` | `"upload"` | Whether uploads also start a run. |
 | `uploads_dir` | string | `"incoming"` | Relative path inside the repo/worktree. |
 | `allowed_user_ids` | int[] | `[]` | Allowed senders for file transfer; empty allows private chats (group usage requires admin). |
-| `deny_globs` | string[] | (defaults) | Glob denylist (e.g. `.git/**`, `**/*.pem`). |
+| `deny_globs` | string[] | (defaults) | Glob denylist (e.g. `.git/**`, `**/*.pem`). `**` matches any number of directories, including none, so `**/*.pem` also denies a root-level `key.pem` ([#831](https://github.com/littlebearapps/untether/issues/831)). |
 | `outbox_enabled` | bool | `true` | Enable agent-initiated file delivery via `.untether-outbox/`. Requires `enabled = true`. |
 | `outbox_dir` | string | `".untether-outbox"` | Relative outbox directory name (must not be absolute). |
 | `outbox_max_files` | int (1–50) | `10` | Max files sent per run. |
@@ -241,6 +252,7 @@ Controls progress message rendering during agent runs.
 | `max_actions` | int (0–50) | `5` | Maximum action lines shown in the progress message. |
 | `heartbeat_interval` | int (5–120) | `30` | Heartbeat tick that re-renders progress messages so long-running tools surface an elapsed-time tail (e.g. `▸ Bash · 3m 47s · npm run build`) without waiting for the next JSONL event ([#481](https://github.com/littlebearapps/untether/issues/481)). |
 | `show_background_tasks` | bool | `true` | Claude only. Show live background tasks (background agents, background Bash, Monitors): a `⏳ background (N)` block in the progress message, then one silent status message after the answer, edited in place and finalised when the tasks end ([#777](https://github.com/littlebearapps/untether/issues/777)). |
+| `show_context_usage` | bool | `true` | Claude only. End the progress, final and live-turn header line with the context-window use, e.g. `done · claude · 1m 36s · step 10 · 62% ctx`. Omitted until the model's window is known (the first result on a model after a restart), and after a compaction until the next response ([#819](https://github.com/littlebearapps/untether/issues/819)). |
 | `background_tasks_max_rows` | int (1–20) | `5` | Row cap for the background block and status message; extra tasks collapse into `+N more`. |
 | `consolidate_wake_turns` | bool | `true` | Claude only. A background-task wake turn that runs no tools, raises no approval or question and answers in ≤300 characters is folded into that status message (an edit — no new message, no push) instead of arriving as its own `🔔` message. Tool use, a longer answer, an error, or the turn that finishes the last task (the report) still arrive as normal pushed messages. `false` restores one message per wake turn ([#785](https://github.com/littlebearapps/untether/issues/785)). Needs `show_background_tasks`. |
 
@@ -332,8 +344,10 @@ Budget alerts always appear regardless of `[footer]` settings.
     pre_result_silence_timeout = 3600.0
     post_result_limbo_grace = 60.0
     post_result_bg_max_hold = 1800.0
+    bg_hold_rearm_on_progress = true
     live_sessions = true
     live_session_max_s = 14400.0
+    rearm_plan_mode = true
     ```
 
 | Key | Type | Default | Notes |
@@ -342,6 +356,7 @@ Budget alerts always appear regardless of `[footer]` settings.
 | `stall_auto_kill` | bool | `false` | Auto-kill stalled processes. Requires zero TCP + CPU not increasing. |
 | `stall_repeat_seconds` | float | `180.0` | Interval between repeat stall warnings in Telegram (30–600). |
 | `tool_timeout` | float | `600.0` | Stall threshold (seconds) for running local tool calls like Bash, Read, Write (60–7200). Increase for long builds or benchmarks. |
+| `detect_unanswerable_control_requests` | bool | `true` | Log `control_request.unanswerable` (WARN, once per request) when a Claude approval or question has waited past `tool_timeout` with nothing on screen that can answer it — no approval/option button and no text-reply route — or no process to answer it ([#684](https://github.com/littlebearapps/untether/issues/684)). Detect-only: it never denies the request or closes the session. Applies to new runs. |
 | `mcp_tool_timeout` | float | `900.0` | Stall threshold (seconds) for running MCP tool calls (60–7200). MCP tools are network-bound and may legitimately run for 10–20+ minutes. |
 | `detect_stuck_after_tool_result` | bool | `false` | Enable the stuck-after-tool_result detector ([#322](https://github.com/littlebearapps/untether/issues/322)) — fires when a `tool_result` arrives and the engine goes silent for `stuck_after_tool_result_timeout` seconds while CPU-active (matches the upstream Claude-code / `mcp-remote` / undici wedge). Opt-in this release; will default `true` once the recovery path has more staging soak time. The detector is suppressed during legitimate long-running background primitives (`Monitor`, `Bash run_in_background=true`, `Agent run_in_background=true`, `ScheduleWakeup`, `RemoteTrigger`) via the per-session tracking infrastructure ([#346](https://github.com/littlebearapps/untether/issues/346) / [#347](https://github.com/littlebearapps/untether/issues/347)). |
 | `stuck_after_tool_result_timeout` | float | `300.0` | Seconds of silence after a `tool_result` before the detector fires (60–1800). Matches undici's default idle-body timeout. |
@@ -361,9 +376,11 @@ Budget alerts always appear regardless of `[footer]` settings.
 | `bash_grace_seconds` | float | `60.0` | Stall-warning grace window for Bash / BashOutput / KillShell tools ([#481](https://github.com/littlebearapps/untether/issues/481)). Range 5–300. While the most-recent action is one of these and within this window of its start, stall warnings (and the `_STALL_MAX_WARNINGS` auto-cancel arm) are suppressed — long builds and deploys are an expected wait, not a hung session. |
 | `pre_result_silence_timeout` | float | `3600.0` | ([#592](https://github.com/littlebearapps/untether/issues/592)) Bounds the *pre-result* dead zone — a run whose stream goes silent **before its first `result` event** is SIGTERMed after this many seconds (0–86400; `0` disables). Suppressed while a permission/ask request is pending, so plan-approval waits stay safe. Catches zombie subprocesses that never produced output (an 8-day idle Claude on mac leaked its session lock and MCP children). |
 | `post_result_limbo_grace` | float | `60.0` | ([#591](https://github.com/littlebearapps/untether/issues/591)) After a successful `result`, a *fully quiescent* limbo subprocess (no live background work, not CPU/tree-active) is SIGTERMed after this grace instead of waiting the full `post_result_idle_timeout` (0–600; `0` = wait the full timeout). A demonstrably-busy process is exempt ([#655](https://github.com/littlebearapps/untether/issues/655)). |
-| `post_result_bg_max_hold` | float | `1800.0` | ([#647](https://github.com/littlebearapps/untether/issues/647)) Upper bound on how long the post-result ceiling defers its SIGTERM while `/proc` evidence shows the subagent tree still working (0–7200; `0` disables the hold). Independently bounded by the `BG_AGENT_MAX_KEEP_S` handle age-out. Stops the 600s ceiling killing live background subagent work. |
-| `live_sessions` | bool | `true` | ([#776](https://github.com/littlebearapps/untether/issues/776)) Claude only. Keep the session open after its answer while background work runs: background-task, Monitor and scheduled-wake-up turns are delivered as their own Telegram messages, and follow-ups are written into the open session instead of resuming it. With live sessions on, `post_result_limbo_grace` is the idle close (stdin closed gracefully, nothing quarantined) and `post_result_bg_max_hold` is how long background work may run after the last turn. `false` restores the pre-v0.35.5 "stop at the first answer" behaviour. |
+| `post_result_bg_max_hold` | float | `1800.0` | The background hold (0–7200, read per spawn). **Live sessions** ([#829](https://github.com/littlebearapps/untether/issues/829)): how long a live Claude session stays open with background work still running and **no background activity** (no turn, no agent progress frame, no subagent tool starting or ending, no output from a background Bash) before it closes with a notice. Working agents are no longer stopped at 30 min; a silent one still is. **`live_sessions = false`** ([#647](https://github.com/littlebearapps/untether/issues/647)): upper bound on how long the post-result ceiling defers its SIGTERM while `/proc` evidence shows the subagent tree still working (`0` disables it), also bounded by the `BG_AGENT_MAX_KEEP_S` handle age-out. |
+| `bg_hold_rearm_on_progress` | bool | `true` | ([#829](https://github.com/littlebearapps/untether/issues/829)) Claude live sessions only. Re-arm the background hold on background activity (see above). `false` restores the rc14 behaviour: the hold counts from the last turn, so a quietly working agent is stopped when it expires. Read per spawn, so a change applies from the next run (`/new`). |
+| `live_sessions` | bool | `true` | ([#776](https://github.com/littlebearapps/untether/issues/776)) Claude only. Keep the session open after its answer while background work runs: background-task, Monitor and scheduled-wake-up turns are delivered as their own Telegram messages, and follow-ups are written into the open session instead of resuming it. With live sessions on, `post_result_limbo_grace` is the idle close (stdin closed gracefully, nothing quarantined) and `post_result_bg_max_hold` is how long background work may run with no activity. `false` restores the pre-v0.35.5 "stop at the first answer" behaviour. |
 | `live_session_max_s` | float | `14400.0` | ([#776](https://github.com/littlebearapps/untether/issues/776)) Absolute lifetime of one live Claude process from spawn (600–86400). The session is closed with a notice when reached, as a backstop against an endless `Monitor`. |
+| `rearm_plan_mode` | bool | `true` | ([#383](https://github.com/littlebearapps/untether/issues/383)) Claude only, live sessions only. In a `plan` / `plan-auto` chat, approving a plan takes the open Claude session out of plan mode; with this on, Untether puts it back (the CLI's own `set_permission_mode`) when the reply ends, so your next message — and, in `plan` chats, a background wake-up — is planned again. `plan-auto` re-plans your messages only, not wake-ups. Background agents the approved reply launched finish first: the switch-back waits until they end or show no activity for `post_result_bg_max_hold` (capped at `live_session_max_s`), and replies meanwhile say `⚠️ Not re-planned`. Read at each new session. `false` = never sent (an approval then lasts the whole session). |
 
 !!! note "The post-result watchdog is a permanent mitigation ([#569](https://github.com/littlebearapps/untether/issues/569))"
 
@@ -467,7 +484,7 @@ here; plugin engines should document their own keys.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
-| `extra_args` | string[] | `["-c", "notify=[]"]` | Extra CLI args for `codex` (exec-only flags are rejected). |
+| `extra_args` | string[] | `["-c", "notify=[]"]` | Extra CLI args for `codex`, placed before `exec`. Flags Untether manages and flags that bypass Codex's sandbox/approvals (`--dangerously-bypass-approvals-and-sandbox`/`--yolo`, `--approve-for-me`, `--dangerously-bypass-hook-trust`, `--sandbox danger-full-access`, a `-c` value mentioning `danger-full-access`, `:danger`, `bypass` or `dangerously`, `-C`/`--cd`, `--worktree`, `-a`, `--ignore-rules`, `--ignore-user-config`, a bare `--`) are rejected at config-load — see [Security → Engine CLI flags](../how-to/security.md#engine-cli-flags-extra_args). |
 | `profile` | string | (unset) | Passed as `--profile <name>` and used as the session title. |
 
 === "untether config"
@@ -491,8 +508,8 @@ here; plugin engines should document their own keys.
 |-----|------|---------|-------|
 | `model` | string | (unset) | Optional model override. |
 | `allowed_tools` | string[] | `["Bash", "Read", "Edit", "Write"]` | Tools pre-approved via `--allowedTools`. **Since 0.35.5rc9 the default is not sent in `default` / `manual` / `acceptEdits`** — pre-approving these would defeat the approval prompt those modes exist to give ([#749](https://github.com/littlebearapps/untether/issues/749)). Setting the key explicitly still applies in every mode, and logs `claude.allowed_tools.prompting_mode_override` once. |
-| `extra_args` | string[] | `[]` | Extra CLI args passed to `claude` (e.g. `["--chrome"]` to opt into the Claude-in-Chrome extension). Flags Untether manages internally (`-p`, `--print`, `--output-format`, `--input-format`, `--resume`/`-r`, `--continue`/`-c`, `--permission-mode`, `--permission-prompt-tool`) are rejected at config-load. |
-| `dangerously_skip_permissions` | bool | `false` | Skip Claude Code permissions prompts. |
+| `extra_args` | string[] | `[]` | Extra CLI args passed to `claude` (e.g. `["--chrome"]` to opt into the Claude-in-Chrome extension). Flags Untether manages internally (`-p`, `--print`, `--output-format`, `--input-format`, `--resume`/`-r`, `--continue`/`-c`, `--permission-mode`, `--permission-prompt-tool`, `--permission-prompts`, `--allowedTools`/`--allowed-tools` — use `allowed_tools`) and the approval bypasses (`--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, a bare `--`) are rejected at config-load, in every spelling (`--flag=value`, short clusters like `-pc`). See [Security → Engine CLI flags](../how-to/security.md#engine-cli-flags-extra_args). |
+| `dangerously_skip_permissions` | bool | `false` | Adds `--dangerously-skip-permissions`, which overrides `permission_mode` **and every `/planmode` choice** — no Telegram approvals are shown. Logs `claude.config.dangerously_skip_permissions` once at startup. |
 | `use_api_billing` | bool | `false` | Keep `ANTHROPIC_API_KEY` for API billing. |
 
 === "untether config"

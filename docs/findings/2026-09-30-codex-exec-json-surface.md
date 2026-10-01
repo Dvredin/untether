@@ -461,12 +461,27 @@ Run these in a scratch git dir with `CODEX_HOME` untouched, `--skip-git-repo-che
 - **U1 — web_search wire bytes (duplicate `id`) and started/completed pairing:**
   `printf 'Use web search to find the codex-cli latest version, answer in one line' | codex -c 'web_search="live"' exec --json --skip-git-repo-check --color=never - | tee /tmp/u1.jsonl`
   Then `grep web_search /tmp/u1.jsonl`.
+  **Result (2026-10-01, codex-cli 0.157.1, `-m gpt-5.6-luna`, #419 step 0):** confirmed. Both
+  `item.started` and `item.completed` carry the **duplicate `id`** (`"id":"item_2",…,"id":"exec-8c5b…"`),
+  the raw id is shared across the two phases, `item.started` has `query:""` + `action:{"type":"other"}`,
+  and `item.completed` carries the real query in both `query` and `action.query` plus `results`
+  (`text_result` objects with `title`/`url`/`snippet`). A second search completed with `query:""`,
+  `action:{"type":"other"}` and one `"Internal Error"` result — the placeholder title covers it.
+  Trimmed fixture: `tests/fixtures/codex_0157_web_search.jsonl`.
 - **U2 — cumulative usage across resume:**
   `echo 'say hi' | codex exec --json --skip-git-repo-check - | tee /tmp/u2a.jsonl`, take the `thread_id`, then
   `echo 'say hi again' | codex exec --json --skip-git-repo-check resume <thread_id> - | tee /tmp/u2b.jsonl`.
   Compare `turn.completed.usage` in u2a/u2b with the rollout `token_count` total/last
   (`sqlite3 'file:~/.codex/state_5.sqlite?mode=ro' "select rollout_path from threads where id='<thread_id>'"`).
   Also confirms whether resume appends to the original rollout file (for the side-channel).
+  **Result (2026-10-01, codex-cli 0.157.1, `-m gpt-5.6-luna`, #419 step 0) — GO:** usage is the
+  thread's running total. Three runs on one thread (fresh, `resume <id>`, `resume --last`) reported
+  `input_tokens 10656 → 21328 → 32017`, `cached 5888 → 11776 → 21760`, `output 6 → 13 → 21`
+  (every field non-decreasing). The rollout's `token_count` agrees: `total` = the exec figure,
+  `last` ≈ 10.7k per run. `thread.started` is re-emitted with the **same** `thread_id` on both
+  `resume <id>` and `resume --last`, and resume appends to the original rollout file. Fixture:
+  `tests/fixtures/codex_0157_resume_usage.jsonl`. Cost: ≈104k input tokens (≈60 % cached) + ≈220
+  output on the ChatGPT-subscription auth (no metered spend).
 - **U3 — compaction in exec JSON + rollout:**
   a multi-turn session with `-c model_auto_compact_token_limit=20000` (or a `/compact`-equivalent via
   the app-server). Check exec JSON for an `error` item "Heads up: …", and the rollout for `compacted` /
@@ -476,6 +491,15 @@ Run these in a scratch git dir with `CODEX_HOME` untouched, `--skip-git-repo-che
   (default web_search=cached), then the same with `-c 'web_search="disabled"'`. The server may now
   reject `minimal` itself on gpt-5.5, with different wording. Capture the exact `error` and `turn.failed`
   lines and any `Reconnecting… n/m` retries.
+  **Resolved 2026-09-30 (codex-cli 0.157.1, gpt-5.5, #416 implementation; both runs rejected before
+  inference, so no tokens billed).** No reconnect retries; `error` and `turn.failed.error.message` both
+  carry the whole pretty-printed JSON body. With the default web_search: `invalid_request_error`,
+  `code: null`, `param: "tools"`, message `The following tools cannot be used with reasoning.effort
+  'minimal': web_search.` With `-c web_search="disabled"`: still a 400 — `invalid_request_error`,
+  `code: "unsupported_value"`, `param: "reasoning.effort"`, message `Unsupported value: 'minimal' is
+  not supported with the 'gpt-5.5' model. Supported values are: 'none', 'low', 'medium', 'high', and
+  'xhigh'.` So disabling web search does not rescue `minimal` (retro-validates rejecting #416's B1).
+  Verbatim lines: `tests/fixtures/codex_turn_failed_minimal_reasoning.jsonl`.
 - **U5 — safe-mode replacement semantics:** with `--sandbox read-only` after `exec`, confirm that a
   write attempt produces a failed `command_execution`/`file_change` item and not a hang. Exec rejects
   approval requests, so this is expected but unverified.

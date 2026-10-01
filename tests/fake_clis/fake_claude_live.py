@@ -40,14 +40,87 @@ FOLLOWUP_DELAY_S = float(os.environ.get("FAKE_CLAUDE_FOLLOWUP_DELAY_S", "0"))
 # #775: how long the steer scenarios wait for a steered user line.
 STEER_WAIT_S = float(os.environ.get("FAKE_CLAUDE_STEER_WAIT_S", "5"))
 
+# #383: the CLI's permission mode. Changed by an approved ExitPlanMode
+# (-> "default", the `prePlanMode ?? "default"` path) and by a
+# `set_permission_mode` control_request, which — like the real CLI — is
+# handled inline by the stdin reader, not queued behind a turn.
+_mode = os.environ.get("FAKE_CLAUDE_START_MODE", "bypassPermissions")
+# Test knobs: refuse every set_permission_mode; emit no system/status frames.
+REARM_ERROR = bool(os.environ.get("FAKE_CLAUDE_REARM_ERROR"))
+NO_STATUS = bool(os.environ.get("FAKE_CLAUDE_NO_STATUS"))
+# #751: report this in the FIRST system/init only (like `auto` on Haiku,
+# which the real CLI silently runs as `default`); later inits report _mode.
+_INIT_MODE_OVERRIDE = os.environ.get("FAKE_CLAUDE_INIT_PERMISSION_MODE")
+_init_count = 0
+# A queued wake turn starts this long after the result, without reading stdin.
+WAKE_AFTER_RESULT_S = float(os.environ.get("FAKE_CLAUDE_WAKE_AFTER_RESULT_S", "0.05"))
+STDIN_LOG = os.environ.get("FAKE_CLAUDE_STDIN_LOG")
+
 _cost = 0.0
 _lines: queue.Queue[dict | None] = queue.Queue()
+_responses: queue.Queue[dict] = queue.Queue()
 _live_tasks: dict[str, str] = {}  # task_id -> tool_use_id
+_emit_lock = threading.Lock()
 
 
 def emit(obj: dict) -> None:
     obj.setdefault("session_id", SESSION_ID)
-    print(json.dumps(obj), flush=True)
+    with _emit_lock:  # the stdin reader emits too (#383 acks)
+        print(json.dumps(obj), flush=True)
+
+
+def log_stdin(kind: str) -> None:
+    """Append one ``<monotonic> <kind>`` line to FAKE_CLAUDE_STDIN_LOG."""
+    if STDIN_LOG:
+        with open(STDIN_LOG, "a") as fh:
+            fh.write(f"{time.monotonic():.6f} {kind}\n")
+
+
+def status_frame() -> None:
+    if not NO_STATUS:
+        emit(
+            {
+                "type": "system",
+                "subtype": "status",
+                "status": None,
+                "permissionMode": _mode,
+            }
+        )
+
+
+def _handle_control_request(obj: dict) -> None:
+    global _mode
+    request = obj.get("request") or {}
+    if request.get("subtype") != "set_permission_mode":
+        return
+    request_id = obj.get("request_id")
+    if REARM_ERROR:
+        emit(
+            {
+                "type": "control_response",
+                "response": {
+                    "subtype": "error",
+                    "request_id": request_id,
+                    "error": "Cannot set permission mode (fake)",
+                    "error_code": "invalid_mode",
+                },
+            }
+        )
+        return
+    changed = request.get("mode") != _mode
+    _mode = request.get("mode") or _mode
+    emit(
+        {
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": {"mode": _mode},
+            },
+        }
+    )
+    if changed:
+        status_frame()
 
 
 def _reader() -> None:
@@ -56,9 +129,20 @@ def _reader() -> None:
         if not raw:
             continue
         try:
-            _lines.put(json.loads(raw))
+            obj = json.loads(raw)
         except json.JSONDecodeError:
             continue
+        kind = obj.get("type", "?")
+        if kind == "control_request":
+            kind = f"control_request:{(obj.get('request') or {}).get('subtype')}"
+        log_stdin(kind)
+        if obj.get("type") == "control_request":
+            _handle_control_request(obj)
+            continue
+        if obj.get("type") == "control_response":
+            _responses.put(obj)
+            continue
+        _lines.put(obj)
     _lines.put(None)  # EOF
 
 
@@ -79,6 +163,11 @@ def next_user(timeout: float | None) -> dict | None | str:
 
 
 def init() -> None:
+    global _init_count
+    _init_count += 1
+    mode = _mode
+    if _INIT_MODE_OVERRIDE and _init_count == 1:
+        mode = _INIT_MODE_OVERRIDE
     emit(
         {
             "type": "system",
@@ -86,44 +175,57 @@ def init() -> None:
             "cwd": os.getcwd(),
             "model": "claude-haiku-fake",
             "tools": ["Bash", "Agent", "Monitor", "ScheduleWakeup"],
-            "permissionMode": "bypassPermissions",
+            "permissionMode": mode,
         }
     )
 
 
-def text(msg: str) -> None:
-    emit(
-        {
-            "type": "assistant",
-            "message": {
-                "id": f"msg_{time.monotonic_ns()}",
-                "role": "assistant",
-                "model": "claude-haiku-fake",
-                "content": [{"type": "text", "text": msg}],
-            },
-        }
-    )
+FAKE_MODEL = "claude-haiku-fake"
 
 
-def tool_use(name: str, tool_id: str, raw_input: dict) -> None:
-    emit(
-        {
-            "type": "assistant",
-            "message": {
-                "id": f"msg_{tool_id}",
-                "role": "assistant",
-                "model": "claude-haiku-fake",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "id": tool_id,
-                        "name": name,
-                        "input": raw_input,
-                    }
-                ],
-            },
-        }
-    )
+def _usage(used: int | None) -> dict | None:
+    """#819: an assistant ``usage`` whose input side totals ``used``."""
+    if used is None:
+        return None
+    return {
+        "input_tokens": 10,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": used - 10,
+        "output_tokens": 5,
+    }
+
+
+def text(msg: str, *, usage: int | None = None, model: str = FAKE_MODEL) -> None:
+    message = {
+        "id": f"msg_{time.monotonic_ns()}",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": msg}],
+    }
+    if usage is not None:
+        message["usage"] = _usage(usage)
+    emit({"type": "assistant", "message": message})
+
+
+def tool_use(
+    name: str, tool_id: str, raw_input: dict, *, usage: int | None = None
+) -> None:
+    message = {
+        "id": f"msg_{tool_id}",
+        "role": "assistant",
+        "model": FAKE_MODEL,
+        "content": [
+            {
+                "type": "tool_use",
+                "id": tool_id,
+                "name": name,
+                "input": raw_input,
+            }
+        ],
+    }
+    if usage is not None:
+        message["usage"] = _usage(usage)
+    emit({"type": "assistant", "message": message})
 
 
 def tool_result(tool_id: str, content: str) -> None:
@@ -141,23 +243,127 @@ def tool_result(tool_id: str, content: str) -> None:
 
 
 def result(
-    answer: str, *, turns: int = 1, delta: float = 0.01, api_ms: int = 900
+    answer: str,
+    *,
+    turns: int = 1,
+    delta: float = 0.01,
+    api_ms: int = 900,
+    model_usage: dict | None = None,
 ) -> None:
     global _cost
     _cost = round(_cost + delta, 6)
+    payload = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "duration_ms": 1000,
+        "duration_api_ms": api_ms,
+        "num_turns": turns,
+        "result": answer,
+        "total_cost_usd": _cost,
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+    if model_usage is not None:
+        payload["modelUsage"] = model_usage
+    emit(payload)
+
+
+# #819: ``result.modelUsage`` naming the fake model's window.
+MODEL_USAGE = {FAKE_MODEL: {"contextWindow": 200_000, "maxOutputTokens": 64_000}}
+
+
+def compaction(
+    trigger: str,
+    pre: int,
+    post: int | None,
+    *,
+    heartbeats: int = 0,
+    failed: bool = False,
+    init_between: bool = False,
+) -> None:
+    """#819: the compaction frames as captured on CLI 2.1.285
+    (``tests/fixtures/claude_compaction_2.1.285.jsonl`` / ``…autocompact…``):
+    ``status: compacting`` (re-sent every 30 s — ``heartbeats``), ``status:
+    null`` + ``compact_result``, a fresh ``init`` (manual ``/compact`` only),
+    then ``compact_boundary`` and the synthetic summary ``user`` frame. A
+    failed compaction stops after its ``status: null``."""
+    emit({"type": "system", "subtype": "status", "status": "compacting"})
+    for _ in range(heartbeats):
+        time.sleep(0.05)
+        emit({"type": "system", "subtype": "status", "status": "compacting"})
+    if failed:
+        emit(
+            {
+                "type": "system",
+                "subtype": "status",
+                "status": None,
+                "compact_result": "failed",
+                "compact_error": "Conversation too long to compact",
+            }
+        )
+        return
     emit(
         {
-            "type": "result",
-            "subtype": "success",
-            "is_error": False,
-            "duration_ms": 1000,
-            "duration_api_ms": api_ms,
-            "num_turns": turns,
-            "result": answer,
-            "total_cost_usd": _cost,
-            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "type": "system",
+            "subtype": "status",
+            "status": None,
+            "compact_result": "success",
         }
     )
+    if init_between:
+        init()
+    meta = {
+        "trigger": trigger,
+        "pre_tokens": pre,
+        "cumulative_dropped_tokens": pre - (post or 0),
+        "duration_ms": 50,
+    }
+    if post is not None:
+        meta["post_tokens"] = post
+    emit(
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": meta,
+            "logical_parent_uuid": "lp-fake",
+        }
+    )
+    emit(
+        {
+            "type": "user",
+            "isSynthetic": True,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "This session is being continued from a "
+                        "previous conversation that ran out of context.",
+                    }
+                ],
+            },
+        }
+    )
+
+
+def compact_command_turn(cmd: str | None) -> None:
+    """#819: a manual ``/compact`` written into the live session — Z10: no
+    API turn, a replayed "Compacted" stdout and a 0-turn, 0-ms, empty
+    result."""
+    lifecycle(cmd, "queued")
+    lifecycle(cmd, "started")
+    compaction("manual", 60_000, 2_000, init_between=True)
+    emit(
+        {
+            "type": "user",
+            "isReplay": True,
+            "message": {
+                "role": "user",
+                "content": "<local-command-stdout>Compacted </local-command-stdout>",
+            },
+        }
+    )
+    result("", turns=0, api_ms=0, delta=0.0, model_usage=MODEL_USAGE)
 
 
 def snapshot() -> None:
@@ -244,7 +450,27 @@ def serve_followups() -> None:
     shutdown()
 
 
+def _wait_for_sigint() -> None:
+    """#829: a real background agent ignores stdin EOF (probe G6); the CLI
+    exits ``FAKE_CLAUDE_SIGINT_RC`` (default 0, probe G7) on the SIGINT
+    Untether sends after the close grace."""
+    rc = int(os.environ.get("FAKE_CLAUDE_SIGINT_RC", "0"))
+
+    def _on_sigint(*_: object) -> None:
+        sys.stdout.flush()
+        os._exit(rc)
+
+    signal.signal(signal.SIGINT, _on_sigint)
+    _maybe_ignore_sigint()
+    time.sleep(60)
+    os._exit(0)
+
+
 def shutdown() -> None:
+    # #829: FAKE_CLAUDE_EOF_MODE=until_sigint models live background agents,
+    # which keep working after EOF — only a SIGINT ends the process.
+    if os.environ.get("FAKE_CLAUDE_EOF_MODE") == "until_sigint":
+        _wait_for_sigint()
     # Stdin closed: stop live background work, as the real CLI does (F3).
     flush_withheld()  # #812: plain async hooks report at teardown
     kill_hooks()
@@ -551,6 +777,57 @@ def scenario_followup(first: dict) -> None:
     if RESULT_DELAY_S > 0:
         time.sleep(RESULT_DELAY_S)
     result("FIRST")
+    serve_followups()
+
+
+def scenario_compact_followup(first: dict) -> None:
+    """#819: the run answers with a known context size; a ``/compact``
+    follow-up compacts in the same process (its own turn), and the next
+    follow-up answers with a much lower context."""
+    init()
+    text("FIRST", usage=60_000)
+    result("FIRST", model_usage=MODEL_USAGE)
+    while True:
+        obj = next_user(None)
+        if obj is None or obj == "timeout":
+            break
+        cmd = obj.get("uuid")
+        if user_text(obj).strip() == "/compact":
+            compact_command_turn(cmd)
+            continue
+        lifecycle(cmd, "queued")
+        lifecycle(cmd, "started")
+        init()
+        text(f"ECHO: {user_text(obj)}", usage=20_000)
+        result(f"ECHO: {user_text(obj)}", model_usage=MODEL_USAGE)
+    shutdown()
+
+
+def scenario_auto_compact_mid_turn(first: dict) -> None:
+    """#819 (the shape captured in ``claude_autocompact_2.1.285.jsonl``): a
+    tool loop fills the context, the CLI auto-compacts between the
+    ``tool_result`` and the next request — no fresh ``init`` — and the turn
+    carries on with a lower context."""
+    init()
+    tool_use("Read", "toolu_big", {"file_path": "big.txt"}, usage=150_000)
+    tool_result("toolu_big", "lots of text")
+    compaction("auto", 170_000, 30_000, heartbeats=2)
+    text("done reading", usage=40_000)
+    result("done reading", turns=2, model_usage=MODEL_USAGE)
+    serve_followups()
+
+
+def scenario_context_usage_growth(first: dict) -> None:
+    """#819: three main-thread responses with rising usage in one turn."""
+    init()
+    tool_use("Read", "toolu_a", {"file_path": "a.txt"}, usage=20_000)
+    time.sleep(WAKE_S)
+    tool_result("toolu_a", "a")
+    tool_use("Read", "toolu_b", {"file_path": "b.txt"}, usage=60_000)
+    time.sleep(WAKE_S)
+    tool_result("toolu_b", "b")
+    text("GROWN", usage=124_000)
+    result("GROWN", turns=3, model_usage=MODEL_USAGE)
     serve_followups()
 
 
@@ -1455,7 +1732,563 @@ def scenario_hook_flood(first: dict) -> None:
     serve_followups()
 
 
+# ── #829: background activity and the live-session hold ───────────────────
+
+PROGRESS_S = float(os.environ.get("FAKE_CLAUDE_PROGRESS_S", "0.1"))
+PROGRESS_FOR_S = float(os.environ.get("FAKE_CLAUDE_PROGRESS_FOR_S", "1.0"))
+TOOL_S = float(os.environ.get("FAKE_CLAUDE_TOOL_S", "1.0"))
+
+
+def _mark_progress() -> None:
+    """Write the wall-clock time of the latest activity where the test can
+    time the close from (``FAKE_CLAUDE_MARKER_FILE``)."""
+    path = os.environ.get("FAKE_CLAUDE_MARKER_FILE")
+    if path:
+        with open(path, "w") as fh:
+            fh.write(repr(time.time()))
+
+
+def _launch_agent() -> None:
+    init()
+    tool_use("Agent", "toolu_ag", {"description": "build", "prompt": "go"})
+    start_bg("a1", "toolu_ag", task_type="local_agent")
+    tool_result("toolu_ag", "Async agent launched successfully.")
+    result("agent started", turns=2)
+
+
+def _task_progress(task_id: str, n: int, tool_use_id: str = "toolu_ag") -> None:
+    emit(
+        {
+            "type": "system",
+            "subtype": "task_progress",
+            "task_id": task_id,
+            "tool_use_id": tool_use_id,
+            "description": f"Running step {n}",
+            "subagent_type": "general-purpose",
+            "usage": {"total_tokens": 1000 + 100 * n, "tool_uses": n, "duration_ms": n},
+            "last_tool_name": "Read",
+        }
+    )
+
+
+def _wait_or_shutdown(seconds: float) -> None:
+    if wait_idle_or_eof(seconds) is None:
+        shutdown()
+
+
+def _silent_until_eof() -> None:
+    while True:
+        _wait_or_shutdown(3600)
+
+
+def scenario_bg_agent_progressing(first: dict) -> None:
+    """#829: a background agent emitting ``task_progress`` (rising usage,
+    one frame per tool call, P0 G1) every ``FAKE_CLAUDE_PROGRESS_S`` for
+    ``FAKE_CLAUDE_PROGRESS_FOR_S``; then it finishes and wakes the parent
+    (``FAKE_CLAUDE_PROGRESS_THEN=finish``, default) or goes silent."""
+    _launch_agent()
+    deadline = time.monotonic() + PROGRESS_FOR_S
+    n = 0
+    while time.monotonic() < deadline:
+        n += 1
+        _task_progress("a1", n)
+        _mark_progress()
+        _wait_or_shutdown(PROGRESS_S)
+    if os.environ.get("FAKE_CLAUDE_PROGRESS_THEN", "finish") != "finish":
+        _silent_until_eof()
+    end_bg("a1")
+    init()
+    text("GOT: AGENT-DONE")
+    result("GOT: AGENT-DONE")
+    serve_followups()
+
+
+def scenario_bg_agent_silent(first: dict) -> None:
+    """#829: a background agent that never reports progress."""
+    _launch_agent()
+    _silent_until_eof()
+
+
+def scenario_bg_agent_long_tool(first: dict) -> None:
+    """#829 A.2: the agent enters one long foreground tool — the CLI sends
+    no ``task_progress`` meanwhile (P0 G2), only the subagent-owned
+    foreground task's start and ``task_notification`` (P0 G3)."""
+    _launch_agent()
+    emit(
+        {
+            "type": "assistant",
+            "parent_tool_use_id": "toolu_ag",
+            "message": {
+                "id": "msg_sub_long",
+                "role": "assistant",
+                "model": "claude-haiku-fake",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_sub_long",
+                        "name": "Bash",
+                        "input": {"command": "make test"},
+                    }
+                ],
+            },
+        }
+    )
+    _task_progress("a1", 1)
+    emit(
+        {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "bfg1",
+            "tool_use_id": "toolu_sub_long",
+            "description": "make test",
+            "owned_by_subagent": True,
+            "is_backgrounded": False,
+            "task_type": "local_bash",
+        }
+    )
+    _wait_or_shutdown(TOOL_S)
+    emit(
+        {
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "bfg1",
+            "tool_use_id": "toolu_sub_long",
+            "status": "completed",
+            "output_file": "",
+            "summary": "make test",
+        }
+    )
+    _mark_progress()
+    _silent_until_eof()
+
+
+def scenario_nonholding_progress(first: dict) -> None:
+    """#829 negative: only a subagent-owned *foreground* task (no known
+    owner) shows progress while a silent background Bash holds the session
+    — that progress must not re-arm the hold."""
+    init()
+    tool_use("Bash", "toolu_bg", {"command": "sleep 600", "run_in_background": True})
+    start_bg("b1", "toolu_bg")
+    tool_result("toolu_bg", "Command running in background with ID: b1.")
+    result("waiting", turns=2)
+    emit(
+        {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "bfg9",
+            "tool_use_id": "toolu_unknown",
+            "description": "fg",
+            "owned_by_subagent": True,
+            "is_backgrounded": False,
+            "task_type": "local_bash",
+        }
+    )
+    n = 0
+    while True:
+        n += 1
+        _task_progress("bfg9", n, tool_use_id="toolu_unknown")
+        _wait_or_shutdown(PROGRESS_S)
+
+
+def scenario_bg_bash_printing(first: dict) -> None:
+    """#829 fallback: a background Bash whose output file (named in its
+    tool_result, P0 G4) grows every ``FAKE_CLAUDE_PROGRESS_S`` for
+    ``FAKE_CLAUDE_PROGRESS_FOR_S`` — or never (``FAKE_CLAUDE_PROGRESS_FOR_S=0``,
+    a silent ``sleep``)."""
+    path = os.environ["FAKE_CLAUDE_OUTPUT_FILE"]
+    with open(path, "w"):
+        pass
+    init()
+    tool_use("Bash", "toolu_bg", {"command": "ticker", "run_in_background": True})
+    start_bg("b1", "toolu_bg")
+    tool_result(
+        "toolu_bg",
+        "Command running in background with ID: b1. Output is being written to: "
+        f"{path}. You will be notified when it completes.",
+    )
+    result("waiting", turns=2)
+    deadline = time.monotonic() + PROGRESS_FOR_S
+    n = 0
+    while time.monotonic() < deadline:
+        n += 1
+        with open(path, "a") as fh:
+            fh.write(f"tick {n}\n")
+        _mark_progress()
+        _wait_or_shutdown(PROGRESS_S)
+    _silent_until_eof()
+
+
+# ── #383: plan approval and the plan re-arm ─────────────────────────────────
+
+
+def ask_exit_plan_mode(req_id: str, *, timeout: float = 10.0) -> bool:
+    """ExitPlanMode round trip: tool_use, can_use_tool control_request, wait
+    for the host's answer. An allow moves the mode to ``default`` (a session
+    started in plan has no prePlanMode) and emits the status frame BEFORE the
+    tool_result, as probed on CLI 2.1.285."""
+    global _mode
+    tool_id = f"toolu_{req_id}"
+    tool_use("ExitPlanMode", tool_id, {"plan": "# Plan\n1. do it"})
+    emit(
+        {
+            "type": "control_request",
+            "request_id": req_id,
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {"plan": "# Plan\n1. do it"},
+                "tool_use_id": tool_id,
+            },
+        }
+    )
+    log_stdin(f"can_use_tool:{req_id}")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            resp = _responses.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            tool_result(tool_id, "timed out")
+            return False
+        inner = resp.get("response") or {}
+        if inner.get("request_id") != req_id:
+            continue
+        allowed = (inner.get("response") or {}).get("behavior") == "allow"
+        break
+    if allowed:
+        _mode = "default"
+        status_frame()
+        tool_result(tool_id, "User has approved your plan. You can now start coding.")
+    else:
+        tool_result(tool_id, "User denied")
+    return allowed
+
+
+def mode_turn(*, reply: str | None = None, sample: str | None = None) -> None:
+    """One turn answering ``MODE: <mode>`` — the mode the turn STARTED in."""
+    mode = sample if sample is not None else _mode
+    log_stdin(f"turn_start:{mode}")
+    init()
+    text(reply or f"MODE: {mode}")
+    result(reply or f"MODE: {mode}")
+
+
+def serve_mode_followups() -> None:
+    """Like serve_followups, but each follow-up answers ``MODE: <mode>``."""
+    while _deferred:
+        _lines.put(_deferred.pop(0))
+    while True:
+        obj = next_user(None)
+        if obj is None or obj == "timeout":
+            break
+        cmd = obj.get("uuid")
+        lifecycle(cmd, "queued")
+        lifecycle(cmd, "started")
+        mode_turn()
+    shutdown()
+
+
+def _plan_first_turn() -> bool:
+    init()
+    allowed = ask_exit_plan_mode("req-epm-1")
+    text("PLANNED")
+    return allowed
+
+
+def scenario_plan_approve_followup(first: dict) -> None:
+    _plan_first_turn()
+    result("PLANNED", turns=2)
+    serve_mode_followups()
+
+
+def scenario_plan_approve_error_turn(first: dict) -> None:
+    """#383: a live follow-up turn approves a plan and then ends in an error
+    — it left plan mode all the same."""
+    init()
+    text("FIRST")
+    result("FIRST")
+    obj = next_user(None)
+    if not isinstance(obj, dict):
+        shutdown()
+    cmd = obj.get("uuid")
+    lifecycle(cmd, "queued")
+    lifecycle(cmd, "started")
+    init()
+    ask_exit_plan_mode("req-epm-err")
+    emit(
+        {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "duration_ms": 1000,
+            "duration_api_ms": 900,
+            "num_turns": 2,
+            "result": "",
+            "total_cost_usd": 0.02,
+        }
+    )
+    serve_mode_followups()
+
+
+def scenario_plan_approve_bg_bash_wake(first: dict) -> None:
+    _plan_first_turn()
+    tool_use("Bash", "toolu_bg", {"command": "sleep 20", "run_in_background": True})
+    start_bg("b1", "toolu_bg")
+    tool_result("toolu_bg", "Command running in background with ID: b1.")
+    result("PLANNED", turns=3)
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    end_bg("b1")
+    mode_turn()
+    serve_mode_followups()
+
+
+def scenario_plan_approve_queued_wake(first: dict) -> None:
+    """#383 wake-turn race: the bg task's notification is already queued when
+    the result is emitted, so the CLI starts the wake turn by itself after
+    WAKE_AFTER_RESULT_S without waiting for any stdin line. The stdin reader
+    keeps applying set_permission_mode meanwhile — the turn samples the mode
+    only when it starts, so it answers ``MODE: plan`` only if the host's
+    re-arm beat it."""
+    _plan_first_turn()
+    tool_use("Bash", "toolu_bg", {"command": "true", "run_in_background": True})
+    start_bg("b1", "toolu_bg")
+    tool_result("toolu_bg", "Command running in background with ID: b1.")
+    result("PLANNED", turns=3)
+    time.sleep(WAKE_AFTER_RESULT_S)
+    mode = _mode
+    end_bg("b1")
+    mode_turn(sample=mode)
+    serve_mode_followups()
+
+
+def scenario_plan_approve_monitor_ticks(first: dict) -> None:
+    """#383: Monitor ticks after an approval. An acting tick that starts in
+    plan mode calls ExitPlanMode first (and waits for the host)."""
+    _plan_first_turn()
+    tool_use("Monitor", "toolu_mon", {"command": "tick", "timeout_ms": 30000})
+    start_bg("m1", "toolu_mon")
+    tool_result("toolu_mon", "Monitor started (task m1).")
+    result("PLANNED", turns=3)
+    for tick in (1, 2, 3):
+        if wait_idle_or_eof(WAKE_S) is None:
+            shutdown()
+        started_in = _mode
+        log_stdin(f"turn_start:{started_in}")
+        init()
+        if started_in == "plan":
+            ask_exit_plan_mode(f"req-tick-{tick}")
+        if tick == 3:
+            end_bg("m1")
+        text(f"TICK {tick} MODE: {started_in}")
+        result(f"TICK {tick} MODE: {started_in}")
+    serve_mode_followups()
+
+
+def _launch_bg_agent(task_id: str) -> None:
+    tool_id = f"toolu_{task_id}"
+    tool_use("Agent", tool_id, {"description": f"work {task_id}", "prompt": "go"})
+    start_bg(task_id, tool_id, task_type="local_agent")
+    tool_result(tool_id, "Async agent launched successfully.")
+
+
+def _answer_while_agents_run(seconds: float, *, launch: str | None = None) -> None:
+    """#383 C4: the approved plan's agents work for ``seconds``; each user
+    line meanwhile runs at once as its own turn answering ``MODE: <mode>``
+    (the real CLI does not hold a follow-up behind a background agent). The
+    first such turn launches agent ``launch`` when given."""
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        obj = next_user(remaining)
+        if obj is None:
+            shutdown()
+        if obj == "timeout":
+            return
+        cmd = obj.get("uuid")
+        lifecycle(cmd, "queued")
+        lifecycle(cmd, "started")
+        mode = _mode
+        log_stdin(f"turn_start:{mode}")
+        init()
+        if launch is not None:
+            _launch_bg_agent(launch)
+            launch = None
+        text(f"MODE: {mode}")
+        result(f"MODE: {mode}")
+
+
+def _agent_finishes(task_id: str) -> None:
+    """The agent ends (recording the mode it ran its last step in) and the
+    CLI starts its wake turn by itself after WAKE_AFTER_RESULT_S, reading no
+    stdin line first — so the turn answers ``MODE: plan`` only if the host
+    re-armed on the task's end frames."""
+    log_stdin(f"agent_end:{task_id}:{_mode}")
+    end_bg(task_id)
+    time.sleep(WAKE_AFTER_RESULT_S)
+    mode_turn(sample=_mode)
+
+
+def scenario_plan_approve_agent_wake(first: dict) -> None:
+    """#383 C4: the approved turn launches a background agent. Follow-ups
+    while it works run unplanned; its wake turn and later follow-ups are
+    planned again."""
+    _plan_first_turn()
+    _launch_bg_agent("a1")
+    result("PLANNED", turns=3)
+    _answer_while_agents_run(WAKE_S)
+    _agent_finishes("a1")
+    serve_mode_followups()
+
+
+def scenario_plan_approve_agent_chain(first: dict) -> None:
+    """#383 C4: a deferred (unplanned) follow-up launches a second agent; it
+    never extends the deferral — the first agent's end re-arms plan while
+    the second still runs."""
+    _plan_first_turn()
+    _launch_bg_agent("a1")
+    result("PLANNED", turns=3)
+    _answer_while_agents_run(WAKE_S, launch="a2")
+    _agent_finishes("a1")
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    _agent_finishes("a2")
+    serve_mode_followups()
+
+
+def scenario_plan_approve_agent_before(first: dict) -> None:
+    """#383 C4: an agent launched in an earlier (planning) turn doesn't hold
+    the re-arm back — it ran under plan mode anyway."""
+    init()
+    _launch_bg_agent("a0")
+    text("PLANNING")
+    result("PLANNING", turns=2)
+    obj = next_user(None)
+    if not isinstance(obj, dict):
+        shutdown()
+    cmd = obj.get("uuid")
+    lifecycle(cmd, "queued")
+    lifecycle(cmd, "started")
+    init()
+    ask_exit_plan_mode("req-epm-2")
+    text("PLANNED")
+    result("PLANNED", turns=2)
+    _answer_while_agents_run(WAKE_S)
+    _agent_finishes("a0")
+    serve_mode_followups()
+
+
+# ── #684: a control request the CLI withdraws / never gets answered ─────────
+
+# How long ``control_cancel`` waits for a host answer before withdrawing.
+CANCEL_AFTER_S = float(os.environ.get("FAKE_CLAUDE_CANCEL_AFTER_S", "0.3"))
+# ``control_unanswered``: emit a result this long after the request (a
+# background agent's request pending across the turn's end); unset = never.
+UNANSWERED_RESULT_S = os.environ.get("FAKE_CLAUDE_UNANSWERED_RESULT_S")
+# ``control_cancel``: pause between the cancel frame and the tool_result, so
+# the host re-renders its progress message in between.
+AFTER_CANCEL_S = float(os.environ.get("FAKE_CLAUDE_AFTER_CANCEL_S", "0"))
+
+
+def _raise_can_use_tool(req_id: str, tool_id: str) -> None:
+    tool_use("Bash", tool_id, {"command": "touch x"})
+    emit(
+        {
+            "type": "control_request",
+            "request_id": req_id,
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": {"command": "touch x"},
+                "tool_use_id": tool_id,
+            },
+        }
+    )
+    log_stdin(f"can_use_tool:{req_id}")
+
+
+def _cancel_turn(req_id: str = "req-cancel-1") -> None:
+    """A Bash permission request the CLI withdraws (interrupt / turn abort):
+    ``control_cancel_request`` then the synthetic rejection tool_result, as
+    probed on CLI 2.1.285 (findings 2026-09-30 Z4). Any host answer is
+    recorded in FAKE_CLAUDE_STDIN_LOG (``control_response``) and ignored."""
+    tool_id = "toolu_c"
+    _raise_can_use_tool(req_id, tool_id)
+    with contextlib.suppress(queue.Empty):
+        _responses.get(timeout=CANCEL_AFTER_S)
+        log_stdin("answered_before_cancel")
+    emit({"type": "control_cancel_request", "request_id": req_id})
+    log_stdin(f"cancel_sent:{req_id}")
+    if AFTER_CANCEL_S > 0:
+        time.sleep(AFTER_CANCEL_S)
+    tool_result(
+        tool_id,
+        "The user doesn't want to proceed with this tool use. The tool use was "
+        "rejected (eg. if it was a file edit, the new_string was NOT written to "
+        "the file). STOP what you are doing and wait for the user to tell you "
+        "how to proceed.",
+    )
+    text("Stopped.")
+    result("Stopped.")
+
+
+def scenario_control_cancel(first: dict) -> None:
+    init()
+    _cancel_turn()
+    serve_followups()
+
+
+def scenario_control_cancel_followup(first: dict) -> None:
+    """Turn 1 answers; the injected follow-up's turn raises and withdraws the
+    request (a follow-up turn is translated by the run's reader tasks)."""
+    init()
+    text("ready")
+    result("ready")
+    obj = next_user(None)
+    if isinstance(obj, dict):
+        cmd = obj.get("uuid")
+        lifecycle(cmd, "queued")
+        lifecycle(cmd, "started")
+        init()
+        _cancel_turn()
+    serve_followups()
+
+
+def scenario_control_unanswered(first: dict) -> None:
+    """A Bash permission request nobody answers: never cancelled. With
+    FAKE_CLAUDE_UNANSWERED_RESULT_S the turn still ends (the request stays
+    pending across the result); otherwise the CLI waits until stdin EOF."""
+    init()
+    _raise_can_use_tool("req-unanswered-1", "toolu_u")
+    if UNANSWERED_RESULT_S is not None:
+        time.sleep(float(UNANSWERED_RESULT_S))
+        text("waiting on approval")
+        result("waiting on approval")
+    while True:
+        obj = next_user(None)
+        if obj is None or obj == "timeout":
+            break
+
+
 _SCENARIOS = {
+    "plan_approve_agent_wake": scenario_plan_approve_agent_wake,
+    "plan_approve_agent_chain": scenario_plan_approve_agent_chain,
+    "plan_approve_agent_before": scenario_plan_approve_agent_before,
+    "control_cancel": scenario_control_cancel,
+    "control_cancel_followup": scenario_control_cancel_followup,
+    "control_unanswered": scenario_control_unanswered,
+    "bg_agent_progressing": scenario_bg_agent_progressing,
+    "bg_agent_silent": scenario_bg_agent_silent,
+    "bg_agent_long_tool": scenario_bg_agent_long_tool,
+    "nonholding_progress": scenario_nonholding_progress,
+    "bg_bash_printing": scenario_bg_bash_printing,
+    "plan_approve_followup": scenario_plan_approve_followup,
+    "plan_deny_followup": scenario_plan_approve_followup,  # the host denies
+    "plan_approve_error_turn": scenario_plan_approve_error_turn,
+    "plan_approve_bg_bash_wake": scenario_plan_approve_bg_bash_wake,
+    "plan_approve_queued_wake": scenario_plan_approve_queued_wake,
+    "plan_approve_monitor_ticks": scenario_plan_approve_monitor_ticks,
     "async_rewake_idle": scenario_async_rewake_idle,
     "async_hook_success": scenario_async_hook_success,
     "async_hook_post_result_response": scenario_async_hook_post_result_response,
@@ -1482,6 +2315,9 @@ _SCENARIOS = {
     "monitor_ticks": scenario_monitor_ticks,
     "scheduled_wakeup": scenario_scheduled_wakeup,
     "followup": scenario_followup,
+    "compact_followup": scenario_compact_followup,
+    "auto_compact_mid_turn": scenario_auto_compact_mid_turn,
+    "context_usage_growth": scenario_context_usage_growth,
     "followup_launches_bg": scenario_followup_launches_bg,
     "followup_blocks": scenario_followup_blocks,
     "multi_agent_acks": scenario_multi_agent_acks,

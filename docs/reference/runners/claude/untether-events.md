@@ -115,7 +115,28 @@ Claude Code emits a system init event early in the stream:
   `scope == "local"`. `system/model_fallback` (not a safeguard stop) emits a
   `note` action `↪️ Switched model <a> → <b> (<trigger>)` and logs
   `claude.model_fallback`.
+- `system/status` with a string `permissionMode` (#383) emits no Untether
+  event; it updates `ClaudeStreamState.effective_permission_mode` (as does
+  every `system.init.permissionMode` and the ack of Untether's own
+  `set_permission_mode`, request id `ut_plan_rearm_…`). Seeing `plan`
+  clears the session's `_PLAN_EXIT_APPROVED`; a plan chat seeing any other
+  mode records `plan_exited_at` / `plan_exit_turn`.
+- `TurnEvent(started).detail["plan_deferred"] = {"agents": N}` (#383 C4): the
+  turn runs unplanned because the plan re-arm is deferred while background
+  agents launched in the plan-exit turn still work — set on a follow-up /
+  idle steer written during the deferral and, in `plan` chats, on a wake
+  turn opened during it. The bridge adds `⚠️ Not re-planned: the approved
+  plan's background agents are still running. Plan mode resumes when they
+  finish.` under the turn header (the whole header for a follow-up).
 - Optional: emit a `note` action summarizing tools/MCP servers (debug-only).
+
+The top-level `control_cancel_request` line (#684) — the CLI withdrawing a
+pending permission request — writes no reply and retires the request: one
+`action.completed` (kind `warning`, `⏹️ Permission request withdrawn — Claude
+Code no longer needs an answer`) for the request's action, which drops its
+keyboard; nothing for an unknown or already-answered id. The base runner keeps
+it out of `last_event_type` (control traffic) and treats it as resolving an
+approval wait in the ring-buffer fallback.
 
 The top-level `rate_limit_event` line (#790) is a quota snapshot, not a
 throttle notice: `allowed` emits nothing; `allowed_warning` emits at most one
@@ -298,6 +319,24 @@ If a tool name is unknown, map to `tool` and include the full input in `detail`.
 Untether `completed.usage` should mirror the Claude Code `result.usage` object
 without transformation. Optionally include `modelUsage` inside `usage` or
 `detail` if downstream consumers want it (currently unused by renderers).
+
+### 6.1 Context-window use (#819)
+
+| Claude frame | Untether event |
+|---|---|
+| main-thread `assistant` with int `message.usage` input fields | `ActionEvent(kind="telemetry", id="claude.context", phase="updated", detail={context_pct, context_used, context_window, model})` — only when the integer % changes and the model's window is known |
+| `result.modelUsage.<model>.contextWindow` | learned into the per-process window cache; a first-known value is emitted as the same telemetry event **before** the supplementary `StartedEvent{complete}` / `CompletedEvent`; `usage["context"] = {pct, used, window, model}` (log field) |
+| `system/status {"status":"compacting"}` | `ActionEvent(kind="note", id="claude.compaction.<n>", phase="started", title="🗜️ Compacting context…")`; a repeat (the 30 s heartbeat) is `phase="updated"` on the same id. Live session with no turn open (a `/compact` follow-up): a `TurnEvent(started)` first |
+| `system/status {"status":null,"compact_result":"success"}` | `phase="completed"`, `🗜️ Context compacted`, `ok=True` |
+| `system/status {"status":null,"compact_result":"failed"}` | `phase="completed"`, `🗜️ Compaction failed · <compact_error>`, `ok=False`, `level="warning"` |
+| `system/status {"status":null}` with a row open / none open | `🗜️ Compaction skipped` / nothing (#383's `permissionMode` frame) |
+| `system/compact_boundary` | the same row re-completed as `🗜️ Context compacted · <pre> → <post> tokens (<trigger>)` (one step), then telemetry with `context_pct: None` (segment hidden until the next response) |
+| `result` after a compaction | `usage["compaction"] = {count, trigger, pre_tokens, post_tokens, result, manual_success}` on the `CompletedEvent` / live `TurnEvent(completed)` |
+| live `TurnEvent(started)` | followed by the current value (the turn's tracker starts empty) |
+
+Subagent (`parent_tool_use_id`) and `<synthetic>` frames never change the value.
+`ProgressTracker` keeps telemetry out of its actions (no step, no running tool, never
+exported). Full rules: runner spec → "Context usage" and "Compaction".
 
 ---
 

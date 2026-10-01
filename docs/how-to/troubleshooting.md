@@ -172,7 +172,13 @@ Switch to `claude`, `codex`, `opencode`, or `pi` via `/config → Engine & model
 
 ### Codex: approval hang
 
-Codex may block waiting for terminal approval in headless mode if no `--ask-for-approval` flag is passed. **Fix:** upgrade to Untether v0.35.0+ which always passes `--ask-for-approval never` (or `untrusted` in safe permission mode). Older versions may not pass this flag, causing Codex to use its default terminal-based approval flow.
+`codex exec` (the headless mode Untether runs) always runs with approval `never` and never waits for terminal approval, so an approval hang is not expected on any recent Codex CLI. Untether v0.35.5+ no longer passes `--ask-for-approval` at all; the Codex **safe** policy picks the read-only sandbox instead (`--sandbox read-only`). If Codex still stalls, check the stall diagnostics and your MCP servers.
+
+### Codex: `invalid value 'untrusted'` / `is no longer supported; remove this setting`
+
+- `error: invalid value 'untrusted' for '--ask-for-approval'` (rc=2, every run in a chat set to **Safe**): Untether before v0.35.5 passed `--ask-for-approval untrusted`, which codex-cli 0.149.0+ removed. **Fix:** upgrade Untether ([#830](https://github.com/littlebearapps/untether/issues/830)), or switch the chat to **Full auto** in `/config` → Approval policy until you can.
+- `approval_policy = "untrusted" is no longer supported; remove this setting` (every Codex run, Full auto included): your own `~/.codex/config.toml` (or a `--profile` file) sets the retired value. **Fix:** remove the `approval_policy = "untrusted"` line. Untether's error hint names this case.
+- A `sandbox_mode` and `default_permissions` conflict is possible if `[engines.codex] extra_args` sets `-c default_permissions=…` while the chat is in **Safe** (Safe sets the sandbox itself). Drop the `-c default_permissions` override, or use Full auto.
 
 ### OpenCode: unsupported event warning
 
@@ -356,7 +362,9 @@ To change:
     voice_transcription_url_allowlist = ["127.0.0.0/8"]   # or your private range
     ```
 
-Run `untether doctor` to validate voice configuration.
+    Since v0.35.5 ([#679](https://github.com/littlebearapps/untether/issues/679)) the voice note reply names the blocked host and the exact entry to add (for example ``voice transcription endpoint `localhost` is blocked by the SSRF guard …``), and the log shows `voice.base_url.ssrf_blocked` with `host`, `blocked_addresses` and `suggested_allowlist`. The same problem is logged at startup and after a hot-reload as `voice.base_url.not_permitted` (WARNING); `voice.base_url.permitted` confirms a fix. A reply saying the endpoint "could not be resolved" means a DNS failure, not the SSRF guard: check the hostname in `voice_transcription_base_url`.
+
+Run `untether doctor` to check the voice API key. It doesn't check the transcription endpoint yet; use the startup log line above for that.
 
 ## File transfer blocked
 
@@ -439,7 +447,7 @@ A follow-up waits for the current Claude turn to finish; it isn't mixed into a t
 
 This is expected since v0.35.5. When Claude starts a background task, a subagent, a `Monitor` or a `ScheduleWakeup` and ends its turn, Untether keeps the session open. Claude then carries on by itself when the work finishes, and each of those turns is delivered as its own message. Before v0.35.5 these turns ran with nothing shown in Telegram. Monitor updates arrive silently (no notification); the others notify, once per finished task ([#785](https://github.com/littlebearapps/untether/issues/785)). Approval buttons work inside these turns as normal ([#776](https://github.com/littlebearapps/untether/issues/776)).
 
-The session stays open while background work is live, up to 30 minutes after the last turn (`[watchdog] post_result_bg_max_hold`) and 4 hours in total (`live_session_max_s`). With no background work it closes about a minute after the reply. When it closes over running tasks you get a notice naming them, such as `⏳ Closing session — 1 background task still running at the background hold limit: … Stopping it; reply to continue.` Replying resumes the same conversation. `/cancel`, changing settings (`/planmode`, model) and Untether restarts close the session the same way, with a notice.
+The session stays open while background work is live, until it has shown no activity for 30 minutes (`[watchdog] post_result_bg_max_hold`) or has been open for 4 hours in total (`live_session_max_s`). Activity means a turn, a background agent's progress (every tool call it makes, including one long-running command), or new output from a background command. A working agent is therefore not stopped at 30 minutes, but a silent `sleep` or a stuck agent is. With no background work the session closes about a minute after the reply. When it closes over running tasks you get a notice naming them, such as `⏳ Closing session — 1 background task still running with no progress for 30 min: … Stopping it.` Once the session has stopped, a quiet follow-up tells you what happens next. `↩️ Reply to continue in the same session.` means a reply resumes the same conversation. The `⚠️ … your next message starts a fresh session` warning means the session didn't stop cleanly, so Claude won't remember that run, and partial work may be left in the working tree. `/cancel`, changing settings (`/planmode`, model) and Untether restarts close the session the same way, with a notice. To go back to the old turn-based hold, set `[watchdog] bg_hold_rearm_on_progress = false` ([#829](https://github.com/littlebearapps/untether/issues/829)).
 
 To turn this off and get the pre-v0.35.5 behaviour back (stop at the first answer), set `live_sessions = false` under `[watchdog]`.
 

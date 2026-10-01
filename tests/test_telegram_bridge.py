@@ -1620,7 +1620,40 @@ async def test_reasoning_command_show_reports_overrides(tmp_path: Path) -> None:
     assert "engine: codex (global default)" in text
     assert "reasoning: high (topic override)" in text
     assert "defaults: topic: high, chat: low" in text
-    assert "available levels: minimal, low, medium, high, xhigh" in text
+    assert "available levels: low, medium, high, xhigh" in text
+
+
+@pytest.mark.anyio
+async def test_reasoning_command_set_minimal_rejected_for_codex(tmp_path: Path) -> None:
+    """#416: `/reasoning set minimal` is refused for Codex."""
+    transport = FakeTransport()
+    cfg = make_cfg(transport)
+    chat_prefs = ChatPrefsStore(tmp_path / "telegram_chat_prefs_state.json")
+    msg = TelegramIncomingMessage(
+        transport="telegram",
+        chat_id=123,
+        message_id=10,
+        text="/reasoning set minimal",
+        reply_to_message_id=None,
+        reply_to_text=None,
+        sender_id=123,
+    )
+
+    await _handle_reasoning_command(
+        cfg,
+        msg,
+        "set minimal",
+        ambient_context=None,
+        topic_store=None,
+        chat_prefs=chat_prefs,
+        resolved_scope=None,
+        scope_chat_ids=frozenset({123}),
+    )
+
+    text = transport.send_calls[-1]["message"].text
+    assert "unknown reasoning level minimal" in text
+    assert "available levels: low, medium, high, xhigh" in text
+    assert await chat_prefs.get_engine_override(123, CODEX_ENGINE) is None
 
 
 @pytest.mark.anyio
@@ -1793,6 +1826,163 @@ async def test_run_engine_hides_resume_line_in_topics() -> None:
 
     assert transport.last_message is not None
     assert "resume-123" not in transport.last_message.text
+
+
+class _RecordingTransport(_CaptureTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.texts: list[str] = []
+
+    async def send(self, *, channel_id, message, options=None):  # type: ignore[override]
+        self.texts.append(message.text)
+        return await super().send(
+            channel_id=channel_id, message=message, options=options
+        )
+
+    async def edit(self, *, ref, message, wait=True):  # type: ignore[override]
+        self.texts.append(message.text)
+        return await super().edit(ref=ref, message=message, wait=wait)
+
+
+class _OptionsRecordingRunner(ScriptRunner):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.seen_options: list[Any] = []
+
+    async def run(self, prompt, resume):  # type: ignore[override]
+        from untether.runners.run_options import get_run_options
+
+        self.seen_options.append(get_run_options())
+        async for event in super().run(prompt, resume):
+            yield event
+
+
+@pytest.mark.anyio
+async def test_run_engine_drops_stale_minimal_before_runner() -> None:
+    """#416: a stale `minimal` never reaches the runner (build_args, footer)
+    and the user is told once, in the run's own progress."""
+    from untether.runners.run_options import EngineRunOptions
+
+    transport = _RecordingTransport()
+    runner = _OptionsRecordingRunner(
+        [Return(answer="ok")],
+        engine=CODEX_ENGINE,
+        resume_value="resume-416",
+    )
+    exec_cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+    runtime = TransportRuntime(
+        router=_make_router(runner),
+        projects=_empty_projects(),
+    )
+
+    with capture_logs() as logs:
+        await _run_engine(
+            exec_cfg=exec_cfg,
+            runtime=runtime,
+            running_tasks={},
+            chat_id=123,
+            user_msg_id=1,
+            text="hello",
+            resume_token=None,
+            context=None,
+            run_options=EngineRunOptions(reasoning="minimal", model="gpt-5.5"),
+        )
+
+    assert len(runner.seen_options) == 1
+    seen = runner.seen_options[0]
+    assert seen is not None
+    assert seen.reasoning is None
+    assert seen.model == "gpt-5.5"
+    assert seen.ignored_reasoning == "minimal"
+    assert any("isn't supported for" in t for t in transport.texts), transport.texts
+    ignored = [
+        e for e in logs if e["event"] == "run.reasoning.unsupported_level_ignored"
+    ]
+    assert len(ignored) == 1
+    assert ignored[0]["engine"] == CODEX_ENGINE
+    assert ignored[0]["level"] == "minimal"
+
+
+def test_resolve_reasoning_override_unsupported_level_is_dropped() -> None:
+    from untether.runners.run_options import EngineRunOptions
+    from untether.telegram.commands.executor import _resolve_reasoning_override
+
+    with capture_logs() as logs:
+        opts, note = _resolve_reasoning_override(
+            engine="codex", run_options=EngineRunOptions(reasoning="minimal")
+        )
+    assert opts is not None
+    assert opts.reasoning is None
+    assert opts.ignored_reasoning == "minimal"
+    assert note is not None
+    assert "`minimal`" in note.action.title
+    assert "/config" in note.action.title
+    events = [
+        e for e in logs if e["event"] == "run.reasoning.unsupported_level_ignored"
+    ]
+    assert len(events) == 1
+    assert events[0]["engine"] == "codex"
+    assert events[0]["level"] == "minimal"
+
+
+def test_resolve_reasoning_override_presanitised_input_same_note() -> None:
+    from untether.runners.run_options import EngineRunOptions
+    from untether.telegram.commands.executor import _resolve_reasoning_override
+    from untether.telegram.engine_overrides import drop_unsupported_reasoning
+
+    pre = drop_unsupported_reasoning("codex", EngineRunOptions(reasoning="minimal"))
+    raw_opts, raw_note = _resolve_reasoning_override(
+        engine="codex", run_options=EngineRunOptions(reasoning="minimal")
+    )
+    with capture_logs() as logs:
+        opts, note = _resolve_reasoning_override(engine="codex", run_options=pre)
+    assert opts is pre
+    assert note is not None and raw_note is not None
+    assert note.action.title == raw_note.action.title
+    assert opts == raw_opts
+    assert (
+        len(
+            [e for e in logs if e["event"] == "run.reasoning.unsupported_level_ignored"]
+        )
+        == 1
+    )
+
+
+def test_resolve_reasoning_override_allowed_level_untouched() -> None:
+    from untether.runners.run_options import EngineRunOptions
+    from untether.telegram.commands.executor import _resolve_reasoning_override
+
+    raw = EngineRunOptions(reasoning="high")
+    with capture_logs() as logs:
+        opts, note = _resolve_reasoning_override(engine="codex", run_options=raw)
+    assert opts is raw
+    assert note is None
+    assert not [
+        e for e in logs if e["event"] == "run.reasoning.unsupported_level_ignored"
+    ]
+
+
+def test_resolve_reasoning_override_unsupported_engine_note_unchanged() -> None:
+    from untether.runners.run_options import EngineRunOptions
+    from untether.telegram.commands.executor import _resolve_reasoning_override
+
+    raw = EngineRunOptions(reasoning="high")
+    opts, note = _resolve_reasoning_override(engine="opencode", run_options=raw)
+    assert opts is raw
+    assert note is not None
+    assert note.action.title == (
+        "reasoning override is not supported for `opencode`; ignoring."
+    )
+
+
+def test_resolve_reasoning_override_none_options() -> None:
+    from untether.telegram.commands.executor import _resolve_reasoning_override
+
+    assert _resolve_reasoning_override(engine="codex", run_options=None) == (None, None)
 
 
 @pytest.mark.anyio
@@ -2549,6 +2739,216 @@ async def test_run_main_loop_voice_hides_transcription_when_disabled(
     # No transcription echo — only progress/final messages
     echo_texts = [c["message"].text for c in transport.send_calls]
     assert not any("hello world" in t for t in echo_texts)
+
+
+def _679_voice_cfg(
+    tmp_path: Path | None,
+    *,
+    voice: bool = True,
+    base_url: str | None = "http://localhost:8000/v1",
+) -> TelegramBridgeConfig:
+    runner = ScriptRunner([Return(answer="ok")], engine=CODEX_ENGINE)
+    runtime = TransportRuntime(
+        router=_make_router(runner),
+        projects=_empty_projects(),
+        config_path=(tmp_path / "untether.toml") if tmp_path is not None else None,
+    )
+    return TelegramBridgeConfig(
+        bot=FakeBot(),
+        runtime=runtime,
+        chat_id=123,
+        startup_msg="",
+        exec_cfg=ExecBridgeConfig(
+            transport=FakeTransport(),
+            presenter=MarkdownPresenter(),
+            final_notify=True,
+        ),
+        voice_transcription=voice,
+        voice_transcription_base_url=base_url,
+    )
+
+
+def _679_recorder(calls: list[dict], seen: anyio.Event):
+    async def _record(**kwargs):
+        # Record before the first await so a cancellation when the poller
+        # ends can't drop the call.
+        calls.append(kwargs)
+        seen.set()
+
+    return _record
+
+
+def _679_waiting_poller(seen: anyio.Event, *, timeout: float = 5.0):
+    async def poller(_cfg: TelegramBridgeConfig):
+        with anyio.move_on_after(timeout):
+            await seen.wait()
+        return
+        yield  # pragma: no cover — makes this an async generator
+
+    return poller
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("watch_config", [None, False])
+async def test_679_run_main_loop_schedules_startup_voice_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, watch_config: bool | None
+) -> None:
+    """#679: a startup endpoint check is scheduled whether or not config
+    watching is enabled (regression guard for placement inside the
+    watch_config block)."""
+    calls: list[dict] = []
+    seen = anyio.Event()
+    monkeypatch.setattr(
+        telegram_loop, "check_voice_endpoint", _679_recorder(calls, seen)
+    )
+    cfg = _679_voice_cfg(None if watch_config is False else tmp_path)
+    await run_main_loop(cfg, _679_waiting_poller(seen), watch_config=watch_config)
+    assert len(calls) == 1
+    assert calls[0]["phase"] == "startup"
+    assert calls[0]["base_url"] == "http://localhost:8000/v1"
+    assert calls[0]["enabled"] is True
+
+
+@pytest.mark.anyio
+async def test_679_startup_check_runs_with_watch_config_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict] = []
+    seen = anyio.Event()
+    monkeypatch.setattr(
+        telegram_loop, "check_voice_endpoint", _679_recorder(calls, seen)
+    )
+    cfg = _679_voice_cfg(tmp_path)
+    await run_main_loop(cfg, _679_waiting_poller(seen), watch_config=False)
+    assert [c["phase"] for c in calls] == ["startup"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("voice", "base_url"), [(False, "http://localhost:8000/v1"), (True, None)]
+)
+async def test_679_run_main_loop_no_voice_check_when_disabled(
+    monkeypatch: pytest.MonkeyPatch, voice: bool, base_url: str | None
+) -> None:
+    calls: list[dict] = []
+    seen = anyio.Event()
+    monkeypatch.setattr(
+        telegram_loop, "check_voice_endpoint", _679_recorder(calls, seen)
+    )
+    cfg = _679_voice_cfg(None, voice=voice, base_url=base_url)
+    await run_main_loop(cfg, _679_waiting_poller(seen, timeout=0.2))
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_679_run_main_loop_survives_classifier_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#679: the real check_voice_endpoint runs in the main task group; a
+    classifier crash must be logged, never propagate as an ExceptionGroup."""
+    import untether.telegram.voice as voice_mod
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("classifier exploded")
+
+    monkeypatch.setattr(voice_mod, "classify_voice_endpoint", _boom)
+    cfg = _679_voice_cfg(None)
+
+    with capture_logs() as logs:
+
+        async def poller(_cfg: TelegramBridgeConfig):
+            with anyio.move_on_after(5.0):
+                while not any(
+                    e["event"] == "voice.base_url.check_failed" for e in logs
+                ):
+                    await anyio.sleep(0.01)
+            return
+            yield  # pragma: no cover
+
+        await run_main_loop(cfg, poller)
+
+    failed = [e for e in logs if e["event"] == "voice.base_url.check_failed"]
+    assert len(failed) == 1
+    assert failed[0]["reason"] == "error"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("changed", "expect_check"),
+    [
+        ({"voice_transcription_base_url": "http://whisper.lan:8000/v1"}, True),
+        ({"show_resume_line": False}, False),
+    ],
+)
+async def test_679_reload_rechecks_voice_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    changed: dict[str, object],
+    expect_check: bool,
+) -> None:
+    """#679: a hot-reload touching a voice endpoint key re-runs the check
+    with the NEW values; an unrelated reload does not."""
+    from untether.config_watch import ConfigReload
+    from untether.runtime_loader import RuntimeSpec
+    from untether.settings import TelegramTransportSettings, UntetherSettings
+
+    base_tg: dict[str, object] = {
+        "bot_token": "tok",
+        "chat_id": 123,
+        "allow_any_user": True,
+        "voice_transcription": True,
+        "voice_transcription_base_url": "http://localhost:8000/v1",
+    }
+    transport_config = TelegramTransportSettings.model_validate(base_tg)
+    new_settings = UntetherSettings.model_validate(
+        {"transport": "telegram", "transports": {"telegram": {**base_tg, **changed}}}
+    )
+    runner = ScriptRunner([Return(answer="ok")], engine=CODEX_ENGINE)
+    spec = RuntimeSpec(
+        router=_make_router(runner),
+        projects=_empty_projects(),
+        allowlist=None,
+        plugin_configs=None,
+    )
+    calls: list[dict] = []
+    startup_seen = anyio.Event()
+    reload_done = anyio.Event()
+
+    async def _record(**kwargs):
+        calls.append(kwargs)
+        startup_seen.set()
+
+    async def fake_watch(*, config_path, runtime, default_engine_override, on_reload):
+        _ = runtime, default_engine_override
+        await startup_seen.wait()
+        await on_reload(
+            ConfigReload(
+                settings=new_settings, runtime_spec=spec, config_path=config_path
+            )
+        )
+        # Let a just-scheduled reload check run before the poller ends.
+        for _ in range(5):
+            await anyio.lowlevel.checkpoint()
+        reload_done.set()
+
+    monkeypatch.setattr(telegram_loop, "check_voice_endpoint", _record)
+    monkeypatch.setattr(telegram_loop, "watch_config_changes", fake_watch)
+
+    cfg = _679_voice_cfg(tmp_path)
+    await run_main_loop(
+        cfg,
+        _679_waiting_poller(reload_done),
+        watch_config=True,
+        transport_config=transport_config,
+    )
+
+    phases = [c["phase"] for c in calls]
+    if expect_check:
+        assert phases == ["startup", "reload"]
+        assert calls[1]["base_url"] == "http://whisper.lan:8000/v1"
+        assert calls[1]["enabled"] is True
+    else:
+        assert phases == ["startup"]
 
 
 @pytest.mark.anyio
@@ -4211,6 +4611,26 @@ async def test_598_not_modified_treated_as_noop() -> None:
     assert result == ref
     assert not any(r.get("event") == "transport.edit.failed" for r in logs)
     assert any(r.get("event") == "transport.edit.noop" for r in logs)
+
+
+@pytest.mark.anyio
+async def test_746_not_modified_match_is_case_insensitive() -> None:
+    """#746: the bridge uses the shared classifier, so the "not modified"
+    match no longer depends on Telegram's capitalisation."""
+    from structlog.testing import capture_logs
+
+    from untether.telegram.bridge import TelegramTransport
+
+    bot = _FailingEditBot("Bad Request: Message Is Not Modified")
+    transport = TelegramTransport(bot)  # type: ignore[arg-type]
+    ref = MessageRef(channel_id=123, message_id=916)
+
+    with capture_logs() as logs:
+        result = await transport.edit(ref=ref, message=RenderedMessage(text="same"))
+
+    assert result == ref
+    assert any(r.get("event") == "transport.edit.noop" for r in logs)
+    assert not any(r.get("event") == "transport.edit.failed" for r in logs)
 
 
 @pytest.mark.anyio

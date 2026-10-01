@@ -138,8 +138,6 @@ def test_codex_exec_flags_after_exec() -> None:
     assert args == [
         "-c",
         "notify=[]",
-        "--ask-for-approval",
-        "never",
         "exec",
         "--json",
         "--skip-git-repo-check",
@@ -1485,3 +1483,130 @@ def test_812_hook_flood_keeps_approval_registry_probe() -> None:
             registry.pop("req_812", None)
     # Without the registry entry the ring alone can no longer tell.
     assert _approval_pending(stream) is False
+
+
+# ---------------------------------------------------------------------------
+# #684: control_cancel_request is control-channel traffic
+# ---------------------------------------------------------------------------
+
+
+def test_684_cancel_frame_is_control_traffic() -> None:
+    feed, stream, _state = _claude_line_handler("sess-684")
+    feed({"type": "system", "subtype": "init", "model": "m"})
+    feed(
+        {
+            "type": "assistant",
+            "message": {
+                "id": "m1",
+                "role": "assistant",
+                "model": "m",
+                "content": [{"type": "text", "text": "hi"}],
+            },
+        }
+    )
+    assert stream.last_event_type == "assistant"
+    feed({"type": "control_cancel_request", "request_id": "r-x"})
+    assert stream.last_event_type == "assistant"
+    assert stream.recent_events[-1][1] == "control_cancel_request"
+
+
+def test_684_ring_cancel_resolves_approval() -> None:
+    from untether.runner import JsonlStreamState, _approval_pending
+
+    stream = JsonlStreamState(expected_session=None)
+    stream.recent_events.append((1.0, "assistant"))
+    stream.recent_events.append((2.0, "control_request"))
+    stream.recent_events.append((3.0, "control_cancel_request"))
+    assert _approval_pending(stream) is False
+
+
+# ── #819: compaction / status frames are liveness-only ─────────────────────
+
+
+def _tool_use_frame(tool_id: str = "toolu_1") -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "model": "m",
+            "content": [
+                {"type": "tool_use", "id": tool_id, "name": "Read", "input": {}}
+            ],
+        },
+    }
+
+
+def _tool_result_frame(tool_id: str = "toolu_1") -> dict:
+    return {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": "x"}
+            ],
+        },
+    }
+
+
+def test_819_status_frames_do_not_overwrite_last_event_type() -> None:
+    """An auto-compaction starts right after a tool_result: the CLI dying
+    mid-compaction must still look like ``user`` to auto-continue."""
+    feed, stream, _ = _claude_line_handler("sess-819")
+    feed({"type": "system", "subtype": "init", "model": "m"})
+    feed(_tool_use_frame())
+    feed(_tool_result_frame())
+    assert stream.last_event_type == "user"
+    for _ in range(3):
+        feed({"type": "system", "subtype": "status", "status": "compacting"})
+    assert stream.last_event_type == "user"
+    feed({"type": "system", "subtype": "status", "status": None})
+    assert stream.last_event_type == "user"
+
+
+def test_819_compact_boundary_does_not_overwrite_last_event_type() -> None:
+    feed, stream, _ = _claude_line_handler("sess-819b")
+    feed({"type": "system", "subtype": "init", "model": "m"})
+    feed(_tool_result_frame())
+    feed(
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": {"trigger": "auto", "pre_tokens": 10},
+        }
+    )
+    assert stream.last_event_type == "user"
+    assert stream.recent_events[-1][1] == "compact_boundary"
+
+
+def test_819_status_frames_count_as_liveness() -> None:
+    feed, stream, _ = _claude_line_handler("sess-819c")
+    feed({"type": "system", "subtype": "init", "model": "m"})
+    count, seen_at = stream.event_count, stream.last_stdout_at
+    feed({"type": "system", "subtype": "status", "status": "compacting"})
+    feed(
+        {
+            "type": "system",
+            "subtype": "status",
+            "status": None,
+            "permissionMode": "plan",
+        }
+    )
+    assert stream.event_count == count + 2
+    assert stream.last_stdout_at >= seen_at
+    labels = [label for _, label in stream.recent_events]
+    assert labels[-2:] == ["status:compacting", "status:null"]
+
+
+def test_819_task_notification_system_frames_still_set_last_event_type() -> None:
+    """Negative: only the listed subtypes are exempt."""
+    feed, stream, _ = _claude_line_handler("sess-819d")
+    feed(_tool_result_frame())
+    feed(
+        {
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "t1",
+            "status": "completed",
+        }
+    )
+    assert stream.last_event_type == "system"

@@ -20,7 +20,7 @@ from ..ids import RESERVED_CHAT_COMMANDS, RESERVED_COMMAND_IDS
 from ..logging import get_logger
 from ..model import EngineId, ResumeToken
 from ..progress import ProgressTracker
-from ..runners.run_options import EngineRunOptions
+from ..runners.run_options import EngineRunOptions, claude_tap_waits_for
 from ..scheduler import ThreadJob, ThreadScheduler
 from ..settings import TelegramTransportSettings
 from ..transport import MessageRef, RenderedMessage, SendOptions
@@ -58,7 +58,7 @@ from .commands.parse import is_cancel_command, parse_dot_typo
 from .commands.reply import make_reply
 from .context import _merge_topic_context, _usage_ctx_set, _usage_topic
 from .engine_defaults import resolve_engine_for_message
-from .engine_overrides import merge_overrides
+from .engine_overrides import drop_unsupported_reasoning, merge_overrides
 from .listen_mode import resolve_listen_mode, should_trigger_run
 from .steer import FOLLOWUP_COMMAND_IDS, maybe_steer, split_followup_command
 from .topic_state import TopicStateStore, resolve_state_path
@@ -75,7 +75,12 @@ from .types import (
     TelegramIncomingMessage,
     TelegramIncomingUpdate,
 )
-from .voice import resolve_transcription_prompt, transcribe_voice
+from .voice import (
+    check_voice_endpoint,
+    resolve_transcription_prompt,
+    transcribe_voice,
+    voice_endpoint_keys_changed,
+)
 
 logger = get_logger(__name__)
 
@@ -150,18 +155,25 @@ async def _resolve_engine_run_options(
     merged = merge_overrides(topic_override, chat_override)
     if merged is None:
         return None
-    return EngineRunOptions(
-        model=merged.model,
-        reasoning=merged.reasoning,
-        permission_mode=merged.permission_mode,
-        ask_questions=merged.ask_questions,
-        diff_preview=merged.diff_preview,
-        show_api_cost=merged.show_api_cost,
-        show_subscription_usage=merged.show_subscription_usage,
-        show_resume_line=merged.show_resume_line,
-        budget_enabled=merged.budget_enabled,
-        budget_auto_cancel=merged.budget_auto_cancel,
-        loop_enabled=merged.loop_enabled,
+    # #416: sanitise a retired reasoning level HERE, the single producer of
+    # per-chat options, so run_job, the live follow-up / steer comparisons and
+    # the command resolver all see identical options (a stale level must never
+    # fake an `options_changed`). The executor adds the user-facing note.
+    return drop_unsupported_reasoning(
+        engine,
+        EngineRunOptions(
+            model=merged.model,
+            reasoning=merged.reasoning,
+            permission_mode=merged.permission_mode,
+            ask_questions=merged.ask_questions,
+            diff_preview=merged.diff_preview,
+            show_api_cost=merged.show_api_cost,
+            show_subscription_usage=merged.show_subscription_usage,
+            show_resume_line=merged.show_resume_line,
+            budget_enabled=merged.budget_enabled,
+            budget_auto_cancel=merged.budget_auto_cancel,
+            loop_enabled=merged.loop_enabled,
+        ),
     )
 
 
@@ -197,6 +209,62 @@ def _apply_trigger_permission_override(
             engine=engine,
         )
     return new_options
+
+
+# #751: (trigger_source, mode) pairs already warned about, per process.
+_UNATTENDED_RISK_WARNED: set[tuple[str, str]] = set()
+_UNATTENDED_RISK_WARNED_MAX = 256
+# `at:` is excluded on purpose: a human scheduled it from the chat and is
+# around to tap (Decision 7). `loop:` re-fires follow a human's /loop.
+_UNATTENDED_TRIGGER_PREFIXES = ("cron:", "webhook:")
+
+
+def _note_unattended_approval_risk(
+    context: RunContext | None,
+    engine: EngineId | None,
+    run_options: EngineRunOptions | None,
+    engine_default_mode: Callable[[], str | None],
+) -> None:
+    """#751: warn once per (trigger, mode) when a cron or webhook run goes to
+    Claude in a mode that waits for a Telegram tap nobody is there to give.
+
+    Sees the real resolved mode — the cron's own, else the chat/topic
+    preference, else engine config — which the config-time audit can't.
+    Log only: the run's approval buttons already reach the chat with a push.
+    """
+    if context is None or engine != "claude":
+        return
+    source = context.trigger_source
+    if not source or not source.startswith(_UNATTENDED_TRIGGER_PREFIXES):
+        return
+    mode = run_options.permission_mode if run_options is not None else None
+    if context.permission_mode is not None:
+        origin = "cron"
+    elif mode is not None:
+        origin = "chat_pref"
+    else:
+        origin = "engine_config"
+        try:
+            mode = engine_default_mode()
+        except Exception:  # noqa: BLE001 — a warning must never break a run
+            return
+    waits_for = claude_tap_waits_for(mode)
+    if mode is None or waits_for is None:
+        return
+    key = (source, mode)
+    if key in _UNATTENDED_RISK_WARNED:
+        return
+    if len(_UNATTENDED_RISK_WARNED) >= _UNATTENDED_RISK_WARNED_MAX:
+        _UNATTENDED_RISK_WARNED.clear()
+    _UNATTENDED_RISK_WARNED.add(key)
+    logger.warning(
+        "trigger.unattended_approval_risk",
+        phase="dispatch",
+        trigger=source,
+        mode=mode,
+        source=origin,
+        waits_for=waits_for,
+    )
 
 
 def _allowed_chat_ids(cfg: TelegramBridgeConfig) -> set[int]:
@@ -552,7 +620,16 @@ async def _drain_backlog(cfg: TelegramBridgeConfig, offset: int | None) -> int |
 
 
 async def _cleanup_orphan_progress(cfg: TelegramBridgeConfig) -> None:
-    """Edit orphan progress messages from a prior instance to show interrupted."""
+    """Edit orphan progress messages from a prior instance to show interrupted.
+
+    #746: failures are expected — the orphan may have been deleted, or the id
+    may not be editable. The HTTP layer already logs each one once at the
+    right level (INFO ``telegram.benign_rejection`` for a vanished message,
+    ERROR for anything genuine), so a per-orphan failure is DEBUG here with
+    the popped reason. ``startup.orphan_cleanup.edited`` is logged only when
+    the edit actually succeeded, and one INFO ``startup.orphan_cleanup.done``
+    summarises the pass.
+    """
     config_path = cfg.runtime.config_path
     if config_path is None:
         return
@@ -567,29 +644,51 @@ async def _cleanup_orphan_progress(cfg: TelegramBridgeConfig) -> None:
     if not entries:
         return
     logger.info("startup.orphan_cleanup", count=len(entries))
+    edited = failed = skipped = 0
+    pop = getattr(cfg.bot, "pop_edit_error", None)
     for entry in entries.values():
         chat_id = entry.get("chat_id")
         message_id = entry.get("message_id")
         if chat_id is None or message_id is None:
+            skipped += 1
             continue
         try:
-            await cfg.bot.edit_message_text(
-                chat_id=int(chat_id),
-                message_id=int(message_id),
+            cid, mid = int(chat_id), int(message_id)
+            result = await cfg.bot.edit_message_text(
+                chat_id=cid,
+                message_id=mid,
                 text="\u26a0\ufe0f interrupted by restart",
             )
-            logger.debug(
-                "startup.orphan_cleanup.edited",
-                chat_id=chat_id,
-                message_id=message_id,
-            )
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — corrupt entry (int()) or an unexpected raise
+            failed += 1
             logger.debug(
                 "startup.orphan_cleanup.edit_failed",
                 chat_id=chat_id,
                 message_id=message_id,
                 exc_info=True,
             )
+            continue
+        if result is None:
+            failed += 1
+            # The #598 reason is keyed on the ints that were sent.
+            reason = pop(cid, mid) if callable(pop) else None
+            logger.debug(
+                "startup.orphan_cleanup.edit_failed",
+                chat_id=cid,
+                message_id=mid,
+                reason=reason,
+            )
+            continue
+        # A Message, or SUPERSEDED (the winning op set the final state).
+        edited += 1
+        logger.debug("startup.orphan_cleanup.edited", chat_id=cid, message_id=mid)
+    logger.info(
+        "startup.orphan_cleanup.done",
+        count=len(entries),
+        edited=edited,
+        failed=failed,
+        skipped=skipped,
+    )
     clear_all_progress(progress_path)
 
 
@@ -1834,6 +1933,22 @@ async def run_main_loop(
                                 transport="telegram",
                                 keys=hot_keys,
                             )
+                            # #679: re-check the voice endpoint when a key
+                            # that affects its SSRF verdict changed (log-only,
+                            # background; the helper never raises and is a
+                            # silent no-op when voice was just disabled).
+                            if voice_endpoint_keys_changed(hot_keys):
+                                tg.start_soon(
+                                    partial(
+                                        check_voice_endpoint,
+                                        enabled=cfg.voice_transcription,
+                                        base_url=cfg.voice_transcription_base_url,
+                                        allowlist_entries=tuple(
+                                            cfg.voice_transcription_url_allowlist
+                                        ),
+                                        phase="reload",
+                                    )
+                                )
                         state.transport_snapshot = new_snapshot
                 if (
                     state.transport_id is not None
@@ -1903,6 +2018,22 @@ async def run_main_loop(
                     )
 
                 tg.start_soon(run_config_watch)
+
+            # #679: warn at startup when the configured voice endpoint would be
+            # refused by the SSRF guard (e.g. `localhost` or a tailnet host
+            # without an allowlist entry) instead of only on the first voice
+            # note. Deliberately OUTSIDE the watch_config block so it runs with
+            # watch_config = false too; background so DNS never delays startup.
+            if cfg.voice_transcription and cfg.voice_transcription_base_url:
+                tg.start_soon(
+                    partial(
+                        check_voice_endpoint,
+                        enabled=cfg.voice_transcription,
+                        base_url=cfg.voice_transcription_base_url,
+                        allowlist_entries=tuple(cfg.voice_transcription_url_allowlist),
+                        phase="startup",
+                    )
+                )
 
             # Graceful drain-then-exit task
             async def _drain_and_exit() -> None:
@@ -2149,6 +2280,19 @@ async def run_main_loop(
                 # runner's _effective_permission_mode() picks it up.
                 run_options = _apply_trigger_permission_override(
                     run_options, context, engine=engine_for_overrides
+                )
+                _note_unattended_approval_risk(
+                    context,
+                    engine_for_overrides,
+                    run_options,
+                    lambda: getattr(
+                        cfg.runtime.resolve_runner(
+                            resume_token=resume_token,
+                            engine_override=engine_for_overrides,
+                        ).runner,
+                        "permission_mode",
+                        None,
+                    ),
                 )
                 await run_engine(
                     exec_cfg=cfg.exec_cfg,

@@ -556,3 +556,74 @@ The host first sends `{"type":"control_request","request_id":"ut_init","request"
 | Z9 | fake; `--permission-mode` X + extra flag | auto+haiku → init `default`; auto+opus → `auto`; plan+`--dangerously-skip-permissions` → `bypassPermissions`; plan+`--allow-dangerously-skip-permissions` → `plan`; plan+settings defaultMode bypass → `plan`; default+`--permission-prompts none` → `default` |
 | Z10 | fake; "hello there", `get_context_usage`, `/compact`, `get_context_usage` | Q4 frame order; context 8373 → 8753 (apiUsage null after compaction); 2 API POSTs only |
 | Z11 | fake with cache_read 185 000 on the first call | `get_context_usage` 186334/200000 = 93 %; no auto-compaction on the next turn |
+
+## Addendum (2026-09-30, rc15 implementation): #383 probes P-1…P-6
+
+Zero token cost. CLI 2.1.285 on lba-1, fake Messages API on 127.0.0.1 scripted per request
+(directives in the user text: `exitplan`, `write:<path>`, `bgbash:<s>`, `fgbash:<s>`, `agent`;
+a subagent is recognised by its prompt and answers after a 3 s delay). Argv as Untether spawns a
+plan chat: `--permission-mode plan --permission-prompt-tool stdio --allowedTools
+Bash,Read,Edit,Write --model haiku` plus `--tools Bash,Read,Edit,Write,ExitPlanMode,Agent`.
+"Plan reminder" = the request's trailing user content contains `Plan mode is active` (the CLI
+also adds `## Re-entering Plan Mode` after a re-arm, and switches a haiku session's model to
+`claude-sonnet-5-5` while in plan). Scripts and logs: lane-C scratch (not committed).
+
+| Probe | Setup | Observation | Gate |
+|---|---|---|---|
+| **P-1** FIFO | turn 1 approved (status `default`); `set_permission_mode plan` and a user line written back-to-back | ack `{"mode":"plan"}` and `system/status{permissionMode:"plan"}` arrive before the follow-up's `command_lifecycle{queued}`; the follow-up turn's `system/init.permissionMode` is `plan`; its first `/v1/messages` body carries the plan reminder + `## Re-entering Plan Mode`, model `claude-sonnet-5-5`. `init` **is** emitted on live follow-up turns here | PASS |
+| **P-2** idempotence | `plan` while already `plan` (at start, and after a real change) | ack `{"mode":"plan"}`, **no** status frame (both times) | PASS |
+| **P-4** second exit | after a re-arm, approve a second ExitPlanMode | `system/status{permissionMode:"default"}` again (`prePlanMode ?? "default"`) | PASS |
+| **P-5** mid-turn write | re-arm written during a foreground `sleep 3` Bash; the turn then `Write`s | ack + status `plan` at once (handled inline); the turn's next model call carries the plan reminder (model switches mid-turn); the `Write` is **not** blocked internally — it raises `can_use_tool` with `decision_reason_type:"mode"` | documents the steer race |
+| **P-6** wake race, bg Bash ends 1 s after the result (×3) | re-arm written 0.3–0.6 ms after reading the result; wake turn `Write`s | 3/3: status `plan` at +6–12 ms, wake turn's `init` reports `plan`, its first request carries the reminder; the `Write` raises `can_use_tool` `decision_reason_type:"mode"`. Control without re-arm: wake `init` `default`, `Write` runs silently (stage-5 allowlist) | PASS |
+| **P-6** wake race, 0 s (notification queued at result time) (×3) | as above, `echo done` | 3/3: the CLI starts the wake turn (`init` at +18–28 ms, reporting **`default`**) before it applies our line (status `plan` at +36–54 ms); the wake turn's **first** request lacks the reminder (haiku), but its first tool call (`Write`) is permission-checked under plan (`can_use_tool`, `decision_reason_type:"mode"`) and its second request carries the reminder | residual window = the wake turn's first model call |
+| **P-3** background agent | approved turn launches a background `Agent`; its subagent `Write`s ~3 s later; host re-arms at the result | the running subagent **inherits** the parent's live mode: its `Write` raises `can_use_tool` (`decision_reason_type:"mode"`, `agent_id` set) and its next model call carries the plan reminder. Control without re-arm: the `Write` runs silently | agents inherit → C4 (deferral) is needed |
+| error-ack shape | `set_permission_mode` `bypassPermissions` / `bogus_mode` | `{"type":"control_response","response":{"subtype":"error","request_id":…,"error":"…","error_code":"bypass_not_launched"\|"invalid_mode"}}` | — |
+
+**Probe G (2026-08-13, CLI 2.1.228) no longer holds on 2.1.285.** A session *started* in plan
+mode whose model calls `Write` (no ExitPlanMode yet) gets a `can_use_tool` control_request with
+`decision_reason_type:"mode"` — the CLI no longer blocks the write internally. Untether classes
+`plan` / `plan-auto` as autonomous (`is_claude_prompting_mode` → False, #749), so its stage-6
+handler auto-approves that request, i.e. **in a plan chat a write the model attempts while still
+planning executes**. Model compliance with the plan reminder is currently the only gate. This
+also bounds what the #383 re-arm can enforce: after a flip, a write is routed to Untether, not
+denied by the CLI. Needs its own issue (route or deny `decision_reason_type:"mode"` requests in
+plan mode; check first how the plan-file write is classified).
+
+## Addendum (2026-10-01, rc15 implementation): #684 R15-6h — `initialize` re-send
+
+Zero token cost. CLI 2.1.285 on lba-1, fake Messages API on 127.0.0.1 (first call returns a Bash
+`tool_use`, later calls a text reply), argv `-p --input-format stream-json --output-format
+stream-json --verbose --permission-prompt-tool stdio --permission-mode default --model haiku
+--tools Bash --setting-sources local --strict-mcp-config --no-session-persistence`. The host
+sends `initialize` (`hooks: null`) and a user line, waits for the `can_use_tool`, then re-sends
+`initialize` (request id `ut_init2`) with the request still pending and reads stdout for 3 s.
+Script: lane-c3 scratch (not committed).
+
+| Observation | Result |
+|---|---|
+| Second `system/init` after the re-send (§4.5 risk 4 of plan 06) | **None** — `system/init` count stayed 1 |
+| Envelope keys | `subtype`, `request_id`, `response`, `pending_permission_requests`, **`pending_user_dialog_requests`** (new, not in Z6b's notes) |
+| `pending_permission_requests` | exactly the pending `can_use_tool` (its `request_id`) |
+| `response.session_state` / `current_permission_mode` | `requires_action` / `default` |
+| Other frames after the re-send | one `system/background_tasks_changed` snapshot (the #776 task map reconciles snapshots) |
+| Stdin close afterwards | as Z5: error tool_result, one more model call, rc 0 |
+
+So the rc16 cross-check (#684 D2 → #837) needs no guard against a re-emitted `system/init`, but
+must tolerate the extra `background_tasks_changed` snapshot and the response still resets the
+runner watchdog's idle clock (risk 3).
+
+## Addendum (2026-10-01, rc15 implementation): §Q3a — #751 probes P1, P1b, P2 and the plan-mode write
+
+Zero token cost. CLI 2.1.285 on lba-1, fake Messages API on 127.0.0.1 (harness (b); the first
+main-loop call returns a Bash `tool_use`, later calls a text reply; the classifier's
+non-streaming "security monitor" requests are logged separately), argv `-p --input-format
+stream-json --output-format stream-json --verbose --permission-prompt-tool stdio
+--setting-sources local --strict-mcp-config --tools Bash` plus the flags below, `HOME` a temp
+dir. Scripts: lane-c5 scratch (not committed).
+
+| Probe | Setup | `system/init.permissionMode` / observation | Consequence for #751 |
+|---|---|---|---|
+| **P1** resume | fresh `--permission-mode plan --model haiku` (session persisted), then `--resume <sid>` with `auto --model opus`, `auto --model haiku`, and no mode flag + haiku | `plan`; resume → `auto` / `default` / `default` | a resume reports the **flag's** mode, never the stored one → the mismatch check runs on resumed runs too (no `not state.resumed` gate) |
+| **P1b** `manual` | `--permission-mode manual`, haiku and opus, fresh | `default` both | `normalise_claude_cli_mode("manual") == "default"`; `manual` requested + `default` reported is no mismatch |
+| **P2** allowlist vs classifier | `--permission-mode auto --model opus`, Bash `rm -rf <dir>` with and without `--allowedTools Bash` | target **inside** the cwd: runs in both, no classifier call (auto's in-project fast path). Target **outside** the cwd: in **both** runs the CLI sends the command to the classifier (`claude-sonnet-5`, then the session model, system prompt "You are a security monitor for autonomous AI coding agents", transcript `{"Bash":"rm -rf …"}`); the fake's reply isn't a valid verdict, so both fail closed (`permission_denials` lists the Bash call, tool_result "… auto mode cannot determine the safety of Bash right now") and the target survives | the allowlist does **not** bypass auto mode's classifier → `--allowedTools` stays for `auto` (plan §4.4 fallback); residual documented: on a run the CLI downgrades to `default`, Bash/Read/Edit/Write stay pre-approved at stage 5 (#835) |
+| plan-mode write | `--permission-mode plan --allowedTools Bash,Read,Edit,Write --model haiku --tools Bash,Read,Edit,Write,ExitPlanMode`; step 1 `Write` to the plan file named in the plan-mode reminder (`$HOME/.claude/plans/<slug>.md`), step 2 `Write` to `<cwd>/code.txt`; host denies every `can_use_tool` | plan-file `Write`: **no** `can_use_tool`, the file is created (the CLI allows it internally). `code.txt` `Write`: `can_use_tool` with `decision_reason_type:"mode"`, `display_name:"Write"`, `permission_suggestions: null`, **despite** `Write` being in `--allowedTools` (the mode check runs before the allow rules); denied → not created | confirms the #383 addendum's Probe-G regression and bounds its fix: the plan file never reaches stage 6, so a stage-6 rule on `decision_reason_type == "mode"` in plan chats needs no plan-file exemption |

@@ -54,8 +54,8 @@ Follow the area's rule file:
   callback, ephemeral cleanup).
 - control-channel changes → `control-channel.md` (PTY lifecycle, registry
   cleanup, cooldown).
-- runner edits trigger `.claude/hooks/runner-edit-context.sh`; telegram edits
-  trigger `telegram-edit-context.sh` — these print contract reminders.
+- runner, schema and telegram edits trigger a prompt hook in
+  `.claude/hooks.json` that prints the area's contract reminders.
 
 ### 3. Run targeted tests
 
@@ -72,7 +72,7 @@ patterns. Coverage threshold is 80%.
 
 ```bash
 uv run pytest               # 2372 tests, ~30 sec
-uv run ruff check src/      # lint
+uv run ruff check src/ tests/      # lint
 uv run ruff format src/ tests/   # format — CI checks formatting
 ```
 
@@ -123,7 +123,7 @@ Fixes #<N>
 ## Test plan
 - [x] Targeted: uv run pytest tests/test_<area>.py
 - [x] Full suite: uv run pytest
-- [x] Lint: uv run ruff check src/
+- [x] Lint: uv run ruff check src/ tests/
 - [x] Format: uv run ruff format --check src/ tests/
 - [ ] Integration tests on @untether_dev_bot per release-discipline.md tier
 

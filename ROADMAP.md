@@ -4,7 +4,7 @@ This roadmap reflects the project's direction based on recent development and co
 
 ## Near-term
 
-- **Antigravity CLI engine** — new engine backend for Google's [Antigravity CLI](https://antigravity.google) (`agy`), the successor to Gemini CLI. A **distinct engine**, not a Gemini rename: authentication, CLI flags, and session semantics all differ, so it will register under its own `antigravity` engine id. Targeted for v0.36.0 ([#558](https://github.com/littlebearapps/untether/issues/558))
+- **Antigravity CLI engine** — new engine backend for Google's [Antigravity CLI](https://antigravity.google) (`agy`), the successor to Gemini CLI. A **distinct engine**, not a Gemini rename: authentication, CLI flags, and session semantics all differ, so it will register under its own `antigravity` engine id. Targeted for v0.35.6, ahead of the v0.36.0 Gemini/Amp removal ([#558](https://github.com/littlebearapps/untether/issues/558))
 - **Retire the Gemini CLI and Amp engines** — both deprecated in v0.35.5 and scheduled for removal in v0.36.0, alongside the Amp-only `/threads` command. Gemini CLI reached end-of-life for individual and free Google accounts on 18 June 2026; the Amp integration is unmaintained. See [deprecated engines](README.md#deprecated-engines) ([#720](https://github.com/littlebearapps/untether/issues/720), [#458](https://github.com/littlebearapps/untether/issues/458), [#722](https://github.com/littlebearapps/untether/issues/722))
 - **Additional transport backends** — Discord and Slack transports via the plugin system
 - **Improved onboarding diagnostics** — expand `untether doctor` with network, permission, and engine health checks
@@ -18,6 +18,9 @@ This roadmap reflects the project's direction based on recent development and co
 
 ## Shipped
 
+- **Live Claude sessions** — a Claude session stays open after its reply while background tasks, subagents, `Monitor` or `ScheduleWakeup` keep working; their results arrive as their own messages with a live background-task status, and follow-ups can be queued or steered into the running session (shipped in v0.35.5; [#776](https://github.com/littlebearapps/untether/issues/776), [#777](https://github.com/littlebearapps/untether/issues/777), [#775](https://github.com/littlebearapps/untether/issues/775))
+- **Context-window visibility** — Claude's context use in the status line (`62% ctx`) and 🗜️ compaction rows (shipped in v0.35.5; [#819](https://github.com/littlebearapps/untether/issues/819))
+- **Claude Code's own `auto` mode** — Untether's old plan-auto-approve mode renamed `plan-auto` so Claude Code's classifier-gated `auto` mode is reachable (shipped in v0.35.5; [#741](https://github.com/littlebearapps/untether/issues/741))
 - **Gemini CLI engine** — full integration with Google's Gemini CLI via stream-json (shipped across v0.34.x–v0.35.x; ⚠️ **deprecated in v0.35.5**, removal in v0.36.0 — upstream end-of-life)
 - **Amp engine** — full integration with Sourcegraph's Amp coding agent via stream-json (shipped across v0.34.x–v0.35.x; ⚠️ **deprecated in v0.35.5**, removal in v0.36.0 — integration unmaintained)
 - **Webhook-driven workflows** — trigger agent runs from CI/CD events, GitHub webhooks, or external services (shipped in v0.28.0 as the triggers system with cron and webhook support)

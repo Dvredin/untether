@@ -82,7 +82,7 @@ scripts/fleet-rollout.sh ${VERSION} --dry-run    # preview
 scripts/fleet-rollout.sh ${VERSION} --only mac   # one host
 ```
 
-The four hosts: lba-1 staging, nsd VPS, channelo VPS, Nathan's Mac.
+The five hosts: lba-1 staging, nsd VPS, channelo VPS, sl VPS, Nathan's Mac.
 
 **Partial failure handling:** if one host fails, the script reports it but
 does NOT roll back successful hosts. Operator decides: rerun the failed
@@ -114,7 +114,7 @@ red flags. Investigate before declaring the fix verified.
 uv run pytest
 
 # Lint + format
-uv run ruff check src/
+uv run ruff check src/ tests/
 uv run ruff format --check src/ tests/
 
 # CHANGELOG validation (if version bumped)

@@ -23,6 +23,7 @@ Each loop records four fields (AT's shape) plus a build **Status**:
 
 > **Status legend:** `available` = built and usable now · `planned Pn` = specified
 > in `docs/plans/agentic-loops-and-commands/` for phase *n*, not yet built.
+> (`docs/plans/` is gitignored — the plan pack lives in the lba-1 checkout only.)
 
 ---
 
@@ -57,13 +58,13 @@ Automated (non-agentic — already live)
   A2   /monitor cron (auto:monitor-audit) — per-host + untether-fleet meta-target
   A3   fleet-rollout.sh / fleet-rollback.sh / fleet-status.sh — operator, attestation-gated
   A4   run-integration-tests.sh — writes the per-VERSION attestation marker
-  A5   CI (format/ruff/ty/pytest 3.12-3.14/build/lockfile/pip-audit/bandit/codeql/docs)
+  A5   CI (format/ruff/ty/pytest 3.12-3.14/build/lockfile/install-test/pip-audit/bandit/codeql/docs)
   A6   release pipeline (auto-tag-on-master.yml → release.yml, OIDC → PyPI) — OPERATOR gate
 
 Intentionally NOT built
   /paid-run       — no billable CLI calls of Untether's own
   /dq-spot-check  — no warehouse / no DQ patterns
-  /cost-watch     — cost lives in runtime budget config (cost_tracker.py + [watchdog]), not a command
+  /cost-watch     — cost lives in runtime budget config (cost_tracker.py + [cost_budget]), not a command
   /issue-triage   — covered by A1 + A2
   /context-health — covered by the context hooks + the context-quality rule
 ```
@@ -185,7 +186,7 @@ Read-only, verdict-returning reviewers under `.claude/agents/`, invoked via the 
 | A2 | `/monitor` cron — files `auto:monitor-audit` (bugs + enhancements) | per-host configs + `untether-fleet` meta-target |
 | A3 | `fleet-rollout.sh` / `fleet-rollback.sh` / `fleet-status.sh` — parallel upgrade/rollback/status, attestation-gated | `scripts/` (operator-run) |
 | A4 | `run-integration-tests.sh` — writes the per-VERSION attestation marker | `scripts/` |
-| A5 | CI — format / ruff / ty / pytest 3.12–3.14 / build / lockfile / pip-audit / bandit / codeql / docs | `.github/workflows/` |
+| A5 | CI — format / ruff / ty / pytest 3.12–3.14 / build / lockfile / install-test / pip-audit / bandit / codeql / docs | `.github/workflows/` |
 | A6 | Release pipeline — `auto-tag-on-master.yml` → `release.yml` (OIDC → PyPI) | OPERATOR gate: the `dev`→`master` PR merge |
 
 ---

@@ -19,7 +19,7 @@ Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencod
 ## Key conventions
 
 - Python 3.12+, anyio for async, msgspec for JSONL, structlog for logging
-- Ruff for linting (`uv run ruff check src/`), pytest with 80% coverage threshold
+- Ruff for linting (`uv run ruff check src/ tests/`), pytest with 80% coverage threshold
 - Australian English in user-facing text (realise, colour, behaviour, licence)
 - Conventional commits: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`
 - Feature branches: `feature/*`, `fix/*`, `docs/*`
@@ -62,13 +62,14 @@ uv run pytest tests/test_*.py -x # specific file
 | `/cancel` | Stop the running agent |
 | `/agent` | Show or set engine for this chat |
 | `/model` | Override the model for an engine |
-| `/planmode` | Toggle permission mode (on/plan-auto/auto/off) |
-| `/usage` | Show API costs for the current session |
+| `/planmode` | Set Claude Code permission mode (on/plan-auto/auto/off) |
+| `/usage` | Claude subscription quota; token totals for Codex/OpenCode |
 | `/stats` | Per-engine session statistics (today/week/all-time) |
 | `/auth` | Codex device re-authentication |
 | `/export` | Export session transcript |
 | `/browse` | Browse project files |
 | `/config` | Interactive settings menu |
+| `/steer` / `/queue` | Claude: steer a follow-up into the running session, or queue it (bare form sets the chat/topic default) |
 | `/verbose` | Toggle verbose progress mode |
 | `/restart` | Gracefully restart Untether |
 
@@ -76,7 +77,7 @@ uv run pytest tests/test_*.py -x # specific file
 
 ```sh
 uv run ruff format --check src/ tests/
-uv run ruff check src/
+uv run ruff check src/ tests/
 uv run pytest
 uv lock --check
 ```

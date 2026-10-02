@@ -30,7 +30,7 @@ Verify it's installed:
 untether --version
 ```
 
-You should see the installed version number (e.g. `0.35.4`).
+You should see the installed version number (e.g. `0.35.5`).
 
 ## 3. Install agent CLIs
 
@@ -75,8 +75,8 @@ Pi can authenticate via a provider login or use API billing. You can log in with
 
 !!! warning "Deprecated — don't install for new setups"
 
-    Google ended Gemini CLI support for **individual and free accounts on
-    18 June 2026**, directing users to [Antigravity CLI](https://antigravity.google).
+    Google ended Gemini CLI support for **individual accounts (free, Google AI Pro and Ultra) on
+    18 June 2026** ([Google's announcement](https://developers.googleblog.com/an-important-update-transitioning-gemini-cli-to-antigravity-cli/)), directing users to [Antigravity CLI](https://antigravity.google).
     On those accounts the CLI fails to authenticate outright
     (`IneligibleTierError`). Worse, under Untether the subprocess hangs rather
     than exiting, so runs stall for ~10 minutes until the watchdog cancels them.
@@ -340,11 +340,12 @@ Press **y** or **Enter** to save. You'll see:
 Untether is now running and listening for messages!
 
 !!! untether "Untether"
-    🐕 untether is ready (v0.35.4)
+    🐕 **untether is ready** (v0.35.5)
 
     *default engine:* `codex`<br>
-    *installed engines:* codex<br>
-    mode: assistant
+    *installed engines:* `codex, claude` (not installed: opencode, pi, gemini, amp)<br>
+    *mode:* `assistant`<br>
+    *directories:* `none`
 
     Send a message to start, or /config for settings.
 
@@ -455,7 +456,7 @@ Your config file lives at `~/.untether/untether.toml`. The onboarding wizard pop
         scope = "auto"
         ```
 
-This config file controls all of Untether's behavior. You can edit it directly or change most settings from Telegram using the `/config` inline menu — no file editing needed.
+This config file controls all of Untether's behaviour. You can edit it directly or change most settings from Telegram using the `/config` inline menu — no file editing needed.
 
 [Full config reference →](../reference/config.md)
 

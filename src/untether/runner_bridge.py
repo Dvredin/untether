@@ -44,6 +44,7 @@ from .runner import (
     _APPROVAL_PENDING_REFIRE_S,
     Runner,
     RunStreamHandle,
+    prespawn_blocked_reason,
     reset_run_stream_handle,
     set_run_stream_handle,
 )
@@ -959,6 +960,7 @@ def _apply_cost_delta(
         delta_usd=round(result.delta, 6),
         cumulative_usd=round(result.cumulative, 6),
         source=result.source,
+        **_background_log_fields(engine, usage),
     )
     return {
         **usage,
@@ -1047,10 +1049,11 @@ def _format_run_cost(
         return None
     parts: list[str] = []
     if cost is not None:
-        if cost >= 0.01:
-            parts.append(f"${cost:.2f}")
-        else:
-            parts.append(f"${cost:.4f}")
+        cost_part = f"${cost:.2f}" if cost >= 0.01 else f"${cost:.4f}"
+        if agents := _background_agents(usage):
+            # #821: the figure includes background agents' spend.
+            cost_part += f" · incl. {_plural(agents, 'bg agent')}"
+        parts.append(cost_part)
     turns = usage.get("num_turns")
     if turns is not None:
         parts.append(f"{turns} tn")
@@ -1118,6 +1121,48 @@ def _warn_cost_visibility_gap(cost: float, settings: Any, budget_enabled: bool) 
         show_api_cost=footer.show_api_cost,
         show_subscription_usage=footer.show_subscription_usage,
     )
+
+
+def _background_agents(usage: dict[str, Any] | None) -> int:
+    """#821: background agents active since the previous result, as the
+    Claude runner reports on ``usage["background"]`` (0 when absent)."""
+    background = (usage or {}).get("background")
+    if not isinstance(background, dict):
+        return 0
+    agents = background.get("agents")
+    if isinstance(agents, int) and not isinstance(agents, bool) and agents > 0:
+        return agents
+    return 0
+
+
+def _background_log_fields(
+    engine: str | None, usage: dict[str, Any] | None
+) -> dict[str, Any]:
+    """#821: the ``cost.turn_delta`` / ``cost.run_outlier`` fields naming the
+    background agents whose spend a Claude cost delta includes. Claude's
+    ``total_cost_usd`` counts subagent requests with no per-agent split, so
+    this labels the figure rather than dividing it. ``engine=None``: decide
+    from the presence of ``usage["background"]``. Other engines: none."""
+    background = (usage or {}).get("background")
+    if engine is None:
+        if not isinstance(background, dict):
+            return {}
+    elif engine != "claude":
+        return {}
+    fields: dict[str, Any] = {"bg_agents": _background_agents(usage)}
+    if isinstance(background, dict):
+        for key, field_name in (
+            ("agents_live", "bg_agents_live"),
+            ("agents_ended", "bg_agents_ended"),
+            ("task_ids", "bg_task_ids"),
+        ):
+            if key in background:
+                fields[field_name] = background[key]
+    return fields
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
 def _run_shape_fields(usage: dict[str, Any], cost: float) -> dict[str, Any]:
@@ -1208,10 +1253,20 @@ def _check_run_cost_outlier(usage: dict[str, Any] | None) -> str | None:
             # receives (`_usage_payload` in runners/claude.py); it was
             # simply not forwarded.
             **_run_shape_fields(usage, cost),
+            # #821: background agents whose spend this figure includes.
+            **_background_log_fields(None, usage),
         )
         if not budget_cfg.notify_run_outlier:
             return None
-        return f"\U0001f4b8 This run cost ${cost:.2f} (over the ${threshold:.2f} alert)"
+        notice = (
+            f"\U0001f4b8 This run cost ${cost:.2f} (over the ${threshold:.2f} alert)"
+        )
+        if agents := _background_agents(usage):
+            notice += (
+                f" \N{EM DASH} includes spend by "
+                f"{_plural(agents, 'background agent')} since the previous reply"
+            )
+        return notice
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "cost.run_outlier_check_failed",
@@ -1355,6 +1410,25 @@ def _record_export_event(
             event_dict["error"] = evt.error
             if evt.usage:
                 record_session_usage(session_id, evt.usage, channel_id=channel_id)
+        elif isinstance(evt, TurnEvent):
+            # #418: a live session's later turns (follow-ups, wake turns).
+            # The opening boundary marks the turn; the closing one carries
+            # its answer, so it is recorded as that turn's ``completed``.
+            if evt.phase == "completed":
+                event_dict = {
+                    "type": "completed",
+                    "ok": evt.ok,
+                    "answer": evt.answer,
+                    "error": evt.error,
+                }
+                if evt.usage:
+                    # Session-cumulative for the live process, i.e. this
+                    # run so far — what the export's "last run" line shows.
+                    record_session_usage(session_id, evt.usage, channel_id=channel_id)
+            else:
+                event_dict["phase"] = evt.phase
+            event_dict["turn"] = evt.turn
+            event_dict["reason"] = evt.reason
         record_session_event(session_id, event_dict, channel_id=channel_id)
         if isinstance(evt, ActionEvent):
             logger.debug(
@@ -1524,6 +1598,61 @@ def _safeguard_usage(usage: Mapping[str, Any] | None) -> dict[str, Any] | None:
     return raw
 
 
+# #835: unattended (cron / webhook) runs. The runner carries the turn's
+# denials on ``usage["unattended"]``; the final gets one footer line and, once
+# per trigger per process, what to change (bounded, oldest evicted first).
+_UNATTENDED_HINTED: dict[str, None] = {}
+_UNATTENDED_HINTED_MAX = 256
+_UNATTENDED_ASK_CLASS_MODES = frozenset({"auto", "bypassPermissions"})
+
+
+def _unattended_usage(usage: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    raw = (usage or {}).get("unattended")
+    if not isinstance(raw, dict):
+        return None
+    denied = raw.get("denied")
+    if not isinstance(denied, dict) or not denied:
+        return None
+    return raw
+
+
+def _unattended_footer(unattended: Mapping[str, Any]) -> str:
+    """``🔒 unattended (cron:x) · denied Write (x2), ExitPlanMode — nobody to
+    approve`` plus, the first time a trigger hits it, what to change."""
+    trigger = str(unattended.get("trigger") or "?")
+    parts = []
+    denied: Mapping[str, Any] = unattended["denied"]
+    for tool, count in denied.items():
+        n = count if isinstance(count, int) and not isinstance(count, bool) else 1
+        parts.append(f"{tool} \N{MULTIPLICATION SIGN}{n}" if n > 1 else str(tool))
+    line = (
+        f"\n\N{LOCK} unattended ({trigger}) \N{MIDDLE DOT} denied "
+        f"{', '.join(parts)} \N{EM DASH} nobody to approve"
+    )
+    if trigger in _UNATTENDED_HINTED:
+        return line
+    _UNATTENDED_HINTED[trigger] = None
+    while len(_UNATTENDED_HINTED) > _UNATTENDED_HINTED_MAX:
+        _UNATTENDED_HINTED.pop(next(iter(_UNATTENDED_HINTED)))
+    if unattended.get("mode") in _UNATTENDED_ASK_CLASS_MODES:
+        hint = (
+            "these always ask (an ask rule, a hook, a tool that needs a person, "
+            "or auto mode falling back after repeated blocks) \N{EM DASH} "
+            "change the rule or run it attended"
+        )
+    elif trigger.startswith("webhook:"):
+        hint = (
+            "webhooks use the chat's permission mode \N{EM DASH} set /planmode "
+            "plan-auto or auto in this chat, or pre-approve the tools"
+        )
+    else:
+        hint = (
+            "set permission_mode on the cron (plan-auto, auto or "
+            "bypassPermissions), or pre-approve the tools"
+        )
+    return f"{line}\n\N{ELECTRIC LIGHT BULB} {hint}"
+
+
 def _safeguard_footer(safeguard: Mapping[str, Any], session_key: str | None) -> str:
     """``🛡️ safeguards stopped N response(s) · <outcome>`` plus, the first
     time a session sees one, a guidance link: the Cyber Verification
@@ -1645,6 +1774,8 @@ class RunningTask:
     # PID (edits.pid) so the drain's self-restart evidence scan can walk the
     # run's process tree.
     edits: ProgressEdits | None = None
+    # #826: the originating message's thread (topic) — scopes /new and /cancel
+    thread_id: ThreadId | None = None
 
 
 RunningTasks = dict[MessageRef, RunningTask]
@@ -3570,12 +3701,16 @@ class ProgressEdits:
             # convention in TelegramPresenter.render_progress and
             # _has_pending_approval.
             _current_is_outline = False
+            _kb_tool: str | None = None  # #822
+            _kb_request_id: str | None = None
             for _a in reversed(state.actions):
                 if _a.completed or not _a.action.detail.get("inline_keyboard"):
                     continue
                 _current_is_outline = (
                     _a.action.detail.get("request_type") == "DiscussApproval"
                 )
+                _kb_tool = _a.action.detail.get("tool_name")
+                _kb_request_id = _a.action.detail.get("request_id")
                 break
             if self._outline_sent and has_approval and _current_is_outline:
                 cancel_row = new_kb[-1:]  # keep only the cancel row
@@ -3714,6 +3849,8 @@ class ProgressEdits:
                             channel_id=self.channel_id,
                             message_id=self.progress_ref.message_id,
                             keyboard_rows=len(new_kb),
+                            request_id=_kb_request_id,
+                            tool_name=_kb_tool,
                         )
                     logger.debug(
                         "transport.edit_message",
@@ -4066,10 +4203,20 @@ async def run_runner_with_cancel(
                         if isinstance(evt, TurnEvent):
                             # #811: the run-level monitor's live-idle clock.
                             edits.note_turn_boundary(evt.phase)
+                            # #418: every turn of the session is exported,
+                            # not just the run's first.
+                            _record_export_event(
+                                evt,
+                                outcome.resume or evt.resume,
+                                channel_id=channel_id,
+                            )
                             if turn_router is not None:
                                 await turn_router.on_turn(evt)
                             continue
                         if turn_router is not None and turn_router.active:
+                            _record_export_event(
+                                evt, outcome.resume, channel_id=channel_id
+                            )
                             await turn_router.on_event(evt)
                             continue
                         if isinstance(evt, StartedEvent):
@@ -4575,8 +4722,24 @@ def _turn_title(evt: TurnEvent) -> str | None:
     if evt.reason == "task_finished" and tasks:
         if len(tasks) == 1:
             return f"{base} — {tasks[0][:80]}"
-        return f"\N{BELL} {len(tasks)} background tasks finished"
+        # #825: name them (first three, 40 chars each) — a bare count left
+        # the user guessing which finished.
+        names = " · ".join(_short_label(t) for t in tasks[:_TURN_TITLE_MAX_NAMES])
+        more = len(tasks) - _TURN_TITLE_MAX_NAMES
+        suffix = f" (+{more} more)" if more > 0 else ""
+        return f"\N{BELL} {len(tasks)} background tasks finished — {names}{suffix}"
     return base
+
+
+_TURN_TITLE_MAX_NAMES = 3
+_TURN_TITLE_NAME_CHARS = 40
+
+
+def _short_label(label: str) -> str:
+    label = " ".join(label.split())
+    if len(label) <= _TURN_TITLE_NAME_CHARS:
+        return label
+    return label[: _TURN_TITLE_NAME_CHARS - 1].rstrip() + "\N{HORIZONTAL ELLIPSIS}"
 
 
 @dataclass(slots=True)
@@ -4783,6 +4946,23 @@ class FollowupTurnRouter:
                 "live_turn.retro_attributed",
                 turn=ctx.turn,
                 reason=ctx.reason,
+                header=ctx.header,
+            )
+        elif (
+            ctx.reason == "task_finished"
+            and evt.reason == "task_finished"
+            and (evt.detail or {}).get("late_tasks")
+        ):
+            # #825: another task finished during this wake turn — name every
+            # task in the header. Keep ``reply_to`` (the opening task's
+            # anchor); a turn that opened as an already-announced repeat now
+            # carries news, so it pushes.
+            ctx.header = _turn_header(evt)
+            ctx.detail = dict(evt.detail or {})
+            ctx.notify = True
+            logger.info(
+                "live_turn.late_tasks_attributed",
+                turn=ctx.turn,
                 header=ctx.header,
             )
         completed = CompletedEvent(
@@ -5464,6 +5644,7 @@ async def handle_message(
         # #814: a safeguard stop is never an error; a not-retried stop with
         # no answer gets an explanation instead of an empty body.
         safeguard = _safeguard_usage(completed.usage)
+        unattended = _unattended_usage(completed.usage)  # #835
         if (
             safeguard is not None
             and safeguard.get("outcome") == "not_retried"
@@ -5473,7 +5654,24 @@ async def handle_message(
 
         # Auto-clear broken session: if a resumed run failed with 0 turns,
         # clear the saved session so the next message starts fresh.
+        # #838: a pre-spawn guard block (RAM / concurrency) never ran the
+        # engine, so the saved session is fine — keep it.
+        _blocked = prespawn_blocked_reason(completed.usage)
         if (
+            turn is None
+            and run_ok is False
+            and resume_token is not None
+            and on_resume_failed is not None
+            and _blocked is not None
+        ):
+            logger.info(
+                "session.auto_clear_skipped",
+                reason="prespawn_blocked",
+                blocked=_blocked,
+                engine=resume_token.engine,
+                resume=resume_token.value,
+            )
+        elif (
             turn is None
             and run_ok is False
             and resume_token is not None
@@ -5806,6 +6004,11 @@ async def handle_message(
                 ),
             )
 
+        if unattended is not None:
+            final_rendered = _insert_footer_line(
+                final_rendered, _unattended_footer(unattended)
+            )
+
         # Append usage footer for Claude Code engine runs
         if runner.engine == "claude":
             _show_sub = footer_cfg.show_subscription_usage
@@ -5880,7 +6083,9 @@ async def handle_message(
 
     running_task: RunningTask | None = None
     if running_tasks is not None and progress_ref is not None:
-        running_task = RunningTask(context=context, edits=edits)
+        running_task = RunningTask(
+            context=context, edits=edits, thread_id=incoming.thread_id
+        )
         running_tasks[progress_ref] = running_task
 
     # ── #776 live-session follow-up turns ─────────────────────────────────

@@ -459,6 +459,45 @@ async def test_handle_message_cancelled_renders_cancelled_state() -> None:
 
 
 @pytest.mark.anyio
+async def test_826_running_task_records_incoming_thread() -> None:
+    """#826: the RunningTask carries the originating message's thread so
+    /new and /cancel can scope to a forum topic."""
+    transport = FakeTransport()
+    hold = anyio.Event()
+    runner = ScriptRunner([Wait(hold)], engine=CODEX_ENGINE, resume_value="s-826")
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+    running_tasks: dict = {}
+
+    async def run_handle_message() -> None:
+        await handle_message(
+            cfg,
+            runner=runner,
+            incoming=IncomingMessage(
+                channel_id=123, message_id=10, text="do something", thread_id=7
+            ),
+            resume_token=None,
+            running_tasks=running_tasks,
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_handle_message)
+        for _ in range(100):
+            if running_tasks:
+                break
+            await anyio.lowlevel.checkpoint()
+        assert running_tasks
+        running_task = running_tasks[next(iter(running_tasks))]
+        assert running_task.thread_id == 7
+        with anyio.fail_after(1):
+            await running_task.resume_ready.wait()
+        running_task.cancel_requested.set()
+
+
+@pytest.mark.anyio
 async def test_handle_message_error_preserves_resume_token() -> None:
     transport = FakeTransport()
     session_id = "019b66fc-64c2-7a71-81cd-081c504cfeb2"
@@ -747,6 +786,15 @@ class TestFormatRunCost:
         )
         assert result is not None
         assert "1.5M/250.0k" in result
+
+    def test_format_run_cost_marks_background_agents(self):
+        """#821: the figure includes background agents' spend — say so."""
+        usage = {"total_cost_usd": 26.94, "num_turns": 3}
+        assert _format_run_cost(usage) == "$26.94 · 3 tn"
+        usage["background"] = {"agents": 2, "agents_live": 1, "agents_ended": 1}
+        assert _format_run_cost(usage) == "$26.94 · incl. 2 bg agents · 3 tn"
+        usage["background"] = {"agents": 1}
+        assert _format_run_cost(usage) == "$26.94 · incl. 1 bg agent · 3 tn"
 
     def test_long_duration(self):
         result = _format_run_cost(
@@ -1372,6 +1420,59 @@ async def test_on_resume_failed_not_called_with_turns() -> None:
     )
 
     assert len(cleared_tokens) == 0
+
+
+@pytest.mark.anyio
+async def test_838_prespawn_block_does_not_clear_saved_session() -> None:
+    """#838: a pre-spawn guard block (marked on usage) never ran the engine —
+    the saved session must survive, with a greppable skip log and no cost
+    footer / cost or token delta."""
+    from structlog.testing import capture_logs
+
+    transport = FakeTransport()
+    runner = ScriptRunner(
+        [
+            ErrorReturn(
+                error="🛑 Too many engine runs in flight (1/1).",
+                usage={"prespawn_blocked": "concurrency"},
+            )
+        ],
+        engine=CODEX_ENGINE,
+        resume_value="kept-session",
+    )
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+    resume = ResumeToken(engine=CODEX_ENGINE, value="kept-session")
+    cleared_tokens: list[ResumeToken] = []
+
+    async def on_resume_failed(token: ResumeToken) -> None:
+        cleared_tokens.append(token)
+
+    with capture_logs() as logs:
+        await handle_message(
+            cfg,
+            runner=runner,
+            incoming=IncomingMessage(channel_id=123, message_id=10, text="hi"),
+            resume_token=resume,
+            on_resume_failed=on_resume_failed,
+        )
+
+    assert cleared_tokens == []
+    skipped = [r for r in logs if r.get("event") == "session.auto_clear_skipped"]
+    assert skipped and skipped[0]["reason"] == "prespawn_blocked"
+    assert skipped[0]["blocked"] == "concurrency"
+    assert not [r for r in logs if r.get("event") == "session.auto_cleared"]
+    assert not [
+        r for r in logs if r.get("event") in {"cost.turn_delta", "usage.token_delta"}
+    ]
+    texts = [c["message"].text for c in transport.send_calls] + [
+        c["message"].text for c in transport.edit_calls
+    ]
+    assert any("Too many engine runs" in t for t in texts)
+    assert not any("💰" in t for t in texts)
 
 
 @pytest.mark.anyio
@@ -4977,6 +5078,55 @@ async def test_outline_not_double_deleted() -> None:
 
     # No outline deletes should have happened
     assert transport.delete_calls == []
+
+
+@pytest.mark.anyio
+async def test_822_keyboard_attach_logs_tool() -> None:
+    """#822: progress_edits.keyboard_attach names the request + tool."""
+    from structlog.testing import capture_logs
+
+    from untether.model import Action, ActionEvent
+
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    edits = _make_edits(transport, presenter)
+    edits.tracker.note_event(
+        ActionEvent(
+            engine="claude",
+            action=Action(
+                id="claude.control.1",
+                kind="warning",
+                title="Bash",
+                detail={
+                    "request_id": "r-822k",
+                    "request_type": "CanUseTool",
+                    "tool_name": "Bash",
+                    "inline_keyboard": {"buttons": [[{"text": "✅ Approve"}]]},
+                },
+            ),
+            phase="started",
+        )
+    )
+    presenter.set_approval_buttons()
+    edits.event_seq = 1
+    with contextlib.suppress(anyio.WouldBlock):
+        edits.signal_send.send_nowait(None)
+
+    with capture_logs() as logs:
+        async with anyio.create_task_group() as tg:
+
+            async def run_cycle() -> None:
+                await anyio.lowlevel.checkpoint()
+                await anyio.lowlevel.checkpoint()
+                edits.signal_send.close()
+
+            tg.start_soon(edits.run)
+            tg.start_soon(run_cycle)
+
+    attach = [r for r in logs if r.get("event") == "progress_edits.keyboard_attach"]
+    assert attach
+    assert attach[0]["tool_name"] == "Bash"
+    assert attach[0]["request_id"] == "r-822k"
 
 
 @pytest.mark.anyio
@@ -10494,3 +10644,82 @@ def test_819_compaction_empty_body_shapes() -> None:
         "🗜️ Context compacted · 6.3k tokens before (manual)"
     )
     assert _compaction_empty_body({"pre_tokens": True}) == "🗜️ Context compacted"
+
+
+# ===========================================================================
+# #835: unattended denials footer
+# ===========================================================================
+
+
+async def _run_unattended(usage: dict, transport: "FakeTransport") -> str:
+    runner = ScriptRunner(
+        [Return(answer="Couldn't write it.", usage=usage)],
+        engine="claude",
+        resume_value=f"s-835-{uuid.uuid4().hex[:6]}",
+    )
+    cfg = ExecBridgeConfig(
+        transport=transport, presenter=MarkdownPresenter(), final_notify=True
+    )
+    await handle_message(
+        cfg,
+        runner=runner,
+        incoming=IncomingMessage(channel_id=123, message_id=10, text="go"),
+        resume_token=None,
+    )
+    return transport.send_calls[-1]["message"].text
+
+
+@pytest.mark.anyio
+async def test_835_final_footer_lists_unattended_denials(monkeypatch) -> None:
+    import untether.runner_bridge as rb
+
+    monkeypatch.setattr(rb, "_UNATTENDED_HINTED", {})
+    text = await _run_unattended(
+        {
+            "unattended": {
+                "trigger": "cron:nightly",
+                "mode": "default",
+                "denied": {"Write": 2, "ExitPlanMode": 1},
+            }
+        },
+        FakeTransport(),
+    )
+    assert "\N{LOCK} unattended (cron:nightly)" in text
+    assert "denied Write \N{MULTIPLICATION SIGN}2, ExitPlanMode" in text
+    assert "nobody to approve" in text
+    assert "set permission_mode on the cron" in text
+
+
+@pytest.mark.anyio
+async def test_835_footer_hint_once_per_trigger(monkeypatch) -> None:
+    import untether.runner_bridge as rb
+
+    monkeypatch.setattr(rb, "_UNATTENDED_HINTED", {})
+    usage = {"unattended": {"trigger": "cron:c", "mode": "plan", "denied": {"Bash": 1}}}
+    first = await _run_unattended(usage, FakeTransport())
+    second = await _run_unattended(usage, FakeTransport())
+    assert "\N{ELECTRIC LIGHT BULB}" in first
+    assert "\N{LOCK} unattended (cron:c)" in second
+    assert "\N{ELECTRIC LIGHT BULB}" not in second
+
+
+def test_835_footer_hint_by_mode_and_trigger_kind(monkeypatch) -> None:
+    import untether.runner_bridge as rb
+
+    monkeypatch.setattr(rb, "_UNATTENDED_HINTED", {})
+    ask = rb._unattended_footer(
+        {"trigger": "cron:a", "mode": "auto", "denied": {"Bash": 1}}
+    )
+    assert "always ask" in ask
+    hook = rb._unattended_footer(
+        {"trigger": "webhook:w", "mode": "default", "denied": {"Write": 1}}
+    )
+    assert "webhooks use the chat's permission mode" in hook
+    assert rb._unattended_usage({"unattended": {"denied": {}}}) is None
+    assert rb._unattended_usage(None) is None
+
+
+@pytest.mark.anyio
+async def test_835_no_footer_without_denials() -> None:
+    text = await _run_unattended({}, FakeTransport())
+    assert "unattended" not in text

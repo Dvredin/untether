@@ -358,11 +358,35 @@ a few Telegram-specific rewrites:
   delimiter row (`|---|`) is dropped and the header row is bolded. When a long
   reply is split, the header row is repeated in the chunk that continues the
   table ([#797](https://github.com/littlebearapps/untether/issues/797)).
+- **Ordered list numbers** — a list that starts at a number other than 1
+  (`42. …`, or the continuation chunk of a long numbered answer) keeps its
+  numbers: the start is set on the list's first item (`<li value>`), which
+  the HTML-to-entities converter honours, where it ignored `<ol start>` and
+  renumbered from 1 ([#886](https://github.com/littlebearapps/untether/issues/886)).
 - **Bare filenames** — `.md`, `.sh` and `.py` are also country-code TLDs, so a
   bare `CLAUDE.md`, `setup.sh` or `render.py:86` (paths and `:line[:col]`
   suffixes included) is rendered as inline code rather than auto-linked as a
   domain. Explicit link text and real URLs keep their links
   ([#788](https://github.com/littlebearapps/untether/issues/788)).
+- **Line breaks** — CommonMark turns a single newline inside a paragraph into
+  a space, which collapsed one-item-per-line digests into a single paragraph.
+  A single newline is now kept as a line break when the next line is indented
+  (2+ columns, kept as up to 8 non-breaking spaces), starts with a structural
+  lead (emoji, bullet/arrow/status glyph, `#N`, `1.`, `(a)`, `**Key:**`, a
+  checkbox or `Key: `), follows a line under 40 characters, starts with a word
+  that would have fitted on the previous line (a wrapper never breaks early),
+  or starts with a capital after a line ending in neither punctuation nor a
+  small function word. Hard-wrapped prose still reflows into one paragraph;
+  breaks inside link text and around pipe tables are left alone
+  ([#870](https://github.com/littlebearapps/untether/issues/870)).
+- **Agent text in code spans** — command titles, the long-running tail, verbose
+  detail lines, `read:`/`glob:`/`ls:`/`grep:`/`find:` tool titles, changed-file
+  paths and the Bash approval preview go through `markdown.inline_code`: the
+  span's fence is longer than any backtick run inside the text (the #855
+  diff-preview technique), so a command such as ``echo `date` `` or a heredoc
+  PR body can't close the span early and run the following action lines
+  together. A multi-line command in a Bash approval keeps its lines in a fenced
+  `sh` block ([#871](https://github.com/littlebearapps/untether/issues/871)).
 
 ## File transfer and `/browse`
 
@@ -452,7 +476,7 @@ Commands:
   project chats.
 - `/ctx` shows the bound context and stored session engines inside topics.
   Outside topics, `/ctx set ...` and `/ctx clear` bind the chat context.
-- `/new` inside a topic cancels any running task and clears stored resume tokens for that topic.
+- `/new` inside a topic cancels that topic's running task (and its pending `/loop` entries) and clears stored resume tokens for that topic. Runs in other topics keep going; `/new` in General only cancels General's runs (General = no thread id = topic id 1). The `/cancel` no-reply fallback is scoped the same way. Non-forum groups stay chat-wide ([#826](https://github.com/littlebearapps/untether/issues/826)).
 
 State is stored in `telegram_topics_state.json` alongside the config file.
 Delete it to reset all topic bindings and stored sessions.
@@ -489,6 +513,14 @@ the press; if we don't, the *user's* Telegram client surfaces
 `BotResponseTimeoutError`. The work Untether then performs (writing control
 responses to Claude's PTY, editing feedback messages, etc.) happens
 independently — answering just clears the spinner.
+
+Callbacks are accepted only from allowed senders (`allowed_user_ids`, #377).
+A Claude approval callback (`claude_control:…`) is also bound to the chat whose
+message carries the button: the same callback data sent from another chat (a
+modified client can attach any callback data to any bot message it can see)
+reads as expired and answers nothing
+([#388](https://github.com/littlebearapps/untether/issues/388)). Other callback
+families already act only on the tapping chat.
 
 Backends that want a visible toast ("Approved" / "Denied" / …) set
 `answer_early = True` and provide `early_answer_toast(args_text) -> str | None`.

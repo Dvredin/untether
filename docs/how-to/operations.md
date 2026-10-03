@@ -47,8 +47,9 @@ For Claude subscription diagnostics, use `/usage debug` ([#410](https://github.c
 
 Untether refuses to spawn a new engine subprocess when free RAM is below `[watchdog] prespawn_ram_block_mb` (default 500 MB), and warns at `prespawn_ram_warn_mb` (default 2000 MB). On block the run completes early with `🛑 Insufficient RAM` instead of spawning a doomed subprocess that would leak memory under OOM. Set either threshold to `0` to disable that tier; `0 / 0` disables the guard entirely. See [config: `[watchdog]`](../reference/config.md#watchdog).
 
-!!! warning "Not yet applied to Claude Code runs"
-    In v0.35.5 the RAM guard, and the `max_concurrent_engine_runs` / `prespawn_ram_per_run_reserve_mb` limits that live inside it, only run for Codex, OpenCode and Pi. Claude Code runs start without the check ([#838](https://github.com/littlebearapps/untether/issues/838)).
+The same check holds two concurrency limits ([#589](https://github.com/littlebearapps/untether/issues/589)): `prespawn_ram_per_run_reserve_mb` raises the block bar by that much for each engine run already in flight, and `max_concurrent_engine_runs` (default `0`, unlimited) refuses a spawn outright with `🛑 Too many engine runs in flight (N/M)`. `0 / 0 / 0` turns the whole guard off.
+
+It applies to every engine, Claude Code included (before 0.35.5rc17 Claude runs skipped it, [#838](https://github.com/littlebearapps/untether/issues/838)). Only new processes are checked: a follow-up written into a live Claude session isn't. A Claude session kept open after its reply for background work (or the idle grace) still holds its process and MCP children, so it counts as a run in flight; the block message names those idle sessions, and they close on their own. A block never clears the chat's saved session — the next message after the load drops resumes it (log `session.auto_clear_skipped reason=prespawn_blocked`).
 
 ## Graceful restart
 
@@ -197,7 +198,7 @@ When enabled, Untether watches the config file for changes and reloads most sett
 - Telegram bridge: `voice_transcription`, `[files]`, `allowed_user_ids`, `allow_any_user`, `show_resume_line`, timing
 - `[security]` keys: `env_extra_allow`, `env_extra_prefix_allow` (re-read on next runner spawn)
 - `[progress]` keys: `max_actions`, `verbosity`, `min_render_interval`, `group_chat_rps`, `heartbeat_interval`, `show_background_tasks`, `background_tasks_max_rows`, `consolidate_wake_turns`, `show_context_usage` ([#269](https://github.com/littlebearapps/untether/issues/269), [#481](https://github.com/littlebearapps/untether/issues/481), [#777](https://github.com/littlebearapps/untether/issues/777), [#819](https://github.com/littlebearapps/untether/issues/819)); `verbosity`, `max_actions` and `show_context_usage` also reach the next turn of an open Claude session ([#863](https://github.com/littlebearapps/untether/issues/863))
-- `[watchdog]` keys: `tool_timeout`, `mcp_tool_timeout`, `claude_stream_idle_timeout_ms`, `post_result_idle_timeout`, `post_result_idle_enabled`, `bash_grace_seconds` (re-read per run); the live-session keys `post_result_bg_max_hold`, `bg_hold_rearm_on_progress` and `rearm_plan_mode` are read when a Claude session starts, so an open session keeps the old value until it closes
+- `[watchdog]` keys: `tool_timeout`, `mcp_tool_timeout`, `claude_stream_idle_timeout_ms`, `post_result_idle_timeout`, `post_result_idle_enabled`, `bash_grace_seconds` (re-read per run); the live-session keys `post_result_bg_max_hold`, `bg_hold_rearm_on_progress`, `bg_hold_declared_waits` and `rearm_plan_mode` are read when a Claude session starts, so an open session keeps the old value until it closes
 - `followup_mode` (the default for [steer follow-ups](steer-follow-ups.md))
 - Trigger pause/resume: in-memory only, toggled via `/config → ⏰ Triggers` ([#294](https://github.com/littlebearapps/untether/issues/294)) — restart auto-resumes
 - `[footer]` and `[cost]` settings (re-read per call)

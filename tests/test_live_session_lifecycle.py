@@ -50,6 +50,13 @@ _ENV = (
     # #684
     "FAKE_CLAUDE_STDIN_LOG",
     "FAKE_CLAUDE_UNANSWERED_RESULT_S",
+    # #872
+    "FAKE_CLAUDE_BASH_TIMEOUT_MS",
+    # #876
+    "FAKE_CLAUDE_BG_PATCH",
+    # #872 R17-01a
+    "FAKE_CLAUDE_WAKE_HOOK_S",
+    "FAKE_CLAUDE_WAKE_DELAY_S",
 )
 
 
@@ -67,6 +74,8 @@ _TIMINGS = {
     "_subcountdown_sigterm_grace_poll_s": 0.1,
     # #829: log every hold re-arm so tests can count them.
     "_hold_rearm_log_every_s": 0.0,
+    # #872: the grace after a declared wait's deadline.
+    "_declared_wait_grace_s": 0.2,
 }
 
 
@@ -1425,3 +1434,361 @@ async def test_684_unanswered_request_still_holds(
     )
     assert seen == {"awaiting": True, "accepting": True}
     assert _engine_state(runner).live_close_reason == "abs_cap"
+
+
+# ---------------------------------------------------------------------------
+# #820: lifecycle_exited says how the live session actually ended
+# ---------------------------------------------------------------------------
+
+
+def _lifecycle_exits(logs: list[dict]) -> list[dict]:
+    return _events(logs, "claude.live_session.lifecycle_exited")
+
+
+async def test_820_clean_idle_close_logs_exited_after_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F on rc16: the CLI exits on EOF while the lifecycle sleeps (the
+    production race, made deterministic by a 0.5 s poll); the run's teardown
+    cancels that sleep, which used to log ``cancelled``."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch)
+    monkeypatch.setitem(_TIMINGS, "_live_poll_s", 0.5)
+    with capture_logs() as logs:
+        runner, _ = await _run("followup")
+    assert _engine_state(runner).live_close_reason == "idle_no_tasks"
+    (exited,) = _lifecycle_exits(logs)
+    assert exited["reason"] == "exited_after_close"
+    assert exited["close_reason"] == "idle_no_tasks"
+
+
+@pytest.mark.parametrize("poll_s", [0.05, 0.5])
+async def test_820_bash_max_hold_close_logs_exited_after_close(
+    monkeypatch: pytest.MonkeyPatch, poll_s: float
+) -> None:
+    """Whichever side wins the race (lifecycle in its grace wait or parked in
+    its poll sleep), a clean max_hold close says so."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch, post_result_bg_max_hold=0.5)
+    monkeypatch.setitem(_TIMINGS, "_live_poll_s", poll_s)
+    with capture_logs() as logs:
+        runner, _ = await _run("bg_bash_wake", wake_s=30)
+    assert _engine_state(runner).live_close_reason == "max_hold"
+    (exited,) = _lifecycle_exits(logs)
+    assert exited["reason"] == "exited_after_close"
+    assert exited["close_reason"] == "max_hold"
+
+
+async def test_820_forced_teardown_logs_sigterm(
+    monkeypatch: pytest.MonkeyPatch, quarantine: QuarantineStore
+) -> None:
+    """F on rc16: a CLI deaf to EOF and SIGINT is SIGTERM'd — the stage
+    marker survives the cancellation of the SIGTERM poll."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch, post_result_bg_max_hold=0.3)
+    os.environ["FAKE_CLAUDE_IGNORE_SIGINT"] = "1"
+    with capture_logs() as logs:
+        runner, _ = await _run("ignore_eof_with_task")
+    assert runner.current_stream.sigterm_sent is True
+    assert quarantine.is_quarantined("claude", SID)  # unchanged (#791)
+    (exited,) = _lifecycle_exits(logs)
+    assert exited["reason"] == "sigterm"
+    assert exited["close_reason"] == "max_hold"
+
+
+async def test_820_sigint_exit_logs_sigint(
+    monkeypatch: pytest.MonkeyPatch, quarantine: QuarantineStore
+) -> None:
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch, post_result_bg_max_hold=0.5)
+    _progress_env(eof_mode="until_sigint")
+    with capture_logs() as logs:
+        runner, _ = await _run("bg_agent_silent")
+    assert runner.current_stream.sigterm_sent is False
+    (exited,) = _lifecycle_exits(logs)
+    assert exited["reason"] == "sigint"
+    assert exited["close_reason"] == "max_hold"
+
+
+async def test_820_cli_exit_without_close_logs_reader_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch)
+    clock = _CloseClock()
+    with capture_logs() as logs:
+        await _run("exit_after_result", on_event=clock.on_event)
+    (exited,) = _lifecycle_exits(logs)
+    assert exited["reason"] == "reader_done"
+    assert exited["close_reason"] is None
+    assert clock.kinds() == []
+
+
+async def test_820_cancel_while_cli_alive_logs_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation that lands while the CLI is still running (no close)
+    keeps ``cancelled`` and sends no ``closed`` notice. Driven from an outer
+    task group, never from inside the ``async for``."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch)
+    os.environ["FAKE_CLAUDE_SCENARIO"] = "bg_bash_wake"
+    os.environ["FAKE_CLAUDE_WAKE_S"] = "30"
+    runner = _LiveRunner(claude_cmd=str(FAKE_CLI), permission_mode="bypassPermissions")
+    for name, value in _TIMINGS.items():
+        setattr(runner, name, value)
+    completed = anyio.Event()
+    notices: list[str] = []
+
+    async def drive() -> None:
+        async for evt in runner.run("hello", None):
+            if isinstance(evt, CompletedEvent):
+                add_live_session_listener(SID, lambda kind, _p: notices.append(kind))
+                completed.set()
+
+    with capture_logs() as logs, anyio.fail_after(20):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(drive)
+            await completed.wait()
+            await anyio.sleep(0.2)  # the lifecycle is polling, CLI alive
+            tg.cancel_scope.cancel()
+    (exited,) = _lifecycle_exits(logs)
+    assert exited["reason"] == "cancelled"
+    assert exited["close_reason"] is None
+    assert "closed" not in notices
+
+
+_STAGES = (None, "sigint", "sigterm")
+_EXIT_REASONS = ("reader_done", "exited_after_close", "sigint")
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("process_gone", [False, True])
+@pytest.mark.parametrize("closing", [False, True])
+@pytest.mark.parametrize("stage", _STAGES)
+@pytest.mark.parametrize("exit_reason", _EXIT_REASONS)
+def test_820_exit_reason_table(
+    cancelled: bool,
+    process_gone: bool,
+    closing: bool,
+    stage: str | None,
+    exit_reason: str,
+) -> None:
+    reason = claude_mod._lifecycle_exit_reason(
+        exit_reason=exit_reason,
+        cancelled=cancelled,
+        process_gone=process_gone,
+        closing=closing,
+        stage=stage,
+    )
+    if cancelled and not process_gone:
+        expected = "cancelled"
+    elif cancelled or exit_reason == "reader_done":
+        expected = (stage or "exited_after_close") if closing else "reader_done"
+    else:
+        expected = exit_reason
+    assert reason == expected
+    # The ``closed`` notice gate is unchanged: the old condition was
+    # ``exit_reason != "cancelled" or reader_done or returncode``.
+    assert (reason != "cancelled") == (not cancelled or process_gone)
+
+
+# ---------------------------------------------------------------------------
+# #872: a declared wait (background Bash timeout, pending wake-up) is honoured
+# ---------------------------------------------------------------------------
+
+
+async def test_872_declared_bash_timeout_holds_past_max_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch, post_result_bg_max_hold=0.5)
+    os.environ["FAKE_CLAUDE_BASH_TIMEOUT_MS"] = "3000"
+    with capture_logs() as logs:
+        runner, events = await _run("bg_bash_wake", wake_s=1.5)
+    finals = [e for e in events if isinstance(e, TurnEvent) and e.phase == "completed"]
+    assert [f.answer for f in finals] == ["GOT: BG-FINISHED"]
+    closes = _events(logs, "claude.live_session.stdin_closed")
+    assert all(c["reason"] != "max_hold" for c in closes)
+    (extended,) = _events(logs, "claude.live_session.hold_extended")
+    assert extended["source"] == "bash_timeout"
+    assert extended["task_id"] == "b1"
+    assert extended["declared_s"] == 3.0
+    assert 0 < extended["remaining_s"] <= 3.2
+    assert _engine_state(runner).live_close_reason == "idle_no_tasks"
+
+
+async def test_872_wake_turn_after_declared_wait_gets_a_fresh_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R17-01a: the declared wait ends (task.ended), the CLI's task
+    notification fires an async UserPromptSubmit hook (live work) and the
+    wake turn opens 0.4 s later. The quiet-time clock dated from before the
+    wait, so the session was closed ``max_hold`` at once, killing the hook.
+    Now the clock restarts when the declared wait ends."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch, post_result_bg_max_hold=0.3)
+    os.environ["FAKE_CLAUDE_BASH_TIMEOUT_MS"] = "3000"
+    os.environ["FAKE_CLAUDE_WAKE_HOOK_S"] = "2"
+    os.environ["FAKE_CLAUDE_WAKE_DELAY_S"] = "0.25"
+    with capture_logs() as logs:
+        runner, events = await _run("bg_bash_wake", wake_s=1.0)
+    finals = [e for e in events if isinstance(e, TurnEvent) and e.phase == "completed"]
+    assert [f.answer for f in finals] == ["GOT: BG-FINISHED"]
+    closes = _events(logs, "claude.live_session.stdin_closed")
+    assert all(c["reason"] != "max_hold" for c in closes)
+    assert _events(logs, "claude.live_session.async_hook_killed") == []
+    rearmed = [
+        e
+        for e in _events(logs, "claude.live_session.hold_rearmed")
+        if e["source"] == "declared_wait_ended"
+    ]
+    assert len(rearmed) == 1
+    assert _engine_state(runner).live_close_reason != "max_hold"
+
+
+async def test_872_fresh_hold_after_declared_wait_is_still_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The restarted window is one ``max_hold``, not unbounded: a hook that
+    keeps the session busy with no wake turn closes ``max_hold`` a window
+    after the declared wait ended."""
+    _settings(monkeypatch, post_result_bg_max_hold=0.3)
+    os.environ["FAKE_CLAUDE_BASH_TIMEOUT_MS"] = "3000"
+    os.environ["FAKE_CLAUDE_WAKE_HOOK_S"] = "30"
+    os.environ["FAKE_CLAUDE_WAKE_DELAY_S"] = "30"  # the turn never opens
+    clock = _CloseClock()
+    runner, events = await _run("bg_bash_wake", wake_s=1.0, on_event=clock.on_event)
+    assert _engine_state(runner).live_close_reason == "max_hold"
+    _, closed_at = clock.first("closing")
+    assert clock.result_at is not None
+    # task ends ~1.0 s after the result; then a fresh 0.3 s window.
+    assert 1.25 <= closed_at - clock.result_at < 2.5
+
+
+async def test_872_silent_task_closes_once_its_declared_wait_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI enforcement off (the task never ends): the hold closes one fresh
+    quiet-time window after the declared deadline + grace (1.0 + 0.2 + 0.5)
+    — not at the 0.5 s quiet-time limit."""
+    _settings(monkeypatch, post_result_bg_max_hold=0.5)
+    os.environ["FAKE_CLAUDE_BASH_TIMEOUT_MS"] = "1000"
+    clock = _CloseClock()
+    runner, _ = await _run("bg_bash_wake", wake_s=30, on_event=clock.on_event)
+    assert _engine_state(runner).live_close_reason == "max_hold"
+    _, closed_at = clock.first("closing")
+    assert clock.result_at is not None
+    assert 1.6 <= closed_at - clock.result_at < 2.4
+
+
+async def test_872_pending_wakeup_beyond_hold_is_not_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The issue's ask: a ScheduleWakeup further out than the hold keeps the
+    session open until it fires (the fake announces "in 60s")."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch, post_result_bg_max_hold=0.5)
+    with capture_logs() as logs:
+        runner, events = await _run("scheduled_wakeup", wake_s=1.5)
+    finals = [e for e in events if isinstance(e, TurnEvent) and e.phase == "completed"]
+    assert [f.answer for f in finals] == ["WOKE"]
+    (extended,) = _events(logs, "claude.live_session.hold_extended")
+    assert extended["source"] == "scheduled_wakeup"
+    assert extended["task_id"] is None
+    assert 59 <= extended["declared_s"] <= 60
+    closes = _events(logs, "claude.live_session.stdin_closed")
+    assert all(c["reason"] != "max_hold" for c in closes)
+    assert _engine_state(runner).pending_wakeup_until is None
+
+
+async def test_872_no_declared_timeout_keeps_the_quiet_time_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch, post_result_bg_max_hold=0.5)
+    clock = _CloseClock()
+    with capture_logs() as logs:
+        runner, _ = await _run("bg_bash_wake", wake_s=30, on_event=clock.on_event)
+    assert _engine_state(runner).live_close_reason == "max_hold"
+    _, closed_at = clock.first("closing")
+    assert clock.result_at is not None and 0.5 <= closed_at - clock.result_at < 1.2
+    assert _events(logs, "claude.live_session.hold_extended") == []
+
+
+@pytest.mark.parametrize("scenario", ["bg_bash_wake", "scheduled_wakeup"])
+async def test_872_kill_switch_ignores_declared_waits(
+    monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch, post_result_bg_max_hold=0.5, bg_hold_declared_waits=False)
+    os.environ["FAKE_CLAUDE_BASH_TIMEOUT_MS"] = "3000"
+    clock = _CloseClock()
+    with capture_logs() as logs:
+        runner, events = await _run(scenario, wake_s=1.5, on_event=clock.on_event)
+    state = _engine_state(runner)
+    assert state.bg_hold_declared_waits is False
+    assert state.live_close_reason == "max_hold"
+    _, closed_at = clock.first("closing")
+    assert clock.result_at is not None and 0.5 <= closed_at - clock.result_at < 1.2
+    assert _events(logs, "claude.live_session.hold_extended") == []
+    assert not any(isinstance(e, TurnEvent) for e in events)  # no WOKE / wake
+
+
+async def test_872_absolute_cap_wins_over_a_declared_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _settings(monkeypatch, post_result_bg_max_hold=0.3, live_session_max_s=1.0)
+    os.environ["FAKE_CLAUDE_BASH_TIMEOUT_MS"] = "60000"
+    runner, _ = await _run("bg_bash_wake", wake_s=30)
+    assert _engine_state(runner).live_close_reason == "abs_cap"
+
+
+def test_872_settings_default_and_round_trip() -> None:
+    wd = WatchdogSettings()
+    assert wd.bg_hold_declared_waits is True
+    off = WatchdogSettings.model_validate({"bg_hold_declared_waits": False})
+    assert off.bg_hold_declared_waits is False
+    assert WatchdogSettings.model_validate(off.model_dump()) == off
+
+
+# ---------------------------------------------------------------------------
+# #876: a task the CLI moved to the background holds the live session
+# ---------------------------------------------------------------------------
+
+
+async def test_876_auto_backgrounded_task_holds_the_live_session(
+    monkeypatch: pytest.MonkeyPatch, quarantine: QuarantineStore
+) -> None:
+    """F on rc16: the moved task stayed ``is_backgrounded=False``, so the
+    session idle-closed after 0.3 s and the CLI killed the copy. Now it is
+    held until the task finishes and its wake turn delivers."""
+    from structlog.testing import capture_logs
+
+    _settings(monkeypatch)  # 0.3 s idle grace, well under the 1.2 s task
+    with capture_logs() as logs:
+        runner, events = await _run("fg_task_backgrounded", wake_s=1.2)
+    finals = [e for e in events if isinstance(e, TurnEvent) and e.phase == "completed"]
+    assert [f.answer for f in finals] == ["COPY DONE"]
+    state = _engine_state(runner)
+    assert state.tasks["f1"].status == "completed"  # finished, not killed
+    assert state.live_close_reason == "idle_no_tasks"
+    closes = _events(logs, "claude.live_session.stdin_closed")
+    ended = next(
+        e
+        for e in logs
+        if e.get("event") == "claude.task.ended" and e.get("task_id") == "f1"
+    )
+    assert len(closes) == 1 and logs.index(ended) < logs.index(closes[0])
+    assert not quarantine.is_quarantined("claude", SID)

@@ -27,10 +27,12 @@ _PLAN_EXIT_APPROVED: set[str]                          # #283 diff-preview skip 
 _PENDING_ASK_REQUESTS: dict[str, tuple[int, str]]       # request_id -> (channel_id, question)
 _HANDLED_REQUESTS: dict[str, HandledControl | None]    # #685: answered/cancelled/expired record (action, outcome, channel)
 _INFLIGHT_CONTROL_RESPONSES: dict[str, str]            # #685: request_id -> claim owner while a tap is being written
+_REQUEST_TO_CHANNEL: dict[str, int]                    # #388: request_id -> chat its buttons were posted in (bind after every _REQUEST_TO_SESSION[...] =)
 _CANCELLED_DURING_WRITE: set[str]                      # #684: CLI withdrew the request while a tap was mid-write
 ```
 
 - Register on first `system.init` event (when session_id is known)
+- Every `can_use_tool` request logs INFO `control_request.received` (`request_id`, `tool_name`, `session_id`, `permission_mode`) before any branch decides it (#822); housekeeping subtypes don't. Keyboard / write / tap logs carry `tool_name` too — never `tool_input`
 - Clean up all registries in the `finally` block of `run_impl` (including outline and approval state)
 - All control responses go through `write_control_response(session_id, request_id, approved, deny_message)`
 - Taps go through `respond_to_control_request()` (#685): `claim_control_request()` reserves the id before the dispatcher's first `await` (early-toast hook), and the result is three-way — sent / already handled (`Already answered`, silent `ℹ️` line) / not found or expired. `classify_control_request()` is channel-scoped. `send_claude_control_response()` is the bool wrapper. Never write a response without a claim

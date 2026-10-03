@@ -34,7 +34,7 @@ This line is parsed from replies and takes precedence over new directives. For b
 
 | Command | Description |
 |---------|-------------|
-| `/cancel` | Reply to the progress message to stop the current run. Also cancels pending `/at` delays, and drops a prompt still waiting in the forward-coalesce window with a `🗑️ Dropped N message(s) …` reply ([#807](https://github.com/littlebearapps/untether/issues/807)). |
+| `/cancel` | Reply to the progress message to stop the current run. Without a reply it stops the single active run (or queued job), else cancels pending `/at` delays and loops — in a forum topic only that topic's, in General only General's ([#826](https://github.com/littlebearapps/untether/issues/826)). Also drops a prompt still waiting in the forward-coalesce window with a `🗑️ Dropped N message(s) …` reply ([#807](https://github.com/littlebearapps/untether/issues/807)). |
 | `/agent` | Show/set the default engine for the current scope. |
 | `/model` | Show/set the model override for the current scope. |
 | `/reasoning` | Show/set the reasoning override for the current scope. |
@@ -49,7 +49,7 @@ This line is parsed from replies and takes precedence over new directives. For b
 | `/ctx clear` | Remove context binding. |
 | `/planmode` | Toggle Claude Code permission mode (on/plan-auto/auto/off/show/clear). `plan-auto` is plan mode with the plan gate auto-approved; `auto` is Claude Code's own classifier-gated mode. Claude Code only — non-Claude engines are directed to `/config` → Approval policy. |
 | `/usage` | Claude Code: show subscription usage (5h window, weekly, per-model). Other engines (Codex, OpenCode, …): token totals for the chat's last session of that engine — session total, last run, run count and cost where reported; quota limits aren't available from those CLIs ([#417](https://github.com/littlebearapps/untether/issues/417)). The Claude view requires Claude Code OAuth credentials (see [troubleshooting](../how-to/troubleshooting.md#macos-and-linux-credential-differences)). `/usage debug` appends a `🔧 debug` block with last-fetch wall time and freshness label, last-error class+message, OAuth token expiry, and the cumulative `claude_usage.schema_mismatch` counter ([#410](https://github.com/littlebearapps/untether/issues/410)). |
-| `/export` | Export the chat's most recently active session transcript as Markdown or JSON ([#417](https://github.com/littlebearapps/untether/issues/417)). The usage header says whether it's the last run's figure or Codex's thread total ([#859](https://github.com/littlebearapps/untether/issues/859)). |
+| `/export` | Export the chat's most recently active session transcript as a Markdown or JSON file (`/export json`), attached as a document with a one-line summary caption ([#417](https://github.com/littlebearapps/untether/issues/417), [#418](https://github.com/littlebearapps/untether/issues/418)). The usage header says whether it's the last run's figure or Codex's thread total ([#859](https://github.com/littlebearapps/untether/issues/859)). |
 | `/browse` | Browse project files with inline keyboard navigation (project chats or `default_project` only; respects `files.deny_globs` and hides dotfiles except `.github`/`.gitignore`). |
 | `/ping` | Health check — replies with uptime since last (re)start. Shows a trigger summary if triggers target the current chat (`⏸ triggers paused` while paused), and `⏳ background: N tasks running` while a live Claude Code session holds background tasks ([#777](https://github.com/littlebearapps/untether/issues/777)). |
 | `/health` | System + triggers + cost snapshot — RAM/swap, Untether process (PID, RSS, FDs, children), trigger counts, today's API cost, uptime. Compact 6-line HTML message; sections degrade gracefully when sources are unavailable. See [operations](../how-to/operations.md#health-snapshot). |
@@ -67,7 +67,7 @@ Notes:
 
 - Outside topics, `/ctx` binds the chat context.
 - In topics, `/ctx` binds the topic context.
-- `/new` cancels running tasks and clears sessions but does **not** clear a bound context.
+- `/new` cancels running tasks and clears sessions but does **not** clear a bound context. In a forum supergroup (and a private chat with topics) it only cancels the runs and loops of the topic it was sent in; `/new` in General leaves topic runs alone. Non-forum groups stay chat-wide ([#826](https://github.com/littlebearapps/untether/issues/826)).
 - `/continue` uses the engine's native "continue" flag: `--continue` (Claude, OpenCode, Pi), `resume --last` (Codex), or `--resume latest` (Gemini, deprecated).
 - Long-running tools (Bash, BashOutput, ScheduleWakeup, Monitor, …) surface a heartbeat-driven elapsed-time tail (`▸ Bash · 3m 47s · npm run build`) on the progress message after ~60s, regardless of `/verbose` state ([#481](https://github.com/littlebearapps/untether/issues/481)). Tune via `[progress] heartbeat_interval`.
 - Loop mode (Claude only): there is no `/loop` Telegram command — it's a Claude Code feature. Untether observes Claude's `ScheduleWakeup` and `CronCreate` tool calls and re-fires iterations after the subprocess exits. Off by default; opt in per chat via `/config` → 🔁 **Loop mode**. Cost protection lives in `[cost_budget]`, runaway-safety caps in `[loop]` ([#289](https://github.com/littlebearapps/untether/issues/289)).

@@ -100,7 +100,11 @@ Claude Code emits a system init event early in the stream:
   prompting one, re-arms the stage-6 approval gate.
 - Background-task subtypes (`task_started`, `task_progress`, `task_updated`,
   `task_notification`, `background_tasks_changed`) emit no Untether events;
-  they maintain the native task map (`ClaudeStreamState.tasks`).
+  they maintain the native task map (`ClaudeStreamState.tasks`). A
+  `task_updated` patch with `is_backgrounded: true` (the CLI moved a running
+  foreground task to the background) marks the task backgrounded, as does a
+  snapshot listing a known parent-owned foreground task, or its notification
+  reaching an idle parent (`claude.task.backgrounded`, #876).
 - `system/api_retry` (#792) emits one `note` action per retry sequence,
   updated in place (`🔁 API error 529 (overloaded) — retrying in 8s (attempt
   2/10)`; level `warning` on the final attempt) and latches an expected wait
@@ -109,7 +113,10 @@ Claude Code emits a system init event early in the stream:
   only with `--include-hook-events`, #812) emit no Untether events. They pair
   by `hook_id` into `ClaudeStreamState.pending_hooks`, which drives the
   live-session async-hook hold, and an idle `hook_response{outcome:"error",
-  exit_code:2}` arms the `hook_rewake` attribution for the next turn (4.5).
+  exit_code:2}` from a hook that started in an earlier turn arms the
+  `hook_rewake` attribution for the next turn (4.5); any other exit 2 (a
+  background subagent's sync denial, a `UserPromptSubmit` blocker) logs
+  `claude.hook.blocking_exit` instead (#828).
   The base runner does not let them overwrite `last_event_type`.
 - `system/informational` (#814): the safeguard notice ("…'s safeguards
   stopped the response above · continuing once …") feeds the per-turn
@@ -158,7 +165,7 @@ approval wait in the ring-buffer fallback.
 
 The top-level `rate_limit_event` line (#790) is a quota snapshot, not a
 throttle notice: `allowed` emits nothing; `allowed_warning` emits at most one
-`note` per window (`⚠️ 5h limit N% used — resets HH:MM`); only `rejected` not
+`note` per window (`⚠️ 5h limit N% used — resets HH:MM`, rendered without a ✓ prefix, #868); only `rejected` not
 covered by overage emits a `⏳ Rate limited until …` note and latches the wait
 until `resetsAt`. Bare events emit nothing. Decision table:
 [stream-json cheatsheet](stream-json-cheatsheet.md#rate_limit_event).
@@ -251,6 +258,9 @@ The terminal event looks like:
 - `origin.kind == "task-notification"` marks a turn the CLI started itself;
   it confirms a `hook_rewake` turn at its result (4.5).
 - `usage["safeguard"]` is added when the turn had a safeguard stop (4.2 E).
+- `usage["background"]` (#821) names the background agents active since the
+  previous result (`agents`, `agents_live`, `agents_ended`, `task_ids`,
+  `since_s`) — their spend is in this result's cost delta; absent when none.
 - **Resume guard:** on a resumed run, a 0-turn result (`num_turns == 0`,
   `duration_api_ms == 0`) that follows a replayed `task_notification{stopped}`
   before any assistant output is absorbed — no `completed`; the next result is
@@ -283,11 +293,13 @@ first post-result `system.init`, `system/status{"status":"compacting"}` (a
 message; `reason` comes from what preceded it: an injected line's
 `command_lifecycle.command_uuid` (`followup`), a `task_notification`
 (`task_finished`), a fresh (≤ 10 s) idle `hook_response` with exit code 2
-from a background hook (`hook_rewake`, #812; `detail.hook` / `hook_event`),
+from a background hook that outlived its turn (`hook_rewake`, #812/#828;
+`detail.hook` / `hook_event`),
 a `command_lifecycle(started)` with an unknown uuid (`scheduled_wakeup`), or a
 live Monitor task (`monitor_event`). A turn that opened `unknown` becomes
 `hook_rewake` at its result when an earlier turn's hook exited 2 during it
-and the result's `origin.kind` is `task-notification`
+(or a stale idle hint ≤ 60 s old was carried in) and the result's `origin.kind`
+is `task-notification`
 (`detail.retro_attributed`). The bridge always pushes a `hook_rewake` final
 (`🪝 Hook feedback — <event>`) and never folds it. Assistant/user
 events tagged `parent_tool_use_id` (a background subagent) never open a turn.
@@ -304,7 +316,10 @@ A turn that opened `unknown` (the CLI often starts it on a background agent's
 result before any task event) completes as `task_finished` if a top-level task
 ends during it (`detail.retro_attributed`), or is paired with a task ending
 within 30 s after it. The task's own notification turn that follows carries
-`detail.already_announced` and the bridge delivers it without a push.
+`detail.already_announced` and the bridge delivers it without a push. A
+top-level task that ends while a `task_finished` turn is open is appended to
+that turn's `detail.tasks` / `task_ids` at completion and listed in
+`detail.late_tasks` (#825); the bridge re-heads the final with every name.
 `TurnEvent(completed)` carries the turn's `detail`; a task's own
 notification turn also carries `detail.announced_turns`, the wake turn(s) its
 end was paired with, so the bridge files an unattributed ack under the right

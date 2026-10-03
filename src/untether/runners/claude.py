@@ -38,7 +38,7 @@ from ..background_status import format_tokens
 from ..config import ConfigError
 from ..events import EventFactory
 from ..logging import get_logger
-from ..markdown import _short_model_name
+from ..markdown import _short_model_name, backtick_fence, inline_code
 from ..model import (
     TURN_COMPLETE_MARKER,
     Action,
@@ -373,6 +373,15 @@ _TERMINAL_CONTROL_OUTCOMES = frozenset({"cancelled", "expired"})
 # and reads as "answered, details unknown".
 _HANDLED_REQUESTS: OrderedDict[str, HandledControl | None] = OrderedDict()
 
+# #388: request_id -> the chat its buttons were posted in (the run's chat,
+# ``get_run_channel_id()`` at registration). A tap from any other chat on a
+# pending / in-flight request reads ``NOT_FOUND`` (``channel_mismatch``) and
+# writes nothing. Only consulted while the id is still pending or claimed, so
+# an entry left behind by any of the deletion paths is inert. Bounded by
+# liveness pruning, never by evicting a live id (no fail-open under load).
+_REQUEST_TO_CHANNEL: dict[str, int] = {}
+_REQUEST_TO_CHANNEL_MAX = 512
+
 
 @dataclass(slots=True)
 class InflightClaim:
@@ -556,11 +565,24 @@ class LiveSession:
     # lifecycle has emitted its ``"closed"`` notice (once).
     close_tasks: list[str] = field(default_factory=list)
     closed_notified: bool = False
+    # #820: the last escalation ``_await_live_exit_or_force`` started
+    # (``sigint`` / ``sigterm`` / ``sigkill``), written *before* each signal so
+    # the lifecycle can say how the CLI ended even when the run's teardown
+    # cancels the await that would have returned it.
+    exit_stage: str | None = None
     # #829: when the current idle period began (the turn ended), and the
     # rate limit of ``claude.live_session.hold_rearmed`` (first re-arm of an
     # idle period, then at most every ``_hold_rearm_log_every_s``).
     idle_period_started: float | None = None
     rearm_logged_at: float | None = None
+    # #872: ``(source, task_id)`` keys already logged as
+    # ``claude.live_session.hold_extended`` this idle period (once each).
+    hold_extended_logged: set[str] = field(default_factory=set)
+    # #872: a declared wait held this idle period past the quiet-time limit.
+    # When it ends (task ended / deadline passed) the hold clock restarts, so
+    # the wake turn it was waiting for — and the hooks its prompt fires —
+    # get a fresh ``max_hold`` window instead of the long-expired one.
+    declared_wait_holding: bool = False
     # #812: background hooks still unpaired when stdin was closed (the
     # stream's view — *candidates*: frames carry no pid, so which of them is
     # still running can't be told); empty when no hook was running. The
@@ -595,6 +617,16 @@ class LiveSession:
 
 
 _LIVE_SESSIONS: dict[str, LiveSession] = {}
+
+
+def idle_live_session_count() -> int:
+    """Live sessions idle between turns and not yet closing (#838).
+
+    They still sit inside ``manage_subprocess`` (holding their MCP children),
+    so they count toward the pre-spawn concurrency ceiling; the guard names
+    them so a block while nothing visibly runs explains itself.
+    """
+    return sum(1 for s in _LIVE_SESSIONS.values() if s.idle and not s.closing)
 
 
 def get_live_session(session_id: str) -> LiveSession | None:
@@ -917,6 +949,32 @@ def _may_stop_clean(live: LiveSession) -> bool:
     session whose turn was closed when stdin was closed. If the CLI then
     exits rc 0 on SIGINT it stopped cleanly — no quarantine."""
     return live.close_reason in _STOPPED_CLEAN_REASONS and live.closed_turn_idle
+
+
+def _lifecycle_exit_reason(
+    *,
+    exit_reason: str,
+    cancelled: bool,
+    process_gone: bool,
+    closing: bool,
+    stage: str | None,
+) -> str:
+    """#820: how a live session ended, for ``lifecycle_exited``.
+
+    The run's reader cancels the task group as soon as the CLI's stdout ends,
+    so the lifecycle is usually cancelled at the await right after its own
+    close — the await's return value is lost. Classify from state that is
+    settled by the time ``finally`` runs instead: whether the process is gone,
+    whether the session was closing, and the escalation stage written before
+    each signal. ``cancelled`` is kept only for a cancellation while the CLI
+    was still running (a ``/cancel`` that gave up waiting, a drain)."""
+    if cancelled and not process_gone:
+        return "cancelled"
+    if cancelled or exit_reason == "reader_done":
+        if closing:
+            return stage or "exited_after_close"
+        return "reader_done"  # the CLI ended without a close
+    return exit_reason  # the await completed: exited_after_close|sigint|sigterm|sigkill
 
 
 def _close_grace_diag(pid: int, start: Any) -> dict[str, Any]:
@@ -1554,6 +1612,18 @@ class ClaudeStreamState:
     # #751 the first init has been compared with the request (once per
     # process: compaction re-emits `init`, live turns re-emit it too).
     permission_mode_checked: bool = False
+    # #835 the trigger source (`cron:<id>` / `webhook:<id>`) when nobody is
+    # present to answer a Telegram prompt; armed in `new_state()` from
+    # `EngineRunOptions.unattended_trigger` (control channel only). Every
+    # stage-6 request that would wait for a tap is denied instead.
+    unattended_trigger: str | None = None
+    # #835 the Untether permission mode the unattended run asked for
+    # (`plan-auto` kept distinct from `plan`; `bypassPermissions` under
+    # --dangerously-skip-permissions) — drives which approvals are denied.
+    unattended_mode: str | None = None
+    # #835 tools denied in the current turn (reset per turn, one entry per
+    # denial); finalised into `usage["unattended"]` at the result.
+    unattended_denials: list[str] = field(default_factory=list)
     # #383: the run's configured mode maps to CLI `plan` (`plan` or
     # `plan-auto`). Armed in `new_state()`; drives the approval caption.
     configured_plan_mode: bool = False
@@ -1706,7 +1776,26 @@ class ClaudeStreamState:
     # #785: top-level background tasks that ended while an ``unknown`` turn
     # was open — the CLI starts the wake turn on an agent's result before any
     # task event names it, so the turn is attributed at its completion.
+    # #825: also while a ``task_finished`` turn is open — the CLI folds a
+    # second finish into that turn, so it is added to its header.
     turn_ended_tasks: list[tuple[str, str]] = field(default_factory=list)
+    # #825 R17-821: model requests sent in the open turn (see
+    # ``turn_request_sent``), and per task in ``turn_ended_tasks`` the count when it
+    # ended. A task that ended after the turn's last request began was never
+    # seen by the model in this turn — the CLI wakes Claude for it next.
+    turn_model_requests: int = 0
+    turn_last_message_id: str | None = None
+    # #825 re-test: a request is counted when the CLI *sends* it — after a
+    # top-level tool_result — not when its first block streams back (without
+    # partial messages that's the end of a long thinking block, so a task
+    # ending mid-generation looked seen). True until that request's message
+    # id arrives, so the id doesn't count it twice.
+    turn_request_sent: bool = False
+    turn_ended_at_request: dict[str, int] = field(default_factory=dict)
+    # #825: late-ended tasks the model couldn't have seen in the turn they
+    # ended in — ``(task_id, label, at)``; the next non-empty ``unknown``
+    # turn (the CLI's wake for them) is attributed to them at completion.
+    pending_late_tasks: list[tuple[str, str, float]] = field(default_factory=list)
     # #785: tasks whose finish a wake turn already delivered; a later turn
     # opened only by their notification is the same finish, not news.
     announced_task_ids: set[str] = field(default_factory=set)
@@ -1744,6 +1833,9 @@ class ClaudeStreamState:
     # tool_use handle is cleared by its own confirmation tool_result, so it
     # can't be what holds the session.
     pending_wakeup_until: float | None = None
+    # #872: the delay that wake-up announced ("in 94s"), for the
+    # ``hold_extended`` log — set and cleared with ``pending_wakeup_until``.
+    pending_wakeup_delay_s: float | None = None
     # #776: why the live session's stdin was closed (idle_no_tasks /
     # max_hold / abs_cap / cancel / new / drain); None while still open.
     live_close_reason: str | None = None
@@ -1886,6 +1978,10 @@ class ClaudeStreamState:
     # result lands; reset on each subsequent result so that a multi-turn
     # bidirectional session re-arms the timer on every turn boundary.
     result_received_at: float | None = None
+    # #821: monotonic time of the previous result — unlike
+    # ``result_received_at`` never cleared at a turn open, so each result can
+    # tell which background agents were active since the one before it.
+    prev_result_at: float | None = None
 
     # #470: cross-layer signals from _post_result_idle_watchdog → bridge.
     # The watchdog stamps ``post_result_closed_at`` (monotonic) and
@@ -1979,9 +2075,11 @@ class ClaudeStreamState:
     # ``system/init`` (MCP servers): never hook evidence (None: not captured
     # — nothing exempt).
     cli_baseline_children: frozenset[tuple[int, int | None]] | None = None
-    # (hook name, hook event, monotonic ts) of an async hook that exited 2
-    # (the asyncRewake wake signal) while idle; the next turn opening within
-    # ``_HOOK_REWAKE_HINT_TTL_S`` is its rewake. Cleared on every turn open.
+    # (hook name, hook event, monotonic ts) of an async hook that outlived
+    # the turn it started in and exited 2 (the asyncRewake wake signal, #828)
+    # while idle; the next turn opening within ``_HOOK_REWAKE_HINT_TTL_S`` is
+    # its rewake. Cleared on every turn open (carried into ``turn_hook_hint``
+    # only within ``_HOOK_REWAKE_CARRY_TTL_S``).
     hook_rewake_hint: tuple[str | None, str | None, float] | None = None
     # The hint the open turn saw (stale at open, or an earlier turn's async
     # hook exiting 2 mid-turn) — the result's ``origin`` confirms it.
@@ -2001,11 +2099,21 @@ class ClaudeStreamState:
     # last turn.
     bg_hold_rearm_on_progress: bool = True
     bg_max_hold_s: float = 1800.0
+    # #872: mirrored from ``[watchdog] bg_hold_declared_waits`` (per spawn).
+    # On, the hold never closes before a declared wait ends
+    # (``declared_wait_until``).
+    bg_hold_declared_waits: bool = True
     # #829: background Bash output files, tool_use_id -> path, from the Bash
     # tool_result ("Output is being written to: …/tasks/<id>.output"). The
     # file grows while the command prints (P0 G4) — the only activity signal
     # a ``local_bash`` task has.
     bg_output_files: dict[str, str] = field(default_factory=dict)
+    # #872: the budget Claude declared for a background Bash — its ``timeout``
+    # with ``run_in_background`` (tool_use_id -> seconds). The CLI stops the
+    # command at that limit (30 min default, 2 h max), so the live session's
+    # hold waits for it. Never cleared by ``_clear_background_handle`` (the
+    # tool_result is only the launch confirmation), like ``bg_output_files``.
+    bg_bash_timeouts: dict[str, float] = field(default_factory=dict)
 
     # #572: set when the run's StreamResultMessage was a Stream-idle-timeout
     # failure — "type_a" (mid-generation stall, retryable) or "type_b"
@@ -3193,6 +3301,149 @@ def _translate_model_fallback(
     ]
 
 
+# #835: tools that change files or run commands. In an unattended `plan` run
+# they are denied at stage 6 — plan mode sends them to the host on current
+# CLIs (`decision_reason_type: "mode"`, the Probe-G regression), and stage 6
+# would otherwise approve them with nobody having seen a plan.
+_UNATTENDED_PLAN_DENIED_TOOLS = frozenset(
+    {"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"}
+)
+# #835: modes where the CLI resolves permissions itself, so anything that
+# still reaches stage 6 is an ask-class request — an `ask` rule, a hook's
+# `ask`, a tool that requires user interaction, a critical-path rm, or (in
+# `auto`) the classifier falling back to prompting after repeated blocks
+# (probe 2026-10-02, CLI 2.1.287: `decision_reason_type: "classifier"`).
+# `dontAsk` auto-denies anything that would prompt, so a request that still
+# reaches stage 6 under it is ask-class too — never approved unattended.
+_UNATTENDED_DENY_ALL_MODES = frozenset({"bypassPermissions", "auto", "dontAsk"})
+
+
+def _unattended_autonomous_deny_reason(
+    state: ClaudeStreamState, tool_name: str, *, diff_gate: bool
+) -> str | None:
+    """Why stage 6's autonomous auto-approve must deny in an unattended run.
+
+    ``None`` means "approve as an attended run would" (e.g. Glob in `plan`,
+    anything in `plan-auto`). Never called for attended runs' decisions.
+    """
+    if state.unattended_trigger is None:
+        return None
+    mode = state.unattended_mode
+    if mode in _UNATTENDED_DENY_ALL_MODES:
+        return "ask_class"
+    if mode == "plan" and tool_name in _UNATTENDED_PLAN_DENIED_TOOLS:
+        return "plan_mode"
+    if diff_gate:
+        return "diff_preview"
+    return None
+
+
+def _unattended_deny_message(trigger: str, tool: str, reason: str) -> str:
+    kind = "webhook" if trigger.startswith("webhook:") else "scheduled"
+    head = f"Untether: this is an unattended {kind} run ({trigger}) — "
+    if tool == "ExitPlanMode":
+        return (
+            head + "nobody can approve a plan. Do not call ExitPlanMode again. "
+            "Finish by giving the complete plan as your final answer."
+        )
+    if tool == "AskUserQuestion":
+        return (
+            head + "nobody can answer questions. Proceed with reasonable "
+            "defaults and state your assumptions."
+        )
+    if reason == "diff_preview":
+        what = f"nobody can review this change, so {tool} was denied"
+    elif reason == "plan_mode":
+        what = (
+            f"it runs in plan mode and nobody can approve a plan, so {tool} was denied"
+        )
+    else:
+        what = f"nobody is available to approve {tool}, so it was denied"
+    return (
+        head + what + ". Continue only with actions that don't need approval; "
+        "if the task can't be finished without it, stop and report what you "
+        "would have done and why it needs approval."
+    )
+
+
+def _unattended_deny(
+    state: ClaudeStreamState,
+    factory: EventFactory,
+    request_id: str,
+    request: Any,
+    *,
+    reason: str,
+) -> list[UntetherEvent]:
+    """#835: deny a request an unattended run would otherwise wait on.
+
+    Queued on ``auto_deny_queue`` (written by ``_drain_auto_deny``), never
+    registered for a tap. One ``🔒`` note row per turn; every denial logs
+    ``permission.unattended_deny`` and is counted for the final's footer.
+    """
+    trigger = state.unattended_trigger or "?"
+    if isinstance(request, claude_schema.ControlCanUseToolRequest):
+        tool = getattr(request, "tool_name", "") or "unknown"
+    else:
+        tool = type(request).__name__.replace("Control", "").replace("Request", "")
+    message = _unattended_deny_message(trigger, tool, reason)
+    if tool == "ExitPlanMode":
+        _drop_exitplanmode_plan(
+            state,
+            request_id,
+            rejected=False,
+            reason="unattended",
+            session_id=factory.resume.value if factory.resume else None,
+        )
+    _REQUEST_TO_INPUT.pop(request_id, None)
+    _REQUEST_TO_TOOL_NAME.pop(request_id, None)
+    state.auto_deny_queue.append((request_id, message))
+    state.unattended_denials.append(tool)
+    logger.warning(
+        "permission.unattended_deny",
+        tool_name=tool,
+        trigger_source=trigger,
+        session_id=factory.resume.value if factory.resume else None,
+        request_id=request_id,
+        permission_mode=state.unattended_mode,
+        effective_permission_mode=state.effective_permission_mode,
+        reason=reason,
+        turn_denials=len(state.unattended_denials),
+    )
+    if len(state.unattended_denials) > 1:
+        return []
+    title = f"\N{LOCK} Unattended run — denied {tool}: nobody to approve it"
+    state.note_seq += 1
+    action_id = f"claude.unattended_deny.{state.note_seq}"
+    detail: dict[str, Any] = {"trigger": trigger, "tool_name": tool, "reason": reason}
+    return [
+        factory.action_started(
+            action_id=action_id, kind="note", title=title, detail=detail
+        ),
+        factory.action_completed(
+            action_id=action_id,
+            kind="note",
+            title=title,
+            ok=True,
+            level="warning",
+            detail=detail,
+        ),
+    ]
+
+
+def _unattended_usage_payload(state: ClaudeStreamState) -> dict[str, Any] | None:
+    """#835 ``usage["unattended"]`` for the turn (None without denials)."""
+    if state.unattended_trigger is None or not state.unattended_denials:
+        return None
+    denied: dict[str, int] = {}
+    for tool in state.unattended_denials:
+        denied[tool] = denied.get(tool, 0) + 1
+    return {
+        "trigger": state.unattended_trigger,
+        "mode": state.unattended_mode,
+        "denied": denied,
+    }
+
+
 def _permission_mode_mismatch_rows(
     event: claude_schema.StreamSystemMessage,
     *,
@@ -3273,6 +3524,10 @@ _HOOK_NEVER_HOLD_EVENTS = frozenset({"SessionStart", "Setup"})
 # A rewake turn opens right after its hook's ``hook_response`` (P5-A: same
 # millisecond); a hint older than this is not taken as the turn's cause.
 _HOOK_REWAKE_HINT_TTL_S = 10.0
+# #828: a hint the next turn didn't open on (a slow turn start) is carried
+# into that turn for its result's ``origin`` check only this long; an older
+# hint is dropped (P5-A: hint → ``init`` is ~20 ms, so this is generous).
+_HOOK_REWAKE_CARRY_TTL_S = 60.0
 # The asyncRewake wake signal: exit code 2 (``outcome: "error"``).
 _HOOK_REWAKE_EXIT_CODE = 2
 
@@ -3294,6 +3549,12 @@ def _apply_hook_event(
     state: ClaudeStreamState, event: claude_schema.StreamSystemMessage
 ) -> None:
     """#812: track ``hook_started`` / ``hook_response`` pairs by ``hook_id``.
+
+    #828: only a hook that **outlived the turn it started in** can be an
+    asyncRewake signal — a background subagent's sync ``PreToolUse`` denial
+    (or the next turn's ``UserPromptSubmit`` blocker) starts and ends while
+    the parent idles, and the open turn's own sync hooks end inside it. Such
+    exit-2 responses log ``claude.hook.blocking_exit`` instead.
 
     Produces no UntetherEvents — hook traffic (every configured hook on every
     tool call) must never reach progress rows or the bridge's stall timers.
@@ -3338,18 +3599,27 @@ def _apply_hook_event(
     known = pending or expired or deferred
     outcome = _str_or_none(event.outcome)
     exit_code = event.exit_code
-    is_rewake_signal = (
+    exit_2 = (
         outcome == "error"
         and isinstance(exit_code, int)
         and not isinstance(exit_code, bool)
         and exit_code == _HOOK_REWAKE_EXIT_CODE
         and not _hook_never_holds(hook_event)
     )
+    # #828: it outlived its turn — started in a turn that has since closed
+    # (idle: any turn up to the last one; mid-turn: an earlier turn). A hook
+    # started while idle is tagged ``state.turn + 1`` and never qualifies;
+    # an unknown hook id (never seen / evicted) is too weak to count.
+    outlived = known is not None and (
+        known.turn < state.turn if state.turn_open else known.turn <= state.turn
+    )
+    is_rewake_signal = exit_2 and outlived
+    held_s = round(time.monotonic() - known.started_at, 1) if known else None
     if is_rewake_signal:
         hint = (name, hook_event, time.monotonic())
         if not state.turn_open:
             state.hook_rewake_hint = hint
-        elif known is not None and known.turn < state.turn:
+        else:
             # An earlier turn's async hook exited 2 after this turn opened
             # (the turn's own cause, confirmed by ``origin`` at its result).
             state.turn_hook_hint = hint
@@ -3359,11 +3629,20 @@ def _apply_hook_event(
             hook_name=name,
             hook_event=hook_event,
             turn_open=state.turn_open,
-            held_s=(
-                round(time.monotonic() - known.started_at, 1)
-                if known is not None
-                else None
-            ),
+            started_turn=known.turn if known else None,
+            held_s=held_s,
+        )
+    elif exit_2:
+        # #828: a blocking (sync) hook said no — a denial, not a rewake.
+        logger.info(
+            "claude.hook.blocking_exit",
+            session_id=session_id,
+            hook_name=name,
+            hook_event=hook_event,
+            turn_open=state.turn_open,
+            started_turn=known.turn if known else None,
+            held_s=held_s,
+            known=known is not None,
         )
     elif outcome == "cancelled":
         logger.info(
@@ -4549,6 +4828,17 @@ def _register_background_handle(
         # (see ClaudeStreamState.last_bg_bash_launched_at docstring). Used by
         # the post-result idle watchdog tick log for observability only.
         state.last_bg_bash_launched_at = time.monotonic()
+        # #872: the declared background budget (only with run_in_background —
+        # a foreground ``timeout`` is a different limit, 2-10 min, and a
+        # foreground command the CLI moves to the background gets 30 min from
+        # the move, so it keeps the quiet-time rule).
+        timeout_ms = raw_input.get("timeout")
+        if (
+            isinstance(timeout_ms, (int, float))
+            and not isinstance(timeout_ms, bool)
+            and timeout_ms > 0
+        ):
+            state.bg_bash_timeouts[tool_id] = timeout_ms / 1000.0
     elif tool_name in ("Agent", "Task") and _agent_runs_in_background(raw_input):
         state.background_observed = True
         state.live_bg_agents.add(tool_id)
@@ -4764,11 +5054,14 @@ def _observe_loop_tool_use(
     :func:`_register_background_handle` so the rc8 ScheduleWakeup
     countdown still works for short waits when Loop mode is OFF.
     """
-    from ..utils.paths import get_run_channel_id
+    from ..utils.paths import get_run_channel_id, get_run_thread_id
 
     chat_id = get_run_channel_id()
     if chat_id is None:
         return  # not in a chat-scoped run (probes, ad-hoc spawns)
+    # #826: record the run's topic so /new and /cancel in another forum topic
+    # leave this loop alone, and fires land back in the originating topic.
+    thread_id = get_run_thread_id()
     if not _loop_enabled_for_chat(chat_id):
         return  # master toggle off → behave as today
     tool_name = str(content.name or "")
@@ -4802,6 +5095,7 @@ def _observe_loop_tool_use(
                 prompt=str(prompt),
                 recurring=recurring,
                 chat_id=int(chat_id),
+                thread_id=thread_id,
                 fallback_first_user_message=state.first_user_message_text,
             )
         except loop_scheduler.LoopSchedulerError as exc:
@@ -4837,6 +5131,7 @@ def _observe_loop_tool_use(
                 delay_seconds=float(delay_seconds_raw),
                 prompt=str(prompt),
                 chat_id=int(chat_id),
+                thread_id=thread_id,
                 fallback_first_user_message=state.first_user_message_text,
             )
         except loop_scheduler.LoopSchedulerError as exc:
@@ -5146,6 +5441,71 @@ async def _bash_output_activity(state: ClaudeStreamState) -> BackgroundActivity 
     return best
 
 
+@dataclass(frozen=True, slots=True)
+class DeclaredWait:
+    """#872: a wait Claude declared — a background Bash's ``timeout``
+    (``bash_timeout``) or a pending ScheduleWakeup (``scheduled_wakeup``).
+
+    ``until`` is ``time.monotonic()`` (grace included); ``declared_s`` is the
+    budget Claude declared (the Bash ``timeout``, or the wake-up's delay from
+    the announced fire time); ``remaining_s`` is ``until - now``."""
+
+    until: float
+    source: str
+    task_id: str | None
+    declared_s: float
+    remaining_s: float
+
+
+def declared_wait_until(
+    state: ClaudeStreamState, *, grace_s: float, now: float | None = None
+) -> DeclaredWait | None:
+    """#872: the latest declared wait still running, or None.
+
+    - A live, non-Monitor ``local_bash`` task whose tool_use carried a
+      background ``timeout`` (``bg_bash_timeouts``) waits until its start +
+      that timeout + ``grace_s`` — the CLI stops the command at the timeout
+      (counted from when it entered the background) and wakes Claude.
+      Subagent-launched background Bash counts too (#801).
+    - A pending ScheduleWakeup waits until its announced fire time
+      (``pending_wakeup_until``, already graced by ``_WAKEUP_FIRE_GRACE_S``).
+
+    Pure (no I/O)."""
+    if now is None:
+        now = time.monotonic()
+    best: DeclaredWait | None = None
+    for task in _live_native_tasks(state):
+        if task.task_type != "local_bash" or _is_native_monitor(state, task):
+            continue
+        timeout_s = state.bg_bash_timeouts.get(task.tool_use_id or "")
+        if not timeout_s:
+            continue
+        until = task.started_at + timeout_s + grace_s
+        if until > now and (best is None or until > best.until):
+            best = DeclaredWait(
+                until=until,
+                source="bash_timeout",
+                task_id=task.task_id,
+                declared_s=timeout_s,
+                remaining_s=until - now,
+            )
+    if _has_pending_wakeup(state) and state.pending_wakeup_until is not None:
+        until = state.pending_wakeup_until
+        if until > now and (best is None or until > best.until):
+            best = DeclaredWait(
+                until=until,
+                source="scheduled_wakeup",
+                task_id=None,
+                declared_s=(
+                    state.pending_wakeup_delay_s
+                    if state.pending_wakeup_delay_s is not None
+                    else max(0.0, until - _WAKEUP_FIRE_GRACE_S - now)
+                ),
+                remaining_s=until - now,
+            )
+    return best
+
+
 def background_task_summary(state: ClaudeStreamState) -> str | None:
     """Return a compact "⏳ 2 watchers · 1 bg task" summary or None if empty.
 
@@ -5168,6 +5528,9 @@ def background_task_summary(state: ClaudeStreamState) -> str | None:
 # taken to be what that turn answered (nsd evidence: ~8 s between the turn's
 # result and the task's ``background_tasks_changed`` end).
 _WAKE_PAIR_WINDOW_S = 30.0
+# #825: how long a late task the model didn't see stays pending for the
+# wake turn the CLI starts for it (R17-821: 9 s, after an empty turn).
+_LATE_TASK_CARRY_S = 120.0
 
 
 def _is_top_level_background(task: ClaudeTask) -> bool:
@@ -5184,16 +5547,21 @@ def _note_task_end(state: ClaudeStreamState, task: ClaudeTask) -> None:
     """#785: attribute a top-level background task's end to the wake turn it
     belongs to — the open ``unknown`` turn (retro-attributed at completion)
     or an ``unknown`` turn that completed moments ago (paired: the task's own
-    notification turn that follows is then flagged as already announced)."""
+    notification turn that follows is then flagged as already announced).
+    #825: a task ending while a ``task_finished`` turn is open (one it didn't
+    open) is collected too and added to that turn's header at completion."""
     if not state.live_mode or state.completed_turns == 0:
         return
     if not _is_top_level_background(task) or task.task_id in state.announced_task_ids:
         return
     if state.turn_open:
-        if state.turn_reason == "unknown" and all(
-            task.task_id != tid for tid, _ in state.turn_ended_tasks
+        if (
+            state.turn_reason in ("unknown", "task_finished")
+            and task.task_id not in state.turn_detail.get("task_ids", [])
+            and all(task.task_id != tid for tid, _ in state.turn_ended_tasks)
         ):
             state.turn_ended_tasks.append((task.task_id, _task_label(task)))
+            state.turn_ended_at_request[task.task_id] = state.turn_model_requests
         return
     at = state.unattributed_turn_completed_at
     if at is None:
@@ -5211,6 +5579,59 @@ def _note_task_end(state: ClaudeStreamState, task: ClaudeTask) -> None:
         description=_task_label(task)[:80],
         gap_s=round(gap, 1),
     )
+
+
+def _seen_late_tasks(
+    state: ClaudeStreamState,
+    event: claude_schema.StreamResultMessage,
+    detail: dict[str, Any],
+) -> list[tuple[str, str]]:
+    """#825: the tasks that ended during this ``task_finished`` turn (and
+    don't already label it) *and* that the model could have seen in it.
+
+    The CLI hands a finished task's notification to the model at its next
+    request; a task that ended after the turn's last request began (R17-821:
+    124 ms before the result, the body already saying "B is still running")
+    gets a wake turn of its own instead. Those are kept in
+    ``pending_late_tasks`` for that turn rather than named here."""
+    late = [
+        (tid, label)
+        for tid, label in state.turn_ended_tasks
+        if tid not in detail.get("task_ids", [])
+    ]
+    seen: list[tuple[str, str]] = []
+    unseen: list[tuple[str, str]] = []
+    for tid, label in late:
+        ended_at = state.turn_ended_at_request.get(tid)
+        if ended_at is None or state.turn_model_requests > ended_at:
+            seen.append((tid, label))
+        else:
+            unseen.append((tid, label))
+    if unseen:
+        now = time.monotonic()
+        state.pending_late_tasks.extend((tid, label, now) for tid, label in unseen)
+        logger.info(
+            "claude.turn.late_tasks_deferred",
+            session_id=event.session_id,
+            turn=state.turn,
+            task_ids=[tid for tid, _ in unseen],
+            model_requests=state.turn_model_requests,
+        )
+    return seen
+
+
+def _take_pending_late_tasks(state: ClaudeStreamState) -> list[tuple[str, str]]:
+    """#825: the deferred late tasks still waiting for their wake turn
+    (not announced since, not older than ``_LATE_TASK_CARRY_S``); clears
+    the list."""
+    now = time.monotonic()
+    carried = [
+        (tid, label)
+        for tid, label, at in state.pending_late_tasks
+        if tid not in state.announced_task_ids and now - at <= _LATE_TASK_CARRY_S
+    ]
+    state.pending_late_tasks = []
+    return carried
 
 
 def _notification_labels_turn(
@@ -5303,6 +5724,30 @@ def _revive_task(
             round(task.started_at - ended_at, 1) if ended_at is not None else None
         ),
         revived_count=task.revived_count,
+        description=(task.description or "")[:80],
+        source=source,
+    )
+
+
+def _mark_backgrounded(state: ClaudeStreamState, task: ClaudeTask, source: str) -> None:
+    """#825/#876: the CLI moved a running foreground task to the background
+    (a foreground command past its ``timeout``, a message arriving while it
+    ran, Ctrl+B, an agent's ``autoBackgroundMs``). It now holds the live
+    session (#776) and — when the parent launched it — labels its wake turn.
+    ``source``: ``task_updated`` (``patch.is_backgrounded``), ``snapshot``
+    (listed in ``background_tasks_changed``) or ``idle_notification`` (its
+    notification reached an idle parent, which a foreground tool can't)."""
+    if task.is_backgrounded:
+        return
+    task.is_backgrounded = True
+    if task.holds_session:
+        state.background_observed = True
+        _stamp_progress(task, "task_started")  # #829: it is running now
+    logger.info(
+        "claude.task.backgrounded",
+        task_id=task.task_id,
+        task_type=task.task_type,
+        owned_by_subagent=task.owned_by_subagent,
         description=(task.description or "")[:80],
         source=source,
     )
@@ -5406,6 +5851,15 @@ def _apply_task_event(
                         status=known.status,
                         ended_ago_s=round(now - known.ended_at, 1),
                     )
+            elif (
+                known is not None
+                and not known.is_backgrounded
+                and not known.owned_by_subagent
+                and known.status in _TASK_LIVE_STATUSES
+            ):
+                # #825/#876: the parent's own background list now names a
+                # task it started in the foreground — the CLI moved it.
+                _mark_backgrounded(state, known, "snapshot")
             elif known is None:
                 # The snapshot lands a moment before task_started; register a
                 # background placeholder so the gap can't read as "idle".
@@ -5479,6 +5933,16 @@ def _apply_task_event(
             task.last_step = event.description
         return
     if subtype == "task_updated":
+        backgrounded = (event.patch or {}).get("is_backgrounded")
+        if backgrounded is True:
+            # #825/#876: the CLI's own foreground→background transition.
+            _mark_backgrounded(state, task, "task_updated")
+        elif backgrounded is False and task.is_backgrounded:
+            # The CLI's truth; not seen in practice.
+            task.is_backgrounded = False
+            logger.debug(
+                "claude.task.foregrounded", task_id=task.task_id, source="task_updated"
+            )
         status = (event.patch or {}).get("status")
         if isinstance(status, str) and status not in _TASK_LIVE_STATUSES:
             _end_task(state, task, status, "task_updated")
@@ -5530,15 +5994,14 @@ def _format_diff_preview(tool_name: str, tool_input: dict[str, Any]) -> str:
             return text[: max_len - 1] + "…"
         return text
 
-    def _fenced(lines: list[str]) -> str:
+    def _fenced(lines: list[str], info: str = "diff") -> str:
         # The approval text is rendered as Markdown: bare ``+ x`` lines
         # became ``- x`` list items (an added line shown as removed) and the
         # lines ran together. A fenced block keeps them verbatim; the fence
         # outruns any backtick run in the content so it can't close early.
         body = "\n".join(lines)
-        longest = max((len(m) for m in re.findall(r"`+", body)), default=0)
-        fence = "`" * max(3, longest + 1)
-        return f"{fence}diff\n{body}\n{fence}"
+        fence = backtick_fence(body, minimum=3)
+        return f"{fence}{info}\n{body}\n{fence}"
 
     if tool_name == "Edit":
         file_path = tool_input.get("file_path", "")
@@ -5583,9 +6046,15 @@ def _format_diff_preview(tool_name: str, tool_input: dict[str, Any]) -> str:
 
     if tool_name == "Bash":
         command = tool_input.get("command", "")
-        if command:
-            return f"$ {_truncate(command, 200)}"
-        return ""
+        if not command:
+            return ""
+        shown = _truncate(command.strip("\n"), 200)
+        # #871: the command the user approves must survive Markdown: a
+        # single line becomes a backtick-safe code span; a multi-line
+        # command (heredoc, script) keeps its lines in a fenced block.
+        if len(shown.splitlines()) > 1:
+            return f"$\n{_fenced(shown.splitlines(), info='sh')}"
+        return f"$ {inline_code(shown)}"
 
     return ""
 
@@ -6207,6 +6676,46 @@ def _usage_payload(event: claude_schema.StreamResultMessage) -> dict[str, Any]:
     return usage
 
 
+# #821: at most this many task ids ride on ``usage["background"]``.
+_BACKGROUND_USAGE_MAX_IDS = 10
+
+
+def _background_usage(
+    state: ClaudeStreamState, now: float | None = None
+) -> dict[str, Any] | None:
+    """#821: the background agents active since the previous result — their
+    spend is in this result's cost delta (``total_cost_usd`` counts subagent
+    requests, with no per-agent breakdown). Active = a backgrounded
+    ``local_agent`` (top-level or nested) still live, or that ended or showed
+    activity after the previous result (every agent, for the run's first
+    result). None when there are none."""
+    if now is None:
+        now = time.monotonic()
+    prev = state.prev_result_at
+    active = [
+        task
+        for task in state.tasks.values()
+        if task.task_type == "local_agent"
+        and task.is_backgrounded
+        and (
+            task.ended_at is None
+            or prev is None
+            or task.ended_at > prev
+            or task.last_progress_at > prev
+        )
+    ]
+    if not active:
+        return None
+    live = sum(1 for task in active if task.ended_at is None)
+    return {
+        "agents": len(active),
+        "agents_live": live,
+        "agents_ended": len(active) - live,
+        "task_ids": [task.task_id for task in active][:_BACKGROUND_USAGE_MAX_IDS],
+        "since_s": None if prev is None else round(now - prev, 1),
+    }
+
+
 def _capture_orphan_descendants(
     state: ClaudeStreamState, *, source: str, pid: int | None = None
 ) -> None:
@@ -6306,6 +6815,7 @@ def _note_pending_wakeup(
     until = fire_at + _WAKEUP_FIRE_GRACE_S
     if state.pending_wakeup_until is None or until > state.pending_wakeup_until:
         state.pending_wakeup_until = until
+        state.pending_wakeup_delay_s = max(0.0, fire_at - now)
 
 
 def _has_pending_wakeup(state: ClaudeStreamState) -> bool:
@@ -6414,6 +6924,7 @@ def _open_followup_turn(
         detail.update(_task_attribution(state, [t.task_id for t in monitors]))
     if reason == "scheduled_wakeup":
         state.pending_wakeup_until = None
+        state.pending_wakeup_delay_s = None
     if reason == "followup" and command_uuid is not None:
         state.awaiting_injected.pop(command_uuid, None)
     # #383 C4: this turn runs unplanned because the approved plan's agents
@@ -6435,14 +6946,32 @@ def _open_followup_turn(
     state.turn_notifications = []
     state.turn_notification_ids = []
     state.turn_ended_tasks = []
+    state.turn_model_requests = 0
+    state.turn_last_message_id = None
+    state.turn_request_sent = False
+    state.turn_ended_at_request = {}
     state.turn_detail = detail
     state.unattributed_turn_completed_at = None
     # #812: a stale hint (a slow turn start) is kept for the result's
-    # ``origin`` check; either way the idle-time hint is spent.
-    state.turn_hook_hint = None if reason == "hook_rewake" else state.hook_rewake_hint
+    # ``origin`` check — #828: only within ``_HOOK_REWAKE_CARRY_TTL_S``;
+    # either way the idle-time hint is spent.
+    carried = None if reason == "hook_rewake" else state.hook_rewake_hint
+    if carried is not None:
+        age_s = time.monotonic() - carried[2]
+        if age_s > _HOOK_REWAKE_CARRY_TTL_S:
+            logger.debug(
+                "claude.hook.rewake_hint_expired",
+                session_id=factory.resume.value if factory.resume else None,
+                hook_name=carried[0],
+                hook_event=carried[1],
+                age_s=round(age_s, 1),
+            )
+            carried = None
+    state.turn_hook_hint = carried
     state.hook_rewake_hint = None
     # Per-turn scalars (see their field docs) start fresh for the new turn.
     state.safeguard = SafeguardTurn()
+    state.unattended_denials = []  # #835
     state.last_assistant_text = None
     state.last_exitplanmode_plan = None
     state.last_schedule_wakeup_arm_delay = None
@@ -6617,6 +7146,16 @@ def translate_claude_event(
         case claude_schema.StreamSystemMessage(subtype=subtype):
             if subtype == "task_notification" and not state.turn_open:
                 task = state.tasks.get(event.task_id or "")
+                if (
+                    task is not None
+                    and not task.is_backgrounded
+                    and not task.owned_by_subagent
+                ):
+                    # #825/#876 fallback: the parent's own foreground tool
+                    # can't outlive its turn unless the CLI backgrounded it.
+                    # (A subagent's foreground task stays ignored — the #785
+                    # nsd wrong-name guard.)
+                    _mark_backgrounded(state, task, "idle_notification")
                 if _notification_labels_turn(event, task):
                     label = event.summary or event.description
                     if task is not None and task.description:
@@ -6696,6 +7235,28 @@ def translate_claude_event(
                     turn=state.turn,
                     task_ids=[tid for tid, _ in state.turn_ended_tasks],
                 )
+            elif state.turn_reason == "task_finished" and (
+                late := _seen_late_tasks(state, event, detail)
+            ):
+                # #825: another task finished while this wake turn ran — the
+                # CLI folded its notification into the turn, so name it too.
+                detail["tasks"] = [
+                    *detail.get("tasks", []),
+                    *(label for _, label in late),
+                ]
+                detail["task_ids"] = [
+                    *detail.get("task_ids", []),
+                    *(tid for tid, _ in late),
+                ]
+                detail["late_tasks"] = [label for _, label in late]
+                detail.pop("already_announced", None)  # a new finish is news
+                _mark_announced(state, (tid for tid, _ in late))
+                logger.info(
+                    "claude.turn.late_tasks_attributed",
+                    session_id=event.session_id,
+                    turn=state.turn,
+                    task_ids=[tid for tid, _ in late],
+                )
             elif (
                 state.turn_reason == "unknown"
                 and (hook_hint := state.turn_hook_hint) is not None
@@ -6716,6 +7277,27 @@ def translate_claude_event(
                     hook_name=hook_hint[0],
                     hook_event=hook_hint[1],
                     attributed="result",
+                )
+            elif (
+                state.turn_reason == "unknown"
+                and event.num_turns > 0
+                and (completed is not None and completed.answer.strip())
+                and (carried := _take_pending_late_tasks(state))
+            ):
+                # #825 R17-821: the CLI's wake turn for a task that ended too
+                # late for the previous turn to see — it opened before any
+                # task event named it (the end was already consumed).
+                ids = [tid for tid, _ in carried]
+                detail["tasks"] = [label for _, label in carried]
+                detail["retro_attributed"] = True
+                detail.update(_task_attribution(state, ids))
+                _mark_announced(state, ids)
+                state.turn_reason = "task_finished"
+                logger.info(
+                    "claude.turn.late_tasks_carried",
+                    session_id=event.session_id,
+                    turn=state.turn,
+                    task_ids=ids,
                 )
             state.turn_hook_hint = None
             state.turn_ended_tasks = []
@@ -6759,6 +7341,31 @@ def translate_claude_event(
                 return []
             if not state.turn_open and not _is_tool_result_only(event):
                 out.extend(_open_turn_events(state, factory))
+            if (
+                state.turn_open
+                and isinstance(event, claude_schema.StreamAssistantMessage)
+                and event.parent_tool_use_id is None
+                and (message_id := event.message.id)
+                and message_id != state.turn_last_message_id
+            ):
+                # #825: one more model request in this turn — unless it
+                # was already counted when the CLI sent it (below).
+                state.turn_last_message_id = message_id
+                if state.turn_request_sent:
+                    state.turn_request_sent = False
+                else:
+                    state.turn_model_requests += 1
+            elif (
+                state.turn_open
+                and isinstance(event, claude_schema.StreamUserMessage)
+                and event.parent_tool_use_id is None
+                and not state.turn_request_sent
+                and _is_tool_result_only(event)
+            ):
+                # #825: the CLI sends the next request with this tool result,
+                # and with it any task notification queued so far.
+                state.turn_request_sent = True
+                state.turn_model_requests += 1
             out.extend(
                 evt
                 for evt in _translate_claude_event_base(
@@ -7091,6 +7698,9 @@ def _translate_claude_event_base(
             # CompletedEvent and a live turn's TurnEvent — D-12.
             if (safeguard := _finalize_safeguard_turn(state, factory)) is not None:
                 usage["safeguard"] = safeguard
+            # #835: the turn's unattended denials, for the final's footer.
+            if (unattended := _unattended_usage_payload(state)) is not None:
+                usage["unattended"] = unattended
             if event.terminal_reason in claude_schema.CLAUDE_ABORTED_TERMINAL_REASONS:
                 # #806: an interrupted turn — the bridge renders it as
                 # cancelled rather than as an answer / error.
@@ -7108,6 +7718,11 @@ def _translate_claude_event_base(
             if (compaction := _compaction_usage(state, event)) is not None:
                 usage["compaction"] = compaction
             _reset_compaction_segment(state)
+            # #821: which background agents' spend this cost delta includes.
+            result_at = time.monotonic()
+            if (background := _background_usage(state, result_at)) is not None:
+                usage["background"] = background
+            state.prev_result_at = result_at
 
             # #572: record the stream-idle classification so the bridge's
             # bounded auto-retry gate can read it via engine_state duck-typing.
@@ -7211,6 +7826,20 @@ def _translate_claude_event_base(
                 state.auto_approve_queue.append(request_id)
                 return []
 
+            # #822: one INFO line per tool request reaching Untether, before
+            # any branch decides it, so auto-approved / auto-denied requests
+            # are attributable too (join on request_id with the outcome
+            # lines). Name only — never the tool input.
+            if isinstance(request, claude_schema.ControlCanUseToolRequest):
+                logger.info(
+                    "control_request.received",
+                    request_id=request_id,
+                    tool_name=getattr(request, "tool_name", None),
+                    session_id=factory.resume.value if factory.resume else None,
+                    permission_mode=state.effective_permission_mode,
+                    unattended=state.unattended_trigger,  # #835
+                )
+
             # #793: record every ExitPlanMode plan body against its request;
             # the approval paths below (and write_control_response) promote
             # it, every denial path drops it.
@@ -7256,12 +7885,26 @@ def _translate_claude_event_base(
                     plan_approved = (
                         session_id is not None and session_id in _PLAN_EXIT_APPROVED
                     )
-                    if (
+                    diff_gate = bool(
                         run_opts
                         and run_opts.diff_preview is True
                         and tool_name in _DIFF_PREVIEW_TOOLS
                         and not plan_approved
-                    ):
+                    )
+                    # #835: an unattended run never waits for a tap and never
+                    # approves what an attended run would have asked about.
+                    unattended_reason = _unattended_autonomous_deny_reason(
+                        state, tool_name, diff_gate=diff_gate
+                    )
+                    if unattended_reason is not None:
+                        return _unattended_deny(
+                            state,
+                            factory,
+                            request_id,
+                            request,
+                            reason=unattended_reason,
+                        )
+                    if diff_gate:
                         logger.debug(
                             "control_request.diff_preview_gate",
                             request_id=request_id,
@@ -7349,6 +7992,15 @@ def _translate_claude_event_base(
                         state.auto_approve_queue.append(request_id)
                         return []
 
+            # #835: everything still unresolved here would wait for a Telegram
+            # tap (plan approval, question, prompting-mode tool, …). In an
+            # unattended run nobody can give it — deny now instead of holding
+            # the process (and a concurrency slot) until someone notices.
+            if state.unattended_trigger is not None:
+                return _unattended_deny(
+                    state, factory, request_id, request, reason="would_wait"
+                )
+
             # Gate ExitPlanMode while an outline is pending (Pause & Outline).
             # Both paths (outline written / not written) bypass the normal
             # 3-button flow: without this, an outline-pending retry would show
@@ -7418,6 +8070,7 @@ def _translate_claude_event_base(
                                 time.time(),
                             )
                             _REQUEST_TO_SESSION[request_id] = session_id
+                            _bind_request_channel(request_id)  # #388
                             state.control_registered_at[request_id] = time.monotonic()
                             _REQUEST_TO_INPUT[request_id] = getattr(
                                 request, "input", {}
@@ -7467,6 +8120,7 @@ def _translate_claude_event_base(
                         else:
                             button_request_id = f"da:{session_id}"
                             _REQUEST_TO_SESSION[button_request_id] = session_id
+                            _bind_request_channel(button_request_id)  # #388
                             state.control_registered_at[button_request_id] = (
                                 time.monotonic()
                             )
@@ -7510,6 +8164,7 @@ def _translate_claude_event_base(
                                     **outline_detail,
                                     "request_id": button_request_id,
                                     "request_type": "DiscussApproval",
+                                    "tool_name": "ExitPlanMode",  # #822
                                     "inline_keyboard": {
                                         "buttons": [
                                             [
@@ -7551,10 +8206,13 @@ def _translate_claude_event_base(
                     key_params = []
                     for key in ["file_path", "path", "command", "pattern"]:
                         if key in tool_input:
-                            value = str(tool_input[key])
-                            if len(value) > 50:
-                                value = value[:47] + "..."
-                            key_params.append(f"{key}={value}")
+                            # #871/#418: the title is markdown — a raw value
+                            # lost its backticks (`x` → x) and a heredoc's
+                            # newline split the title. A one-line code span
+                            # whose fence outruns any inner backtick.
+                            value = inline_code(str(tool_input[key]), width=50)
+                            if value:
+                                key_params.append(f"{key}={value}")
                     if key_params:
                         details += f" ({', '.join(key_params)})"
                 # CC4: Diff preview for Edit/Write tools (gated on per-chat setting)
@@ -7588,6 +8246,7 @@ def _translate_claude_event_base(
             if factory.resume:
                 session_id = factory.resume.value
                 _REQUEST_TO_SESSION[request_id] = session_id
+                _bind_request_channel(request_id)  # #388
                 state.control_registered_at[request_id] = time.monotonic()  # #684
                 # Store original tool input and tool name for response handling
                 if isinstance(request, claude_schema.ControlCanUseToolRequest):
@@ -7832,6 +8491,12 @@ def _translate_claude_event_base(
             detail: dict[str, Any] = {
                 "request_id": request_id,
                 "request_type": request_type,
+                # #822: names the tool on the keyboard logs (never the input).
+                "tool_name": (
+                    getattr(request, "tool_name", None)
+                    if isinstance(request, claude_schema.ControlCanUseToolRequest)
+                    else None
+                ),
                 "inline_keyboard": {
                     "buttons": button_rows,
                 },
@@ -7972,12 +8637,21 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     reason="telegram_deny" if rejects_plan else "telegram_procedural",
                     session_id=plan_session,
                 )
+        # #822: read once for both branches (both always popped it) so every
+        # write log names the tool and the CLI's effective mode — never the
+        # tool input.
+        tool_name = _REQUEST_TO_TOOL_NAME.pop(request_id, None)
+        write_log: dict[str, Any] = {
+            "tool_name": tool_name,
+            "permission_mode": (
+                plan_state.effective_permission_mode if plan_state else None
+            ),
+        }
         if approved:
             inner: dict[str, Any] = {"behavior": "allow"}
             # Claude Code CLI requires updatedInput for can_use_tool responses
             if request_id in _REQUEST_TO_INPUT:
                 inner["updatedInput"] = _REQUEST_TO_INPUT.pop(request_id)
-            tool_name = _REQUEST_TO_TOOL_NAME.pop(request_id, None)
             # After approving any plan-gated tool, bypass the diff_preview
             # gate for subsequent tools in the same session — the user has
             # already reviewed code, repeating the prompt per-tool is
@@ -7994,7 +8668,6 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             inner = {"behavior": "deny", "message": deny_message or "User denied"}
             # Clean up stored input on denial too
             _REQUEST_TO_INPUT.pop(request_id, None)
-            _REQUEST_TO_TOOL_NAME.pop(request_id, None)
         response = {
             "type": "control_response",
             "response": {
@@ -8021,6 +8694,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     approved=approved,
                     session_id=session_id,
                     channel="pipe",
+                    **write_log,
                 )
                 return True
             except (OSError, anyio.ClosedResourceError) as e:
@@ -8032,6 +8706,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     error=str(e),
                     error_type=e.__class__.__name__,
                     channel="pipe",
+                    **write_log,
                 )
                 return False
             except Exception as e:  # noqa: BLE001
@@ -8043,6 +8718,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     error=str(e),
                     error_type=e.__class__.__name__,
                     channel="pipe",
+                    **write_log,
                 )
                 return False
         elif self._pty_master_fd is not None:
@@ -8054,6 +8730,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     approved=approved,
                     session_id=session_id,
                     channel="pty",
+                    **write_log,
                 )
                 return True
             except OSError as e:
@@ -8065,6 +8742,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     error=str(e),
                     error_type=e.__class__.__name__,
                     channel="pty",
+                    **write_log,
                 )
                 return False
             except Exception as e:  # noqa: BLE001
@@ -8076,6 +8754,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     error=str(e),
                     error_type=e.__class__.__name__,
                     channel="pty",
+                    **write_log,
                 )
                 return False
         else:
@@ -8300,6 +8979,21 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 "bypassPermissions"
                 if self.dangerously_skip_permissions is True
                 else normalise_claude_cli_mode(requested_mode)
+            )
+        # #835: an unattended (cron / webhook) run denies anything that would
+        # wait for a tap. Control channel only — the legacy `-p` path has no
+        # stage 6 to gate.
+        run_opts = get_run_options()
+        if (
+            requested_mode is not None
+            and run_opts is not None
+            and run_opts.unattended_trigger is not None
+        ):
+            state.unattended_trigger = run_opts.unattended_trigger
+            state.unattended_mode = (
+                "bypassPermissions"
+                if self.dangerously_skip_permissions is True
+                else requested_mode
             )
         # #383: a plan chat — the approval caption and the plan re-arm key
         # off the configured mode, never the CLI's current one.
@@ -8787,6 +9481,10 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     # #829: ``claude.live_session.hold_rearmed`` logs the first re-arm of an
     # idle period, then at most once per this many seconds.
     _hold_rearm_log_every_s: float = 300.0
+    # #872: after a declared wait's deadline (a background Bash's ``timeout``,
+    # a wake-up's fire time) the hold waits this much longer, so the CLI's own
+    # stop notice / wake turn lands before Untether would close.
+    _declared_wait_grace_s: float = 60.0
 
     async def _live_session_lifecycle(
         self,
@@ -8811,14 +9509,20 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
           ``state.bg_hold_rearm_on_progress`` — by background activity:
           ``latest_background_progress`` while idle, and a background Bash's
           output file when the hold would expire);
+        - #872, ``state.bg_hold_declared_waits``: never before a declared wait
+          ends (``declared_wait_until``: a background Bash's ``timeout``, a
+          pending ScheduleWakeup's fire time, + ``_declared_wait_grace_s``);
         - ``abs_cap_s`` from spawn → notice + close (``abs_cap``).
         Closing stdin makes the CLI stop its tasks and exit rc=0 (F3/F4). Only
         if it doesn't exit within ``_live_close_grace_s`` does
         ``_await_live_exit_or_force`` log ``close_grace_expired`` and escalate
         (SIGINT, then SIGTERM/SIGKILL); a clean idle close is not quarantined
-        (#791).
+        (#791). ``claude.live_session.lifecycle_exited`` reports how the
+        session actually ended (``_lifecycle_exit_reason``, #820) with the
+        close reason beside it.
         """
         exit_reason = "reader_done"
+        cancelled = False
         # #829: the session this lifecycle watches — kept so the ``"closed"``
         # notice can be sent from ``finally`` on every exit path, including a
         # CLI that exits within one poll of the close.
@@ -8917,10 +9621,12 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     live.idle_since = None
                     live.hold_started = None
                     live.idle_period_started = None
+                    live.declared_wait_holding = False
                     continue
                 if live.idle_period_started is None:
                     live.idle_period_started = now
                     live.rearm_logged_at = None
+                    live.hold_extended_logged.clear()
                 if state.plan_rearm_failed:
                     # #383: the CLI refused the plan re-arm; don't let wake
                     # turns keep running unplanned. The next message resumes
@@ -8949,6 +9655,31 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     live.idle_since = now
                 live.had_live_work = live_work
                 if live_work:
+                    if (
+                        live.declared_wait_holding
+                        and declared_wait_until(
+                            state, grace_s=self._declared_wait_grace_s, now=now
+                        )
+                        is None
+                    ):
+                        # #872: the declared wait just ended. The quiet-time
+                        # clock still dates from before it, so the expired
+                        # rule would close at once — over the wake turn's
+                        # prompt and its UserPromptSubmit hook (R17-01a).
+                        # Restart it; ``abs_cap`` above still bounds it.
+                        live.declared_wait_holding = False
+                        live.hold_started = now
+                        run_logger.info(
+                            "claude.live_session.hold_rearmed",
+                            session_id=sid,
+                            source="declared_wait_ended",
+                            task_id=None,
+                            since_turn_s=(
+                                round(now - live.idle_period_started, 1)
+                                if live.idle_period_started is not None
+                                else None
+                            ),
+                        )
                     rearm = state.bg_hold_rearm_on_progress
                     if rearm and live.hold_started is not None:
                         # #829: the hold measures quiet time, not time since
@@ -8962,6 +9693,19 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                         and live.hold_started is not None
                         and now - live.hold_started >= max_hold_s
                     ):
+                        if state.bg_hold_declared_waits:
+                            # #872: a wait Claude declared (a background
+                            # Bash's ``timeout``, a pending wake-up) is not
+                            # cut short for being quiet; ``abs_cap`` above
+                            # still bounds it. ``hold_started`` is untouched,
+                            # so once it lapses the quiet-time rule applies.
+                            wait = declared_wait_until(
+                                state, grace_s=self._declared_wait_grace_s, now=now
+                            )
+                            if wait is not None:
+                                live.declared_wait_holding = True
+                                self._log_hold_extended(live, wait, run_logger, now)
+                                continue
                         if rearm:
                             # #829 fallback, only at would-expire: a
                             # background Bash that is still printing.
@@ -8977,9 +9721,19 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 if now - live.idle_since >= idle_grace_s:
                     await close_live_session(sid, "idle_no_tasks", only_if_idle=True)
         except (anyio.get_cancelled_exc_class(), KeyboardInterrupt):
-            exit_reason = "cancelled"
+            cancelled = True
             raise
         finally:
+            reason = _lifecycle_exit_reason(
+                exit_reason=exit_reason,
+                cancelled=cancelled,
+                process_gone=(
+                    reader_done.is_set()
+                    or getattr(proc, "returncode", None) is not None
+                ),
+                closing=tracked is not None and tracked.closing,
+                stage=tracked.exit_stage if tracked is not None else None,
+            )
             run_logger.info(
                 "claude.live_session.lifecycle_exited",
                 session_id=(
@@ -8987,21 +9741,20 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     if state.factory.resume is not None
                     else None
                 ),
-                reason=exit_reason,
+                reason=reason,
+                close_reason=tracked.close_reason if tracked is not None else None,
             )
             # The run's task group is cancelled as soon as the CLI's stdout
-            # ends, so "cancelled" is also the normal exit after a close —
-            # report it once the process is gone (never while it may still
-            # be running, e.g. a /cancel that gave up waiting).
+            # ends, so a cancellation is also the normal exit after a close
+            # (#820 classifies it from the settled state above). Report the
+            # close once the process is gone — never while it may still be
+            # running (``reason == "cancelled"``: e.g. a /cancel that gave up
+            # waiting).
             if (
                 tracked is not None
                 and tracked.closing
                 and not tracked.closed_notified
-                and (
-                    exit_reason != "cancelled"
-                    or reader_done.is_set()
-                    or getattr(proc, "returncode", None) is not None
-                )
+                and reason != "cancelled"
             ):
                 await self._notify_live_closed(tracked, run_logger)
 
@@ -9048,6 +9801,33 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 else None
             ),
             activity_age_s=round(max(0.0, now - activity.at), 1),
+        )
+
+    def _log_hold_extended(
+        self,
+        live: LiveSession,
+        wait: DeclaredWait,
+        run_logger: Any,
+        now: float,
+    ) -> None:
+        """#872: ``claude.live_session.hold_extended`` — once per idle period
+        per ``(source, task_id)``."""
+        key = f"{wait.source}:{wait.task_id}"
+        if key in live.hold_extended_logged:
+            return
+        live.hold_extended_logged.add(key)
+        run_logger.info(
+            "claude.live_session.hold_extended",
+            session_id=live.session_id,
+            source=wait.source,
+            task_id=wait.task_id,
+            declared_s=round(wait.declared_s, 1),
+            remaining_s=round(wait.remaining_s, 1),
+            since_turn_s=(
+                round(now - live.idle_period_started, 1)
+                if live.idle_period_started is not None
+                else None
+            ),
         )
 
     async def _notify_live_closed(self, live: LiveSession, run_logger: Any) -> None:
@@ -9193,6 +9973,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         # ends the reader, which cancels this task group; a deferred B2
         # quarantine decision must not be lost to that cancellation.
         stopped_clean = False
+        live.exit_stage = "sigint"  # #820: before the signal, not after
         with anyio.CancelScope(shield=True):
             signal_pid_group(proc.pid, signal.SIGINT)
             with anyio.move_on_after(self._live_close_sigint_grace_s):
@@ -9226,6 +10007,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         )
         if stream is not None:
             stream.sigterm_sent = True
+        live.exit_stage = "sigterm"  # #820
         signal_pid_group(proc.pid, signal.SIGTERM)
         deadline = time.monotonic() + self._subcountdown_sigterm_grace_s
         while time.monotonic() < deadline:
@@ -9233,6 +10015,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             if proc.returncode is not None:
                 return "sigterm"
         if proc.returncode is None:
+            live.exit_stage = "sigkill"  # #820
             signal_pid_group(proc.pid, signal.SIGKILL)
         return "sigkill"
 
@@ -10196,6 +10979,17 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         2. Legacy mode: -p flag with PTY stdin. Prompt passed as CLI arg.
            Stdin used only for initial payload, then kept open via PTY.
         """
+        # #838: the #350 RAM guard and #589 concurrency ceiling. This override
+        # never calls the base run_impl, so the guard must run here — first,
+        # before start_run registers the session in _ACTIVE_RUNNERS, the #812
+        # probe thread starts or a PTY opens; a block registers nothing.
+        # Live follow-ups / steers inject into an existing process and never
+        # reach run_impl, so they are never checked.
+        block_result = self._check_prespawn_ram_guard(resume)
+        if block_result is not None:
+            yield block_result
+            return
+
         state = self.new_state(prompt, resume)
         self.start_run(prompt, resume, state=state)
 
@@ -10408,6 +11202,12 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                                 settings_obj.watchdog,
                                 "bg_hold_rearm_on_progress",
                                 True,
+                            )
+                        )
+                        # #872: read per spawn like its siblings.
+                        state.bg_hold_declared_waits = bool(
+                            getattr(
+                                settings_obj.watchdog, "bg_hold_declared_waits", True
                             )
                         )
                 except Exception:  # noqa: BLE001 — settings errors must not block a run
@@ -10776,6 +11576,8 @@ class ControlSendResult:
     session_id: str | None = None
     prior: HandledControl | None = None
     reason: str | None = None
+    # #822: the tool the request was for (logged on claude_control.sent).
+    tool_name: str | None = None
 
 
 def mark_request_handled(
@@ -10823,6 +11625,36 @@ def mark_request_handled(
         _HANDLED_REQUESTS.popitem(last=False)
 
 
+def _bind_request_channel(request_id: str) -> None:
+    """Bind a just-registered request to the run's chat (#388).
+
+    Called right after every ``_REQUEST_TO_SESSION[...] =`` registration
+    (pinned by a structural test). No run chat (tests, legacy) → unbound,
+    which keeps the pre-#388 behaviour for that id.
+    """
+    channel = get_run_channel_id()
+    _REQUEST_TO_CHANNEL.pop(request_id, None)
+    if channel is None:
+        return
+    _REQUEST_TO_CHANNEL[request_id] = channel
+    if len(_REQUEST_TO_CHANNEL) > _REQUEST_TO_CHANNEL_MAX:
+        # Liveness pruning: drop entries no longer pending or claimed; a
+        # live binding is never evicted.
+        for rid in [
+            rid
+            for rid in _REQUEST_TO_CHANNEL
+            if rid not in _REQUEST_TO_SESSION and rid not in _INFLIGHT_CONTROL_RESPONSES
+        ]:
+            del _REQUEST_TO_CHANNEL[rid]
+
+
+def control_request_origin(request_id: str) -> int | None:
+    """The chat a pending / claimed request is bound to (#388), or None."""
+    if request_id in _REQUEST_TO_SESSION or request_id in _INFLIGHT_CONTROL_RESPONSES:
+        return _REQUEST_TO_CHANNEL.get(request_id)
+    return None
+
+
 def classify_control_request(
     request_id: str, *, channel_id: int | None = None
 ) -> ControlLookup:
@@ -10832,7 +11664,18 @@ def classify_control_request(
     handled record → ``CANCELLED`` / ``ALREADY_HANDLED``; else ``NOT_FOUND``.
     A handled record from another chat reads ``NOT_FOUND`` (reason
     ``channel_mismatch``) — one chat can't read another's resolution (#715).
+
+    #388: checked first, a pending or in-flight request bound to another chat
+    also reads ``NOT_FOUND`` (``channel_mismatch``) — a forged callback from
+    a different chat can't answer it, and learns nothing (not even "being
+    handled"). ``channel_id=None`` (internal callers) skips the check.
     """
+    if channel_id is not None:
+        origin = control_request_origin(request_id)
+        if origin is not None and origin != channel_id:
+            return ControlLookup(
+                ControlRequestStatus.NOT_FOUND, reason="channel_mismatch"
+            )
     claim = _INFLIGHT_CONTROL_RESPONSES.get(request_id)
     if claim is not None:
         return ControlLookup(
@@ -10845,6 +11688,14 @@ def classify_control_request(
             ),
         )
     if request_id in _REQUEST_TO_SESSION:
+        if channel_id is not None and request_id not in _REQUEST_TO_CHANNEL:
+            # #388: a registration site that forgot _bind_request_channel
+            # (or a run without a chat) would silently reopen the gap.
+            logger.debug(
+                "claude_control.origin_unbound",
+                request_id=request_id,
+                channel_id=channel_id,
+            )
         return ControlLookup(ControlRequestStatus.PENDING)
     if request_id in _HANDLED_REQUESTS:
         record = _HANDLED_REQUESTS[request_id]
@@ -10962,6 +11813,8 @@ async def respond_to_control_request(
             prior=lookup.prior,
             reason=lookup.reason,
         )
+    # #822: read before write_control_response pops it.
+    tool_name = _REQUEST_TO_TOOL_NAME.get(request_id)
     try:
         session_id = _REQUEST_TO_SESSION[request_id]
         if session_id not in _ACTIVE_RUNNERS:
@@ -10979,6 +11832,7 @@ async def respond_to_control_request(
                 sent=False,
                 session_id=session_id,
                 reason="no_active_session",
+                tool_name=tool_name,
             )
 
         runner, _ = _ACTIVE_RUNNERS[session_id]
@@ -11003,6 +11857,7 @@ async def respond_to_control_request(
                 sent=success,
                 session_id=session_id,
                 prior=_HANDLED_REQUESTS.get(request_id),
+                tool_name=tool_name,
             )
         # A written *or* attempted write marks it handled (a closed pipe
         # means the session is gone either way).
@@ -11012,6 +11867,7 @@ async def respond_to_control_request(
             sent=success,
             session_id=session_id,
             reason=None if success else "write_failed",
+            tool_name=tool_name,
         )
     finally:
         _CANCELLED_DURING_WRITE.discard(request_id)
@@ -11124,6 +11980,7 @@ def _cleanup_session_registries(
         cleaned.append(f"requests({len(stale)})")
     for k in stale:
         del _REQUEST_TO_SESSION[k]
+        _REQUEST_TO_CHANNEL.pop(k, None)  # #388
         # #685: a claim on a request whose session is gone can never
         # complete — drop it so the id doesn't read "in flight" for ever.
         _INFLIGHT_CONTROL_RESPONSES.pop(k, None)

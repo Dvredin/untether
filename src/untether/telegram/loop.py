@@ -14,7 +14,7 @@ from ..commands import list_command_ids
 from ..config import ConfigError
 from ..config_watch import ConfigReload
 from ..config_watch import watch_config as watch_config_changes
-from ..context import RunContext
+from ..context import RunContext, attended_context, unattended_trigger
 from ..directives import DirectiveError
 from ..ids import RESERVED_CHAT_COMMANDS, RESERVED_COMMAND_IDS
 from ..logging import get_logger
@@ -69,6 +69,7 @@ from .topics import (
     _topics_chat_allowed,
     _topics_chat_project,
     _validate_topics_setup,
+    thread_filter_for,
 )
 from .types import (
     TelegramCallbackQuery,
@@ -177,46 +178,74 @@ async def _resolve_engine_run_options(
     )
 
 
-def _apply_trigger_permission_override(
+# Trigger-level fields that win over the resolved chat/topic options for a
+# trigger's own run (#330 permission_mode). Each is copied from RunContext.
+_TRIGGER_OVERRIDE_FIELDS: tuple[str, ...] = ("permission_mode", "model", "reasoning")
+
+
+def _apply_trigger_overrides(
     run_options: EngineRunOptions | None,
     context: RunContext | None,
     *,
     engine: EngineId | None = None,
+    log: bool = True,
 ) -> EngineRunOptions | None:
-    """#330: apply a trigger-level `permission_mode` on top of resolved run_options.
+    """Apply a trigger's own overrides on top of resolved run_options (#330/#743).
 
-    Dispatchers populate ``RunContext.permission_mode`` from
-    ``CronConfig.permission_mode``; this helper overrides the resolved
-    per-chat/topic ``EngineRunOptions.permission_mode`` when a trigger
-    override is present. Logs once when the override actually changes the
-    effective value so staging debug is greppable.
+    Dispatchers populate ``RunContext`` from the trigger config
+    (``CronConfig.permission_mode``, …); each set field replaces the resolved
+    per-chat/topic value for that run only. This is the single applier for
+    every trigger-level option, used by ``run_job`` and by the live
+    follow-up / steer comparisons so all three see identical options.
+
+    ``log``: emit ``trigger.cron.<field>_override`` when an override changes
+    the effective value. Only ``run_job`` logs; the comparison sites pass
+    ``log=False`` so a follow-up or steer never prints a spurious override.
     """
-    if context is None or context.permission_mode is None:
+    if context is None:
         return run_options
-    previous_mode = run_options.permission_mode if run_options is not None else None
-    if run_options is None:
-        new_options = EngineRunOptions(permission_mode=context.permission_mode)
-    else:
-        from dataclasses import replace
+    fields = {
+        name: value
+        for name in _TRIGGER_OVERRIDE_FIELDS
+        if (value := getattr(context, name, None)) is not None
+    }
+    # #835: derived, not configured — the shared predicate marks cron and
+    # webhook runs so the runner denies anything that would wait for a tap.
+    # Never logged as an "override".
+    derived: dict[str, object] = {}
+    if (source := unattended_trigger(context)) is not None:
+        derived["unattended_trigger"] = source
+    if not fields and not derived:
+        return run_options
+    from dataclasses import replace
 
-        new_options = replace(run_options, permission_mode=context.permission_mode)
-    if previous_mode != context.permission_mode:
-        logger.info(
-            "trigger.cron.permission_mode_override",
-            trigger_source=context.trigger_source,
-            chat_permission_mode=previous_mode,
-            trigger_permission_mode=context.permission_mode,
-            engine=engine,
-        )
+    base = run_options if run_options is not None else EngineRunOptions()
+    if "reasoning" in fields:
+        # #743: the cron's own level replaces the chat's, so a stale chat
+        # level dropped by the resolver (#416) must not be reported as
+        # ignored for this run.
+        derived["ignored_reasoning"] = None
+    new_options = replace(base, **fields, **derived)
+    if engine is not None and "reasoning" in fields:
+        # #416 parity with the resolver and the executor, so comparisons see
+        # the same options the run is spawned with.
+        new_options = drop_unsupported_reasoning(engine, new_options)
+    if log:
+        for name, value in fields.items():
+            previous = getattr(run_options, name) if run_options is not None else None
+            if previous != value:
+                logger.info(
+                    f"trigger.cron.{name}_override",
+                    trigger_source=context.trigger_source,
+                    engine=engine,
+                    **{f"chat_{name}": previous, f"trigger_{name}": value},
+                )
     return new_options
 
 
 # #751: (trigger_source, mode) pairs already warned about, per process.
 _UNATTENDED_RISK_WARNED: set[tuple[str, str]] = set()
 _UNATTENDED_RISK_WARNED_MAX = 256
-# `at:` is excluded on purpose: a human scheduled it from the chat and is
-# around to tap (Decision 7). `loop:` re-fires follow a human's /loop.
-_UNATTENDED_TRIGGER_PREFIXES = ("cron:", "webhook:")
 
 
 def _note_unattended_approval_risk(
@@ -226,16 +255,16 @@ def _note_unattended_approval_risk(
     engine_default_mode: Callable[[], str | None],
 ) -> None:
     """#751: warn once per (trigger, mode) when a cron or webhook run goes to
-    Claude in a mode that waits for a Telegram tap nobody is there to give.
+    Claude in a mode that asks for a Telegram tap nobody is there to give.
 
     Sees the real resolved mode — the cron's own, else the chat/topic
     preference, else engine config — which the config-time audit can't.
-    Log only: the run's approval buttons already reach the chat with a push.
+    Log only: since #835 those requests are denied at once (``outcome``).
     """
     if context is None or engine != "claude":
         return
-    source = context.trigger_source
-    if not source or not source.startswith(_UNATTENDED_TRIGGER_PREFIXES):
+    source = unattended_trigger(context)
+    if source is None:
         return
     mode = run_options.permission_mode if run_options is not None else None
     if context.permission_mode is not None:
@@ -264,6 +293,8 @@ def _note_unattended_approval_risk(
         mode=mode,
         source=origin,
         waits_for=waits_for,
+        # #835: nothing waits any more — such requests are denied at once.
+        outcome="denied",
     )
 
 
@@ -490,7 +521,13 @@ def _dispatch_builtin_command(
             async def _stateless_new() -> None:
                 from .commands.topics import _cancel_chat_tasks
 
-                cancelled = _cancel_chat_tasks(msg.chat_id, ctx.running_tasks)
+                # #826: a forum topic's /new only cancels that topic's runs.
+                cancelled = _cancel_chat_tasks(
+                    msg.chat_id,
+                    ctx.running_tasks,
+                    thread_filter=thread_filter_for(msg),
+                    thread_id=msg.thread_id,
+                )
                 label = "cancelled run" if cancelled else "no stored sessions to clear"
                 await reply(text=f"{label} for this chat.")
 
@@ -1617,20 +1654,31 @@ async def send_with_resume(
             notify=False,
         )
         return
+    # #835: a human reply to a running cron/webhook turn (its progress or a
+    # wake-turn message) is the human's turn, not the trigger's — drop the
+    # trigger-only fields so it resolves attended with the chat's options.
+    context = attended_context(running_task.context)
+    if context is not running_task.context:
+        logger.info(
+            "trigger.reply_context_attended",
+            chat_id=chat_id,
+            user_msg_id=user_msg_id,
+            trigger_source=running_task.context.trigger_source,
+        )
     progress_ref = await _send_queued_progress(
         cfg,
         chat_id=chat_id,
         user_msg_id=user_msg_id,
         thread_id=thread_id,
         resume_token=resume,
-        context=running_task.context,
+        context=context,
     )
     await enqueue(
         chat_id,
         user_msg_id,
         text,
         resume,
-        running_task.context,
+        context,
         thread_id,
         session_key,
         progress_ref,
@@ -2273,12 +2321,11 @@ async def run_main_loop(
                     chat_prefs=state.chat_prefs,
                     topic_store=state.topic_store,
                 )
-                # #330: cron-level permission_mode override wins over the
-                # resolved chat/topic preference. Dispatchers populate
-                # RunContext.permission_mode from CronConfig.permission_mode;
-                # here we apply it to the per-run EngineRunOptions so the
-                # runner's _effective_permission_mode() picks it up.
-                run_options = _apply_trigger_permission_override(
+                # #330 / #743: trigger-level overrides win over the resolved
+                # chat/topic preference. Dispatchers populate RunContext from
+                # the trigger config; here they are applied to the per-run
+                # EngineRunOptions so the runner picks them up.
+                run_options = _apply_trigger_overrides(
                     run_options, context, engine=engine_for_overrides
                 )
                 _note_unattended_approval_risk(
@@ -2359,8 +2406,8 @@ async def run_main_loop(
                     chat_prefs=state.chat_prefs,
                     topic_store=state.topic_store,
                 )
-                return _apply_trigger_permission_override(
-                    options, job.context, engine=job.resume_token.engine
+                return _apply_trigger_overrides(
+                    options, job.context, engine=job.resume_token.engine, log=False
                 )
 
             scheduler = ThreadScheduler(
@@ -2698,8 +2745,8 @@ async def run_main_loop(
                         chat_prefs=state.chat_prefs,
                         topic_store=state.topic_store,
                     )
-                    return _apply_trigger_permission_override(
-                        options, resolved.context, engine=target.engine
+                    return _apply_trigger_overrides(
+                        options, resolved.context, engine=target.engine, log=False
                     )
 
                 return await maybe_steer(

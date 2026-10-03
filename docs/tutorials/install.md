@@ -30,7 +30,7 @@ Verify it's installed:
 untether --version
 ```
 
-You should see the installed version number (e.g. `0.35.4`).
+You should see the installed version number (e.g. `0.35.5`).
 
 ## 3. Install agent CLIs
 
@@ -53,7 +53,7 @@ npm install -g @anthropic-ai/claude-code
 Untether uses the official Claude Code CLI, so your existing Claude subscription applies. Run `claude` and log in with your Claude account. Untether defaults to subscription billing unless you opt into API billing in config.
 
 !!! note "macOS credentials"
-    On macOS, Claude Code stores OAuth credentials in macOS Keychain rather than a plain-text file. Untether handles both automatically — just make sure you've run `claude login` at least once before starting Untether.
+    On macOS, Claude Code stores OAuth credentials in macOS Keychain rather than a plain-text file. Untether handles both automatically — just make sure you've signed in to Claude Code at least once (run `claude` and follow the login prompt) before starting Untether.
 
 ### OpenCode
 
@@ -75,8 +75,8 @@ Pi can authenticate via a provider login or use API billing. You can log in with
 
 !!! warning "Deprecated — don't install for new setups"
 
-    Google ended Gemini CLI support for **individual and free accounts on
-    18 June 2026**, directing users to [Antigravity CLI](https://antigravity.google).
+    Google ended Gemini CLI support for **individual accounts (free, Google AI Pro and Ultra) on
+    18 June 2026** ([Google's announcement](https://developers.googleblog.com/an-important-update-transitioning-gemini-cli-to-antigravity-cli/)), directing users to [Antigravity CLI](https://antigravity.google).
     On those accounts the CLI fails to authenticate outright
     (`IneligibleTierError`). Worse, under Untether the subprocess hangs rather
     than exiting, so runs stall for ~10 minutes until the watchdog cancels them.
@@ -321,7 +321,7 @@ Untether supports three workflow modes that control how conversations continue:
 | **Workspace** | Teams, multiple projects | Forum topics, each bound to a project/branch. Independent sessions per topic. |
 | **Handoff** | Terminal-first workflow | Every message is a new run. Resume lines shown for copying to terminal. |
 
-The onboarding wizard configures this automatically based on your setup (private chat = assistant, forum group = workspace). You can change modes later by editing three settings in your config file — see [Choose a workflow mode](../how-to/choose-a-mode.md) for details.
+These are the workflows you picked between in step 7; the wizard only changes your choice if you picked workspace and the group fails the topics check, and you then choose to switch to assistant. You can change modes later by editing three settings in your config file — see [Choose a workflow mode](../how-to/choose-a-mode.md) for details.
 
 ## 11. Save your config
 
@@ -340,11 +340,12 @@ Press **y** or **Enter** to save. You'll see:
 Untether is now running and listening for messages!
 
 !!! untether "Untether"
-    🐕 untether is ready (v0.35.4)
+    🐕 **untether is ready** (v0.35.5)
 
     *default engine:* `codex`<br>
-    *installed engines:* codex<br>
-    mode: assistant
+    *installed engines:* `codex, claude` (not installed: opencode, pi, gemini, amp)<br>
+    *mode:* `assistant`<br>
+    *directories:* `none`
 
     Send a message to start, or /config for settings.
 
@@ -455,7 +456,7 @@ Your config file lives at `~/.untether/untether.toml`. The onboarding wizard pop
         scope = "auto"
         ```
 
-This config file controls all of Untether's behavior. You can edit it directly or change most settings from Telegram using the `/config` inline menu — no file editing needed.
+This config file controls all of Untether's behaviour. You can edit it directly or change most settings from Telegram using the `/config` inline menu — no file editing needed.
 
 [Full config reference →](../reference/config.md)
 

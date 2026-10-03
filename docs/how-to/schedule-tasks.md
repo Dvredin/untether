@@ -3,7 +3,7 @@
 There are several ways to run tasks on a schedule: the `/at` command for quick one-shot delays, Telegram's built-in message scheduling, Untether's trigger system (webhooks and cron), and Loop mode for Claude Code's `/loop` and `ScheduleWakeup`.
 
 !!! note "Loop mode is opt-in"
-    By default, Untether does **not** fire Claude Code's session-scoped schedules after a turn ends — the `claude --print` subprocess exits and the cron task dies with it (verified empirically against `claude` v2.1.129/2.1.132 — upstream docs claiming `--resume` restores tasks are incorrect in `--print` mode). Since v0.35.5 a Claude session stays open after its reply while a `ScheduleWakeup` is pending (up to 30 minutes), so short dynamic-loop waits fire natively and arrive as `⏰ Scheduled wake-up` messages. For anything longer, turn on **Loop mode** in `/config → 🔁 Loop mode`. See [Loop mode](#loop-mode) below.
+    By default, Untether does **not** fire Claude Code's session-scoped schedules after a turn ends — the `claude --print` subprocess exits and the cron task dies with it (verified empirically against `claude` v2.1.129/2.1.132 — upstream docs claiming `--resume` restores tasks are incorrect in `--print` mode). Since v0.35.5 a Claude session stays open after its reply while a `ScheduleWakeup` is pending (up to the 30-minute background hold, `[watchdog] post_result_bg_max_hold`), so short dynamic-loop waits fire natively and arrive as `⏰ Scheduled wake-up` messages. For anything longer, turn on **Loop mode** in `/config → 🔁 Loop mode`. See [Loop mode](#loop-mode) below.
 
 ## One-shot delays with /at
 
@@ -67,7 +67,7 @@ Autonomous loops consume API credits or your Claude subscription quota. A 24-hou
 
 ### Cancelling a loop
 
-`/cancel` drops all active loops for the current chat and writes a do-not-resume sentinel so the upstream session-scoped cron — if it ever survives — cannot be re-fired by Untether. `/new` does the same (treats `/new` as "wipe this chat's state").
+`/cancel` drops all active loops for the current chat **or forum topic** ([#826](https://github.com/littlebearapps/untether/issues/826)) and writes a do-not-resume sentinel so the upstream session-scoped cron — if it ever survives — cannot be re-fired by Untether. `/new` does the same (treats `/new` as "wipe this chat's — or this topic's — state"). In a forum, a loop belongs to the topic whose run created it, and its iterations are posted back in that topic.
 
 ## Telegram scheduling
 
@@ -97,14 +97,28 @@ For more control, use Untether's built-in cron system. Cron triggers fire on a s
     id = "daily-review"
     schedule = "0 9 * * 1-5"
     project = "myapp"
+    chat_id = -1001234567890  # the chat to post in — usually myapp's chat
     engine = "claude"
     prompt = "Review open PRs and summarise their status."
     ```
 
 This runs every weekday at 9:00 AM (server time) in the `myapp` project using
-Claude Code. Add `timezone = "Australia/Melbourne"` to evaluate in a specific
-timezone, or set `default_timezone` in `[triggers]` for all crons. See
+Claude Code, and posts in chat `-1001234567890`. Add
+`timezone = "Australia/Melbourne"` to evaluate in a specific timezone, or set
+`default_timezone` in `[triggers]` for all crons. See
 [Webhooks and cron](webhooks-and-cron.md#timezone) for details.
+
+!!! note "`project` doesn't choose the chat"
+    `project` sets the working directory only. Without `chat_id`, the cron
+    posts to the default `chat_id` from `[transports.telegram]`, not the
+    chat bound to `myapp`. Untether logs `trigger.cron.chat_fallback` when
+    that happens and the two chats differ ([#894](https://github.com/littlebearapps/untether/issues/894)).
+
+!!! tip "Turning triggers on needs one restart"
+    Most trigger edits hot-reload, but switching `[triggers] enabled` from
+    `false` to `true` only takes effect after a restart, because the cron
+    scheduler starts at startup. The Telegram reload notice says
+    **Restart required** when this applies.
 
 Common schedules:
 
@@ -119,9 +133,9 @@ Add `run_once = true` to fire a cron exactly once, then auto-disable. Fired stat
 
 ### Autonomous crons in plan-mode chats (Claude) {#autonomous-crons}
 
-By default a cron inherits the chat's permission mode, so if you've set `/planmode plan` on a Claude chat the scheduled run will pause for your approval too. That's rarely what you want for an 8 AM summariser that runs while you're asleep.
+By default a cron inherits the chat's permission mode, and if the chat has none, the engine default (`plan` unless you changed `[engines.claude] permission_mode`). Nobody is around to approve anything when a cron fires, so since v0.35.5rc17 an unattended Claude run **denies** anything that would wait for a tap: a plan approval, a question, or a tool the mode would ask about ([#835](https://github.com/littlebearapps/untether/issues/835)). A cron that inherits `plan` therefore ends with a plan instead of doing the work.
 
-Set `permission_mode = "auto"` on the cron to make that run autonomous without flipping the whole chat:
+**Always set an explicit `permission_mode` on a Claude cron that should act unattended.** Set `permission_mode = "auto"` (or `"bypassPermissions"`) to make that run autonomous without flipping the whole chat:
 
 ```toml
 [[triggers.crons]]
@@ -134,12 +148,55 @@ permission_mode = "auto"
 ```
 
 !!! warning "`auto` changed meaning in v0.35.5"
-    Before v0.35.5, `permission_mode = "auto"` meant plan mode with the plan gate auto-approved. It now selects Claude Code's own classifier-gated auto mode, which has no plan phase. Existing crons keep running but behave differently — set `"plan-auto"` to restore the previous behaviour. Untether logs one warning at startup, and again if a config reload changes the list, naming every engine setting and cron that uses `"auto"`. It also warns at startup about crons set to `default`, `manual`, `acceptEdits` or `plan`, which wait for a tap nobody gives, and logs the same warning when a cron or webhook fires into a chat whose mode will ask for approval.
+    Before v0.35.5, `permission_mode = "auto"` meant plan mode with the plan gate auto-approved. It now selects Claude Code's own classifier-gated auto mode, which has no plan phase. Existing crons keep running but behave differently — set `"plan-auto"` to restore the previous behaviour. Untether logs one warning at startup, and again if a config reload changes the list, naming every engine setting and cron that uses `"auto"`.
 
-!!! warning "Unattended crons and prompting modes"
-    Since v0.35.5, `default`, `manual` and `acceptEdits` really do prompt: any tool call the mode doesn't cover waits for an Approve / Deny tap ([#749](https://github.com/littlebearapps/untether/issues/749)). A cron that fires while you're away will sit on that button. For unattended crons use `plan-auto`, `auto`, `dontAsk` or `bypassPermissions`, or pre-approve the tools the job needs.
+!!! warning "Unattended runs never wait for a tap"
+    A cron or webhook run has nobody to tap Approve, so Untether denies, at once, anything that would wait for one, and tells Claude to carry on without it or stop and report what it would have done ([#835](https://github.com/littlebearapps/untether/issues/835)). The progress message shows `🔒 Unattended run — denied <tool>: nobody to approve it`, the final lists every denial once (`🔒 unattended (cron:<id>) · denied Write ×2 — nobody to approve`), and each one logs `permission.unattended_deny`. What that means per mode:
 
-Precedence (Claude): cron `permission_mode` > per-chat `/planmode` > engine config default. Every autonomous run logs `trigger.cron.permission_mode_override`. Valid values: `default` (alias `manual`), `plan`, `plan-auto`, `auto`, `acceptEdits`, `dontAsk`, `bypassPermissions`. Claude-only for now; other engines silently ignore the field ([#332](https://github.com/littlebearapps/untether/issues/332) tracks full coverage).
+    - `default`, `manual`, `acceptEdits`: any tool the mode would ask about is denied.
+    - `plan`: the plan approval is denied (the run ends with the plan as its answer), and so are `Edit`, `Write`, `MultiEdit`, `NotebookEdit` and `Bash`. Use `plan-auto` if the cron should plan and then act.
+    - `auto`, `dontAsk`, `bypassPermissions`: routine work runs as before. Only requests the CLI still asks the host about are denied — an `ask` rule, a hook that answers `ask`, a tool that needs a person, a critical-path `rm`, and auto mode falling back to asking after repeated classifier blocks.
+    - With diff preview on in the chat, a file edit that would have shown its diff for approval is denied too.
+
+    Questions (`AskUserQuestion`) are denied in every mode, with a note to proceed on reasonable defaults. `/at` runs are not affected: you scheduled them from the chat, so their buttons work as usual. A reply to an unattended run's message continues in an attended session with normal buttons.
+
+    Untether also logs `trigger.unattended_approval_risk` at startup for crons set to `default`, `manual`, `acceptEdits` or `plan`, and when a cron or webhook fires into a chat whose mode would ask (`outcome=denied`). The Telegram startup message lists such Claude crons on one line — `unattended approvals (auto-denied): cron:nightly (plan), cron:digest (inherits plan) +2 more` — including crons with no `permission_mode` when the engine default (`plan` out of the box) would ask ([#836](https://github.com/littlebearapps/untether/issues/836)). Set the mode on each listed cron to clear it. The line is built once at startup (a reload doesn't refresh it), skips spent `run_once` crons, and doesn't list webhooks, which always take their chat's mode.
+
+Precedence (Claude): cron `permission_mode` > per-chat `/planmode` > engine config default. Every autonomous run logs `trigger.cron.permission_mode_override`. Valid values: `default` (alias `manual`), `plan`, `plan-auto`, `auto`, `acceptEdits`, `dontAsk`, `bypassPermissions`. For a Codex cron, `"safe"` selects Codex's read-only sandbox for that run; the deprecated Gemini engine passes the value through as `--approval-mode`, and OpenCode, Pi and AMP ignore the field ([#332](https://github.com/littlebearapps/untether/issues/332) tracks full coverage).
+
+### Pick a model per cron
+
+A cron normally runs on the chat's `/model` and reasoning setting. Give it its own with `model` and `reasoning` (effort, for Claude) — they apply to that scheduled run only, so routine jobs in an Opus chat can run on a cheaper model without changing the chat for interactive use ([#743](https://github.com/littlebearapps/untether/issues/743)):
+
+```toml
+[[triggers.crons]]
+id = "nightly-triage"
+schedule = "0 6 * * *"
+chat_id = -1001234567890
+engine = "claude"
+model = "sonnet"
+reasoning = "low"
+permission_mode = "auto"
+prompt = "Triage new issues and reply with a summary."
+
+[[triggers.crons]]
+id = "weekly-deep-review"
+schedule = "0 9 * * 1"
+chat_id = -1001234567890
+engine = "claude"
+model = "opus"
+reasoning = "high"
+permission_mode = "plan-auto"
+prompt = "Review last week's merged PRs for design problems."
+```
+
+- **Precedence:** cron `model` / `reasoning` > the topic's or chat's `/model` and reasoning > engine config (`[engines.claude] model`) > the CLI default. Unset inherits, as before.
+- **Set `engine` too**, so the model name matches the engine that runs it (a Claude alias like `sonnet` fails on Codex).
+- `model` is free-form, like `/model set`; an unknown name fails the run with the engine's own error. It can't start with `-` or contain spaces.
+- `reasoning` must be a level the engine accepts — Claude `low`, `medium`, `high`, `xhigh`, `max`; Codex `low` … `xhigh` — checked at config load when `engine` is set. OpenCode and Pi don't take it. Some models don't support every effort level (Claude Code says the levels available depend on the model), so pair `max` with a model that has it.
+- A reply to the cron's message runs on the **chat's** model, not the cron's; if the cron's session is still open for background work it is closed and resumed with the chat's settings.
+- The footer and the `runner.completed` log show the model that actually ran; `trigger.cron.model_override` / `trigger.cron.reasoning_override` are logged when the cron's value differs from the chat's, and `/config → ⏰ Triggers` shows `model=` / `effort=` on that cron's row.
+- Webhooks can't pick a model yet ([#332](https://github.com/littlebearapps/untether/issues/332)).
 
 ## Trigger provenance and history
 

@@ -14,7 +14,7 @@ from ..commands import list_command_ids
 from ..config import ConfigError
 from ..config_watch import ConfigReload
 from ..config_watch import watch_config as watch_config_changes
-from ..context import RunContext
+from ..context import RunContext, attended_context, unattended_trigger
 from ..directives import DirectiveError
 from ..ids import RESERVED_CHAT_COMMANDS, RESERVED_COMMAND_IDS
 from ..logging import get_logger
@@ -60,6 +60,7 @@ from .context import _merge_topic_context, _usage_ctx_set, _usage_topic
 from .engine_defaults import resolve_engine_for_message
 from .engine_overrides import drop_unsupported_reasoning, merge_overrides
 from .listen_mode import resolve_listen_mode, should_trigger_run
+from .reply_context import append_reply_context, strip_reply_routing_lines
 from .steer import FOLLOWUP_COMMAND_IDS, maybe_steer, split_followup_command
 from .topic_state import TopicStateStore, resolve_state_path
 from .topics import (
@@ -69,6 +70,7 @@ from .topics import (
     _topics_chat_allowed,
     _topics_chat_project,
     _validate_topics_setup,
+    thread_filter_for,
 )
 from .types import (
     TelegramCallbackQuery,
@@ -177,46 +179,74 @@ async def _resolve_engine_run_options(
     )
 
 
-def _apply_trigger_permission_override(
+# Trigger-level fields that win over the resolved chat/topic options for a
+# trigger's own run (#330 permission_mode). Each is copied from RunContext.
+_TRIGGER_OVERRIDE_FIELDS: tuple[str, ...] = ("permission_mode", "model", "reasoning")
+
+
+def _apply_trigger_overrides(
     run_options: EngineRunOptions | None,
     context: RunContext | None,
     *,
     engine: EngineId | None = None,
+    log: bool = True,
 ) -> EngineRunOptions | None:
-    """#330: apply a trigger-level `permission_mode` on top of resolved run_options.
+    """Apply a trigger's own overrides on top of resolved run_options (#330/#743).
 
-    Dispatchers populate ``RunContext.permission_mode`` from
-    ``CronConfig.permission_mode``; this helper overrides the resolved
-    per-chat/topic ``EngineRunOptions.permission_mode`` when a trigger
-    override is present. Logs once when the override actually changes the
-    effective value so staging debug is greppable.
+    Dispatchers populate ``RunContext`` from the trigger config
+    (``CronConfig.permission_mode``, …); each set field replaces the resolved
+    per-chat/topic value for that run only. This is the single applier for
+    every trigger-level option, used by ``run_job`` and by the live
+    follow-up / steer comparisons so all three see identical options.
+
+    ``log``: emit ``trigger.cron.<field>_override`` when an override changes
+    the effective value. Only ``run_job`` logs; the comparison sites pass
+    ``log=False`` so a follow-up or steer never prints a spurious override.
     """
-    if context is None or context.permission_mode is None:
+    if context is None:
         return run_options
-    previous_mode = run_options.permission_mode if run_options is not None else None
-    if run_options is None:
-        new_options = EngineRunOptions(permission_mode=context.permission_mode)
-    else:
-        from dataclasses import replace
+    fields = {
+        name: value
+        for name in _TRIGGER_OVERRIDE_FIELDS
+        if (value := getattr(context, name, None)) is not None
+    }
+    # #835: derived, not configured — the shared predicate marks cron and
+    # webhook runs so the runner denies anything that would wait for a tap.
+    # Never logged as an "override".
+    derived: dict[str, object] = {}
+    if (source := unattended_trigger(context)) is not None:
+        derived["unattended_trigger"] = source
+    if not fields and not derived:
+        return run_options
+    from dataclasses import replace
 
-        new_options = replace(run_options, permission_mode=context.permission_mode)
-    if previous_mode != context.permission_mode:
-        logger.info(
-            "trigger.cron.permission_mode_override",
-            trigger_source=context.trigger_source,
-            chat_permission_mode=previous_mode,
-            trigger_permission_mode=context.permission_mode,
-            engine=engine,
-        )
+    base = run_options if run_options is not None else EngineRunOptions()
+    if "reasoning" in fields:
+        # #743: the cron's own level replaces the chat's, so a stale chat
+        # level dropped by the resolver (#416) must not be reported as
+        # ignored for this run.
+        derived["ignored_reasoning"] = None
+    new_options = replace(base, **fields, **derived)
+    if engine is not None and "reasoning" in fields:
+        # #416 parity with the resolver and the executor, so comparisons see
+        # the same options the run is spawned with.
+        new_options = drop_unsupported_reasoning(engine, new_options)
+    if log:
+        for name, value in fields.items():
+            previous = getattr(run_options, name) if run_options is not None else None
+            if previous != value:
+                logger.info(
+                    f"trigger.cron.{name}_override",
+                    trigger_source=context.trigger_source,
+                    engine=engine,
+                    **{f"chat_{name}": previous, f"trigger_{name}": value},
+                )
     return new_options
 
 
 # #751: (trigger_source, mode) pairs already warned about, per process.
 _UNATTENDED_RISK_WARNED: set[tuple[str, str]] = set()
 _UNATTENDED_RISK_WARNED_MAX = 256
-# `at:` is excluded on purpose: a human scheduled it from the chat and is
-# around to tap (Decision 7). `loop:` re-fires follow a human's /loop.
-_UNATTENDED_TRIGGER_PREFIXES = ("cron:", "webhook:")
 
 
 def _note_unattended_approval_risk(
@@ -226,16 +256,16 @@ def _note_unattended_approval_risk(
     engine_default_mode: Callable[[], str | None],
 ) -> None:
     """#751: warn once per (trigger, mode) when a cron or webhook run goes to
-    Claude in a mode that waits for a Telegram tap nobody is there to give.
+    Claude in a mode that asks for a Telegram tap nobody is there to give.
 
     Sees the real resolved mode — the cron's own, else the chat/topic
     preference, else engine config — which the config-time audit can't.
-    Log only: the run's approval buttons already reach the chat with a push.
+    Log only: since #835 those requests are denied at once (``outcome``).
     """
     if context is None or engine != "claude":
         return
-    source = context.trigger_source
-    if not source or not source.startswith(_UNATTENDED_TRIGGER_PREFIXES):
+    source = unattended_trigger(context)
+    if source is None:
         return
     mode = run_options.permission_mode if run_options is not None else None
     if context.permission_mode is not None:
@@ -264,6 +294,8 @@ def _note_unattended_approval_risk(
         mode=mode,
         source=origin,
         waits_for=waits_for,
+        # #835: nothing waits any more — such requests are denied at once.
+        outcome="denied",
     )
 
 
@@ -488,10 +520,20 @@ def _dispatch_builtin_command(
         else:
             # Stateless mode: just cancel running tasks and reply
             async def _stateless_new() -> None:
-                from .commands.topics import _cancel_chat_tasks
+                from .commands.topics import (
+                    _cancel_chat_tasks_counted,
+                    _cancelled_label,
+                )
 
-                cancelled = _cancel_chat_tasks(msg.chat_id, ctx.running_tasks)
-                label = "cancelled run" if cancelled else "no stored sessions to clear"
+                # #826: a forum topic's /new only cancels that topic's runs.
+                cancelled = _cancel_chat_tasks_counted(
+                    msg.chat_id,
+                    ctx.running_tasks,
+                    thread_filter=thread_filter_for(msg),
+                    thread_id=msg.thread_id,
+                )
+                # #895: an idle post-result live session is "closed", not a run.
+                label = _cancelled_label(cancelled) or "no stored sessions to clear"
                 await reply(text=f"{label} for this chat.")
 
             handler = _stateless_new
@@ -886,11 +928,33 @@ class TelegramLoopState:
     seen_update_order: deque[int]
     seen_message_keys: set[MessageKey]
     seen_messages_order: deque[MessageKey]
+    # #894: last-seen ``[triggers] enabled`` (startup, then each reload) so a
+    # reload flipping it on is flagged restart-required exactly once. A
+    # failed startup init resets it to False (nothing is running).
+    triggers_enabled: bool = False
+    # #894: ``trigger.*.chat_fallback`` findings already logged, so reloads
+    # don't repeat the warning.
+    trigger_chat_fallbacks_warned: set[TriggerChatFallback] = field(default_factory=set)
+
+
+def _triggers_enable_needs_restart(
+    *, previous: bool, current: bool, running: bool
+) -> bool:
+    """#894: whether a reload's ``[triggers] enabled`` value needs a restart.
+
+    The cron scheduler and webhook server only start at startup, so turning
+    ``enabled`` on is a no-op until restart when nothing is running. Only
+    the off→on edge is flagged (not every later reload). Turning it off is
+    hot (``TriggerManager.update`` clears every cron and route), and so is
+    turning it back on while the scheduler from startup is still running.
+    """
+    return current and not previous and not running
 
 
 if TYPE_CHECKING:
     from ..runner_bridge import RunningTasks
     from ..triggers.manager import TriggerManager
+    from ..triggers.settings import TriggerChatFallback
 
 
 _FORWARD_FIELDS = (
@@ -1289,6 +1353,8 @@ class ResumeResolver:
         topic_key: tuple[int, int] | None,
         engine_for_session: EngineId,
         prompt_text: str,
+        reply_quote_text: str | None = None,
+        reply_reference_text: str | None = None,
     ) -> ResumeDecision:
         if resume_token is not None:
             return ResumeDecision(
@@ -1299,6 +1365,14 @@ class ResumeResolver:
                 MessageRef(channel_id=chat_id, message_id=reply_id)
             )
             if running_task is not None:
+                prompt_text = append_reply_context(
+                    prompt_text,
+                    selected_quote=reply_quote_text,
+                    reply_text=strip_reply_routing_lines(
+                        reply_reference_text,
+                        is_resume_line=self._cfg.runtime.is_resume_line,
+                    ),
+                )
                 self._task_group.start_soon(
                     send_with_resume,
                     self._cfg,
@@ -1617,20 +1691,31 @@ async def send_with_resume(
             notify=False,
         )
         return
+    # #835: a human reply to a running cron/webhook turn (its progress or a
+    # wake-turn message) is the human's turn, not the trigger's — drop the
+    # trigger-only fields so it resolves attended with the chat's options.
+    context = attended_context(running_task.context)
+    if context is not running_task.context:
+        logger.info(
+            "trigger.reply_context_attended",
+            chat_id=chat_id,
+            user_msg_id=user_msg_id,
+            trigger_source=running_task.context.trigger_source,
+        )
     progress_ref = await _send_queued_progress(
         cfg,
         chat_id=chat_id,
         user_msg_id=user_msg_id,
         thread_id=thread_id,
         resume_token=resume,
-        context=running_task.context,
+        context=context,
     )
     await enqueue(
         chat_id,
         user_msg_id,
         text,
         resume,
-        running_task.context,
+        context,
         thread_id,
         session_key,
         progress_ref,
@@ -1751,6 +1836,7 @@ async def run_main_loop(
         seen_update_order=deque(),
         seen_message_keys=set(),
         seen_messages_order=deque(),
+        triggers_enabled=bool(cfg.trigger_config and cfg.trigger_config.get("enabled")),
     )
 
     def refresh_topics_scope() -> None:
@@ -1962,6 +2048,42 @@ async def run_main_loop(
                     )
                     state.transport_id = reload.settings.transport
 
+                # #894: read [triggers] once — for the restart check below
+                # (which must land before the reload notice) and for the
+                # trigger hot-reload at the end of this handler.
+                raw_triggers: object = None
+                triggers_read_error: Exception | None = None
+                try:
+                    from ..config import read_config
+
+                    raw_triggers = read_config(reload.config_path).get("triggers")
+                except (ConfigError, ValueError, TypeError, OSError) as exc:
+                    triggers_read_error = exc
+                triggers_enabled_now = isinstance(raw_triggers, dict) and bool(
+                    raw_triggers.get("enabled")
+                )
+                if triggers_read_error is None:
+                    # #894: hot-reload can't start the scheduler/server, so
+                    # flag a false→true flip as restart-required (log + the
+                    # Telegram reload notice) instead of silently doing
+                    # nothing.
+                    if _triggers_enable_needs_restart(
+                        previous=state.triggers_enabled,
+                        current=triggers_enabled_now,
+                        running=trigger_manager is not None,
+                    ):
+                        logger.warning(
+                            "config.reload.restart_required",
+                            key="triggers.enabled",
+                            hint=(
+                                "The cron scheduler and webhook server only "
+                                "start at startup; restart Untether to run "
+                                "the configured triggers."
+                            ),
+                        )
+                        _reload_restart_keys.append("triggers.enabled")
+                    state.triggers_enabled = triggers_enabled_now
+
                 # #547 axis 2 / #548: broadcast the affirmative
                 # "Hot-reloaded — No restart needed." (or, if any
                 # restart-only key was edited, the matching
@@ -1983,22 +2105,33 @@ async def run_main_loop(
                         )
 
                 # --- Hot-reload trigger configuration ---
-                if trigger_manager is not None:
+                if triggers_read_error is not None:
+                    if trigger_manager is not None:
+                        logger.warning(
+                            "config.reload.triggers_failed",
+                            error=str(triggers_read_error),
+                        )
+                elif trigger_manager is not None or triggers_enabled_now:
                     try:
-                        from ..config import read_config
                         from ..triggers.settings import (
                             TriggersSettings,
                             parse_trigger_config,
+                            warn_trigger_chat_fallbacks,
                         )
 
-                        raw_toml = read_config(reload.config_path)
-                        raw_triggers = raw_toml.get("triggers")
-                        if isinstance(raw_triggers, dict) and raw_triggers.get(
-                            "enabled"
-                        ):
+                        if isinstance(raw_triggers, dict) and triggers_enabled_now:
                             new_settings = parse_trigger_config(raw_triggers)
-                            trigger_manager.update(new_settings)
-                        else:
+                            if trigger_manager is not None:
+                                trigger_manager.update(new_settings)
+                            # #894: warn (once) about project-only triggers
+                            # that will post to the default chat.
+                            warn_trigger_chat_fallbacks(
+                                new_settings,
+                                default_chat_id=cfg.chat_id,
+                                project_chat_id=cfg.runtime.project_chat_id,
+                                warned=state.trigger_chat_fallbacks_warned,
+                            )
+                        elif trigger_manager is not None:
                             # Triggers disabled or removed — clear all.
                             trigger_manager.update(TriggersSettings())
                     except (ValueError, TypeError, OSError) as exc:
@@ -2273,12 +2406,11 @@ async def run_main_loop(
                     chat_prefs=state.chat_prefs,
                     topic_store=state.topic_store,
                 )
-                # #330: cron-level permission_mode override wins over the
-                # resolved chat/topic preference. Dispatchers populate
-                # RunContext.permission_mode from CronConfig.permission_mode;
-                # here we apply it to the per-run EngineRunOptions so the
-                # runner's _effective_permission_mode() picks it up.
-                run_options = _apply_trigger_permission_override(
+                # #330 / #743: trigger-level overrides win over the resolved
+                # chat/topic preference. Dispatchers populate RunContext from
+                # the trigger config; here they are applied to the per-run
+                # EngineRunOptions so the runner picks them up.
+                run_options = _apply_trigger_overrides(
                     run_options, context, engine=engine_for_overrides
                 )
                 _note_unattended_approval_risk(
@@ -2308,7 +2440,14 @@ async def run_main_loop(
                         on_thread_known, topic_key, chat_session_key
                     ),
                     on_resume_failed=wrap_on_resume_failed(topic_key, chat_session_key),
-                    engine_override=engine_override,
+                    # Run the engine the options and the approval audit were
+                    # resolved for: a raw ``None`` made resolve_runner fall
+                    # back to the global default, so a cron on a Claude
+                    # project with no ``engine`` ran on Codex in full auto
+                    # (rc15 integration finding).
+                    engine_override=(
+                        engine_for_overrides if resume_token is None else None
+                    ),
                     thread_id=thread_id,
                     show_resume_line=show_resume_line,
                     progress_ref=progress_ref,
@@ -2352,8 +2491,8 @@ async def run_main_loop(
                     chat_prefs=state.chat_prefs,
                     topic_store=state.topic_store,
                 )
-                return _apply_trigger_permission_override(
-                    options, job.context, engine=job.resume_token.engine
+                return _apply_trigger_overrides(
+                    options, job.context, engine=job.resume_token.engine, log=False
                 )
 
             scheduler = ThreadScheduler(
@@ -2411,10 +2550,21 @@ async def run_main_loop(
                 from ..triggers.dispatcher import TriggerDispatcher
                 from ..triggers.manager import TriggerManager
                 from ..triggers.server import run_webhook_server
-                from ..triggers.settings import parse_trigger_config
+                from ..triggers.settings import (
+                    parse_trigger_config,
+                    warn_trigger_chat_fallbacks,
+                )
 
                 try:
                     trigger_settings = parse_trigger_config(cfg.trigger_config)
+                    # #894: a project-only trigger posts to the default chat,
+                    # not the project's — warn once so it isn't a surprise.
+                    warn_trigger_chat_fallbacks(
+                        trigger_settings,
+                        default_chat_id=cfg.chat_id,
+                        project_chat_id=cfg.runtime.project_chat_id,
+                        warned=state.trigger_chat_fallbacks_warned,
+                    )
                     # #317: pass config_path so the manager can load/save
                     # the run_once fired-state alongside untether.toml.
                     trigger_manager = TriggerManager(
@@ -2461,6 +2611,10 @@ async def run_main_loop(
                         error=str(exc),
                         error_type=exc.__class__.__name__,
                     )
+                    # #894: nothing is running, so treat triggers as off —
+                    # a reload that fixes the TOML is then flagged
+                    # restart-required like an off→on flip.
+                    state.triggers_enabled = False
 
             def resolve_topic_key(
                 msg: TelegramIncomingMessage,
@@ -2586,6 +2740,11 @@ async def run_main_loop(
                 chat_id = msg.chat_id
                 user_msg_id = msg.message_id
                 context = resolved.context
+                reply_reference_text = (
+                    msg.reply_reference_text
+                    if msg.reply_reference_text is not None
+                    else msg.reply_to_text
+                )
                 engine_resolution = await resolve_engine_defaults(
                     explicit_engine=resolved.engine_override,
                     context=context,
@@ -2595,7 +2754,14 @@ async def run_main_loop(
                 engine_override = engine_resolution.engine
                 if steerable and await _try_steer(
                     msg=msg,
-                    prompt_text=prompt_text,
+                    prompt_text=append_reply_context(
+                        prompt_text,
+                        selected_quote=msg.reply_quote_text,
+                        reply_text=strip_reply_routing_lines(
+                            reply_reference_text,
+                            is_resume_line=cfg.runtime.is_resume_line,
+                        ),
+                    ),
                     resolved=resolved,
                     engine=engine_override,
                     topic_key=topic_key,
@@ -2614,10 +2780,20 @@ async def run_main_loop(
                     topic_key=topic_key,
                     engine_for_session=engine_resolution.engine,
                     prompt_text=prompt_text,
+                    reply_quote_text=msg.reply_quote_text,
+                    reply_reference_text=reply_reference_text,
                 )
                 if resume_decision.handled_by_running_task:
                     return
                 resume_token = resume_decision.resume_token
+                prompt_text = append_reply_context(
+                    prompt_text,
+                    selected_quote=msg.reply_quote_text,
+                    reply_text=strip_reply_routing_lines(
+                        reply_reference_text,
+                        is_resume_line=cfg.runtime.is_resume_line,
+                    ),
+                )
                 if resume_token is None:
                     await run_job(
                         chat_id,
@@ -2691,8 +2867,8 @@ async def run_main_loop(
                         chat_prefs=state.chat_prefs,
                         topic_store=state.topic_store,
                     )
-                    return _apply_trigger_permission_override(
-                        options, resolved.context, engine=target.engine
+                    return _apply_trigger_overrides(
+                        options, resolved.context, engine=target.engine, log=False
                     )
 
                 return await maybe_steer(

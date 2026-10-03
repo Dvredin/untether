@@ -442,6 +442,82 @@ async def test_router_already_announced_turn_is_not_pushed() -> None:
     assert notify is False
 
 
+async def test_825_router_reheads_task_finished_turn_with_late_tasks() -> None:
+    """#825: a wake turn that opened as an already-announced repeat for task
+    A, during which task B finished, is delivered naming both — and pushed,
+    because B's finish is news. Its reply anchor is kept."""
+    rec = _Recorder()
+    router = _router(rec)
+    opened = {"tasks": ["job A"], "task_ids": ["a1"], "already_announced": True}
+    await router.on_turn(_turn("started", detail=opened))
+    assert router.current is not None and router.current.notify is False
+    reply_before = router.current.reply_to
+    await router.on_turn(
+        _turn(
+            "completed",
+            ok=True,
+            answer="both done",
+            detail={
+                "tasks": ["job A", "job B"],
+                "task_ids": ["a1", "a2"],
+                "late_tasks": ["job B"],
+            },
+        )
+    )
+    _turn_no, _ok, _answer, header, notify, reply = rec.delivered[0]
+    assert header == (
+        "\N{BELL} 2 background tasks finished \N{EM DASH} job A \N{MIDDLE DOT} job B"
+    )
+    assert notify is True
+    assert reply == reply_before.message_id
+
+
+async def test_825_router_keeps_header_without_late_tasks() -> None:
+    rec = _Recorder()
+    router = _router(rec)
+    detail = {"tasks": ["job A"], "task_ids": ["a1"]}
+    await router.on_turn(_turn("started", detail=detail))
+    await router.on_turn(
+        _turn(
+            "completed",
+            ok=True,
+            answer="done",
+            detail={"tasks": ["job A", "job B"], "task_ids": ["a1", "a2"]},
+        )
+    )
+    assert rec.delivered[0][3] == "\N{BELL} Background task finished \N{EM DASH} job A"
+
+
+@pytest.mark.parametrize(
+    ("answer", "actions", "expected"),
+    [
+        ("B's report: " + "findings. " * 40, 0, "long_answer"),
+        ("checked B", 1, "tools"),
+        ("B finished (again).", 0, "fold"),  # the accepted #785 trade-off
+    ],
+)
+def test_825_turn_after_late_attribution_is_delivered_when_substantive(
+    answer: str, actions: int, expected: str
+) -> None:
+    """#825 review: B was named in A's turn, so B's own CLI turn arrives
+    ``already_announced``. A substantive B turn still breaks out as its own
+    message; only a short restatement folds into the status message."""
+    from untether.background_status import wake_fold_decision
+
+    assert (
+        wake_fold_decision(
+            reason="task_finished",
+            ok=True,
+            answer=answer,
+            substantive_actions=actions,
+            already_announced=True,
+            live_tasks_remaining=0,
+            batch_announced=True,
+        )
+        == expected
+    )
+
+
 async def test_router_completed_without_detail_keeps_open_header() -> None:
     rec = _Recorder()
     router = _router(rec)
@@ -587,7 +663,37 @@ async def test_router_followup_turn_anchors_to_its_message() -> None:
         (
             "task_finished",
             {"tasks": ["a", "b"]},
-            "\N{BELL} 2 background tasks finished",
+            "\N{BELL} 2 background tasks finished \N{EM DASH} a \N{MIDDLE DOT} b",
+        ),
+        (
+            # #825: first three names, then a count of the rest.
+            "task_finished",
+            {"tasks": ["a", "b", "c", "d", "e"]},
+            "\N{BELL} 5 background tasks finished \N{EM DASH} a \N{MIDDLE DOT} b"
+            " \N{MIDDLE DOT} c (+2 more)",
+        ),
+        (
+            # #825: each name is cut to 40 characters.
+            "task_finished",
+            {"tasks": ["x" * 60, "job B"]},
+            "\N{BELL} 2 background tasks finished \N{EM DASH} "
+            + "x" * 39
+            + "\N{HORIZONTAL ELLIPSIS} \N{MIDDLE DOT} job B",
+        ),
+        (
+            # #892: a continued agent's mark survives the name cut.
+            "task_finished",
+            {"tasks": ["x" * 60 + " (continued)", "job B"]},
+            "\N{BELL} 2 background tasks finished \N{EM DASH} "
+            + "x" * 39
+            + "\N{HORIZONTAL ELLIPSIS} (continued) \N{MIDDLE DOT} job B",
+        ),
+        (
+            "task_finished",
+            {"tasks": ["y" * 90 + " (continued)"]},
+            "\N{BELL} Background task finished \N{EM DASH} "
+            + "y" * 80
+            + " (continued)",
         ),
         ("followup", {}, None),
     ],
@@ -1532,3 +1638,285 @@ def test_819_export_skips_telemetry_keeps_other_actions(monkeypatch) -> None:
     assert recorded == []
     rb._record_export_event(_action(), _TOKEN)
     assert [e["action"]["kind"] for e in recorded] == ["command"]
+
+
+async def test_router_refreshes_progress_settings_at_each_turn_start() -> None:
+    """rc15 integration finding (R15-19f): a hot-reloaded ``[progress]``
+    toggle reached only the next spawned run; follow-up turns of a live
+    session kept the old value. The router now fires a hook per turn start."""
+    rec = _CancelRecorder()
+    starts: list[int] = []
+    router = rb.FollowupTurnRouter(
+        new_tracker=lambda: ProgressTracker(engine="claude"),
+        create_progress=rec.create,
+        close_progress=rec.close,
+        deliver=rec.deliver,
+        default_reply_to=USER_REF,
+        followup_notify=False,
+        anchor_for={}.get,
+        on_turn_started=lambda: starts.append(1),
+    )
+    await router.on_turn(_turn("started", turn=2, reason="followup"))
+    await router.on_turn(_turn("completed", turn=2, reason="followup"))
+    await router.on_turn(_turn("started", turn=3, reason="followup"))
+    assert len(starts) == 2
+
+
+def test_refresh_progress_settings_reaches_a_verbose_override(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from untether.markdown import MarkdownFormatter
+    from untether.telegram.bridge import TelegramPresenter
+
+    default = TelegramPresenter(formatter=MarkdownFormatter(show_context_usage=True))
+    override = TelegramPresenter(
+        formatter=MarkdownFormatter(verbosity="verbose", show_context_usage=True)
+    )
+    monkeypatch.setattr(
+        rb,
+        "_load_progress_settings",
+        lambda: SimpleNamespace(
+            max_actions=3, verbosity="compact", show_context_usage=False
+        ),
+    )
+    rb._refresh_progress_settings(default, override)
+    assert default._formatter.show_context_usage is False
+    assert override._formatter.show_context_usage is False
+    assert override._formatter.max_actions == 3
+    assert override._formatter.verbosity == "verbose"  # the override's own
+
+
+# ── #418: /export records every turn of a live session ──────────────────────
+
+
+def _turn_action(turn: int) -> ActionEvent:
+    return ActionEvent(
+        engine="claude",
+        action=Action(id=f"toolu_t{turn}", kind="command", title=f"echo turn{turn}"),
+        phase="completed",
+        ok=True,
+    )
+
+
+async def test_418_export_records_every_live_turn() -> None:
+    """Live finding: after one run plus three injected follow-ups (four
+    turns), /export held only the first run's events — the follow-up and
+    wake turns' events went to the turn router before the export recorder."""
+    from untether.telegram.commands import export as export_mod
+
+    export_mod._SESSION_HISTORY.clear()
+    usage = {"total_cost_usd": 0.42, "num_turns": 9}
+    steps: list[Emit] = [Emit(_turn_action(1))]
+    for turn, reason in ((2, "followup"), (3, "followup"), (4, "task_finished")):
+        steps += [
+            Emit(_turn("started", turn=turn, reason=reason)),
+            Emit(_turn_action(turn)),
+            Emit(
+                _turn(
+                    "completed",
+                    turn=turn,
+                    reason=reason,
+                    ok=True,
+                    answer=f"ANSWER-{turn}",
+                    resume=_TOKEN,
+                    **({"usage": usage} if turn == 4 else {}),
+                )
+            ),
+        ]
+    await _run_with_turn(*steps, end_mid_turn=True)
+
+    _ts, events, recorded_usage = export_mod._SESSION_HISTORY[(1, _TOKEN.value)]
+    action_ids = [e["action"]["id"] for e in events if e["type"] == "action"]
+    # Every turn's action, each exactly once (no double recording).
+    assert action_ids == ["toolu_t1", "toolu_t2", "toolu_t3", "toolu_t4"]
+    answers = [e["answer"] for e in events if e["type"] == "completed"]
+    assert answers[:1] == ["FIRST"]
+    assert [a for a in answers if a.startswith("ANSWER-")] == [
+        "ANSWER-2",
+        "ANSWER-3",
+        "ANSWER-4",
+    ]
+    turns = [(e["turn"], e["reason"]) for e in events if e["type"] == "turn"]
+    assert turns == [(2, "followup"), (3, "followup"), (4, "task_finished")]
+    # The latest result's usage (session-cumulative for the live process).
+    assert recorded_usage == usage
+
+    md = export_mod._format_export_markdown(_TOKEN.value, events, recorded_usage)
+    for needle in (
+        "FIRST",
+        "ANSWER-2",
+        "ANSWER-3",
+        "ANSWER-4",
+        "echo turn4",
+        "## Turn 2 (follow-up)",
+        "## Turn 4 (background task finished)",
+    ):
+        assert needle in md
+    export_mod._SESSION_HISTORY.clear()
+
+
+# ── #890: repeat usage-limit errors from wake turns coalesce ────────────────
+
+_CAP = "You've hit your session limit · resets 5:30pm (Australia/Melbourne)"
+
+
+def _capped_turn(
+    turn: int,
+    *,
+    reason: str = "task_finished",
+    head: str = _CAP,
+    latched: bool = True,
+) -> list[Emit]:
+    usage: dict = {"num_turns": 1, "total_cost_usd": 45.25}
+    if latched:
+        usage["usage_limit_latched"] = True
+    return [
+        Emit(
+            _turn("started", turn=turn, reason=reason, detail={"tasks": [f"t{turn}"]})
+        ),
+        Emit(
+            _turn(
+                "completed",
+                turn=turn,
+                reason=reason,
+                ok=False,
+                answer="",
+                error=f"{head}\nsession: 681bd6d5 · live turn {turn} · turns: 1",
+                resume=_TOKEN,
+                usage=usage,
+            )
+        ),
+    ]
+
+
+def _cap_messages(transport: FakeTransport, needle: str = "hit your session limit"):
+    return [c for c in transport.send_calls if needle in c["message"].text]
+
+
+async def test_890_repeat_capped_wake_errors_fold_into_the_first() -> None:
+    """#890: once the limit is latched, each later background wake fails at
+    once with the same message — one error final, edited with a counter, not
+    one push per wake."""
+    transport, _ = await _run_with_turn(
+        *_capped_turn(2), *_capped_turn(3), *_capped_turn(4), end_mid_turn=True
+    )
+    sent = _cap_messages(transport)
+    assert len(sent) == 1
+    ref = sent[0]["ref"]
+    edits = [c["message"].text for c in transport.edit_calls if c["ref"] == ref]
+    assert edits, "the first error final was never updated"
+    assert "+1 more background wake-up hit the same limit" in edits[0]
+    assert "+2 more background wake-ups hit the same limit" in edits[-1]
+    # The first error's own text survives the edits.
+    assert "hit your session limit" in edits[-1]
+    assert "Background task finished" in edits[-1]
+
+
+async def test_890_consolidation_off_keeps_one_message_per_wake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``consolidate_wake_turns = false`` (the #785 kill switch) keeps the
+    rc12 delivery: every capped wake error is its own message."""
+    import untether.runner_bridge as bridge_mod
+    from untether.settings import ProgressSettings
+
+    settings = ProgressSettings(consolidate_wake_turns=False)
+    monkeypatch.setattr(bridge_mod, "_load_progress_settings", lambda: settings)
+    transport, _ = await _run_with_turn(
+        *_capped_turn(2), *_capped_turn(3), end_mid_turn=True
+    )
+    assert len(_cap_messages(transport)) == 2
+
+
+async def test_890_different_or_unlatched_errors_get_their_own_message() -> None:
+    """Only the same latched limit message coalesces: another error, an
+    unlatched error and a user's follow-up all keep their own final."""
+    other = "You've hit your weekly limit · resets 9:00am (Australia/Melbourne)"
+    transport, _ = await _run_with_turn(
+        *_capped_turn(2),
+        *_capped_turn(3, head=other),
+        *_capped_turn(4, latched=False),
+        *_capped_turn(5, reason="followup"),
+        end_mid_turn=True,
+    )
+    assert len(_cap_messages(transport)) == 3
+    assert len(_cap_messages(transport, "weekly limit")) == 1
+    assert not any(
+        "more background wake-up" in c["message"].text for c in transport.edit_calls
+    )
+
+
+def _ok_wake_turn(turn: int, *, reason: str = "monitor_event") -> list[Emit]:
+    return [
+        Emit(_turn("started", turn=turn, reason=reason)),
+        Emit(
+            _turn(
+                "completed",
+                turn=turn,
+                reason=reason,
+                ok=True,
+                answer="Still waiting.",
+                resume=_TOKEN,
+                usage={"num_turns": 1},
+            )
+        ),
+    ]
+
+
+async def test_890_successful_wake_that_folds_starts_afresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wake turn that got through means the limit lifted, even when its
+    short ack folds into the background panel: a later cap is a fresh
+    (pushed) error, not a counter edited into the hours-old one."""
+    from types import SimpleNamespace
+
+    import untether.runner_bridge as bridge_mod
+
+    target = SimpleNamespace(breakouts=0)
+    folded: list[str] = []
+
+    async def fake_fold(self, text: str, **_kw) -> bool:
+        folded.append(text)
+        return True
+
+    monkeypatch.setattr(
+        bridge_mod.BackgroundStatusManager,
+        "fold_target",
+        property(lambda self: target),
+    )
+    monkeypatch.setattr(bridge_mod.BackgroundStatusManager, "fold", fake_fold)
+    transport, _ = await _run_with_turn(
+        *_capped_turn(2), *_ok_wake_turn(3), *_capped_turn(4), end_mid_turn=True
+    )
+    assert folded == ["Still waiting."]
+    assert len(_cap_messages(transport)) == 2
+    assert not any(
+        "more background wake-up" in c["message"].text for c in transport.edit_calls
+    )
+
+
+async def test_890_cancelled_wake_turn_starts_afresh() -> None:
+    """A cancelled turn also ends the run of repeats: the next cap gets its
+    own message."""
+    transport, _ = await _run_with_turn(
+        *_capped_turn(2),
+        Emit(_turn("started", turn=3, reason="task_finished")),
+        Emit(
+            _turn(
+                "completed",
+                turn=3,
+                reason="task_finished",
+                ok=True,
+                answer="PARTIAL",
+                resume=_TOKEN,
+                usage={"terminal_reason": "aborted_tools"},
+            )
+        ),
+        *_capped_turn(4),
+        end_mid_turn=True,
+    )
+    assert len(_cap_messages(transport)) == 2
+    assert not any(
+        "more background wake-up" in c["message"].text for c in transport.edit_calls
+    )

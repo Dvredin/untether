@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import stat
 import time
 from collections import deque
 from collections.abc import Callable
@@ -43,6 +44,35 @@ _BENIGN_REJECTIONS: tuple[tuple[str, str], ...] = (
 
 # #746: a flood of benign rejections is still worth a WARNING (a wrong-id or
 # routing bug, or a stuck render loop, would otherwise leave only INFO lines).
+# Message calls (send/edit/delete/answer) get a short timeout: one dead
+# pooled connection (e.g. a stalled IPv6 flow to api.telegram.org) otherwise
+# blocks the chat's outbox for the full bulk timeout (rc15 integration
+# finding: 120 s freezes, lost and duplicated finals). Uploads, downloads and
+# getUpdates keep their own, longer timeouts.
+_MESSAGE_TIMEOUT_S = 30.0
+_CONNECT_TIMEOUT_S = 10.0
+# Never sent: safe to repeat for any method.
+_UNSENT_ERRORS: tuple[type[httpx.HTTPError], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
+# May have reached Telegram: repeat only where a duplicate is harmless.
+_IDEMPOTENT_METHODS = frozenset(
+    {
+        "editMessageText",
+        "editMessageReplyMarkup",
+        "deleteMessage",
+        "answerCallbackQuery",
+    }
+)
+_IDEMPOTENT_RETRY_ERRORS: tuple[type[httpx.HTTPError], ...] = (
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+)
+
 _BENIGN_BURST_THRESHOLD = 5  # rejections of one (method, reason_class) ...
 _BENIGN_BURST_WINDOW_S = 60.0  # ... within this many seconds
 
@@ -70,6 +100,18 @@ def classify_benign_rejection(
         if needle in text:
             return reason_class
     return None
+
+
+def _payload_target(request_payload: Any) -> tuple[Any, Any]:
+    """#823: the ``(chat_id, message_id)`` a request targeted, for error logs.
+
+    Works for both JSON and multipart (``data=``) payloads; anything that
+    isn't a dict (or a method with no chat, e.g. ``getUpdates``) yields
+    ``(None, None)``.
+    """
+    if not isinstance(request_payload, dict):
+        return None, None
+    return request_payload.get("chat_id"), request_payload.get("message_id")
 
 
 def _error_description(resp: httpx.Response) -> str | None:
@@ -208,6 +250,8 @@ class HttpBotClient:
         token: str,
         *,
         base_url: str = "https://api.telegram.org",
+        bot_api_local_dir: Path | None = None,
+        max_download_bytes: int = 50 * 1024 * 1024,
         timeout_s: float = 30,
         http_client: httpx.AsyncClient | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -215,6 +259,8 @@ class HttpBotClient:
         if not token:
             raise ValueError("Telegram token is empty")
         api_base = base_url.rstrip("/")
+        self._bot_api_local_dir = bot_api_local_dir
+        self.set_max_download_bytes(max_download_bytes)
         self._local_mode = urlsplit(api_base).hostname in {
             "127.0.0.1",
             "::1",
@@ -222,7 +268,13 @@ class HttpBotClient:
         }
         self._base = f"{api_base}/bot{token}"
         self._file_base = f"{api_base}/file/bot{token}"
-        self._http_client = http_client or httpx.AsyncClient(timeout=timeout_s)
+        self._bulk_timeout_s = timeout_s
+        self._http_client = http_client or httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                min(timeout_s, _MESSAGE_TIMEOUT_S),
+                connect=min(timeout_s, _CONNECT_TIMEOUT_S),
+            )
+        )
         self._owns_http_client = http_client is None
         # #598: last failure reason per (method, chat_id, message_id). The
         # queued call chain returns bare ``None`` on failure, so upper
@@ -248,10 +300,7 @@ class HttpBotClient:
         description: str,
     ) -> None:
         """#598: remember why a request failed, keyed for later correlation."""
-        chat_id = message_id = None
-        if isinstance(request_payload, dict):
-            chat_id = request_payload.get("chat_id")
-            message_id = request_payload.get("message_id")
+        chat_id, message_id = _payload_target(request_payload)
         self._last_api_errors[(method, chat_id, message_id)] = description
         while len(self._last_api_errors) > 64:
             self._last_api_errors.pop(next(iter(self._last_api_errors)))
@@ -324,11 +373,14 @@ class HttpBotClient:
                     retry_after=retry_after,
                 )
                 raise TelegramRetryAfter(retry_after)
+            chat_id, message_id = _payload_target(request_payload)
             logger.error(
                 "telegram.api_error",
                 method=method,
                 url=_safe_url(resp.request.url),
                 payload=payload,
+                chat_id=chat_id,
+                message_id=message_id,
             )
             self._record_api_error(
                 method,
@@ -339,6 +391,33 @@ class HttpBotClient:
 
         logger.debug("telegram.response", method=method, payload=payload)
         return payload.get("result")
+
+    async def _post_once(
+        self,
+        method: str,
+        *,
+        json: dict[str, Any] | None,
+        data: dict[str, Any] | None,
+        files: dict[str, Any] | None,
+        **timeout_kwargs: Any,
+    ) -> httpx.Response:
+        if json is not None:
+            return await self._http_client.post(
+                f"{self._base}/{method}", json=json, **timeout_kwargs
+            )
+        return await self._http_client.post(
+            f"{self._base}/{method}", data=data, files=files, **timeout_kwargs
+        )
+
+    @staticmethod
+    def _should_retry(method: str, exc: httpx.HTTPError) -> bool:
+        if method == "getUpdates":
+            return False  # the poll loop retries on its own
+        if isinstance(exc, _UNSENT_ERRORS):
+            return True
+        return method in _IDEMPOTENT_METHODS and isinstance(
+            exc, _IDEMPOTENT_RETRY_ERRORS
+        )
 
     async def _request(
         self,
@@ -355,22 +434,36 @@ class HttpBotClient:
         if request_timeout is not None:
             timeout_kwargs["timeout"] = request_timeout
         try:
-            if json is not None:
-                resp = await self._http_client.post(
-                    f"{self._base}/{method}", json=json, **timeout_kwargs
+            try:
+                resp = await self._post_once(
+                    method, json=json, data=data, files=files, **timeout_kwargs
                 )
-            else:
-                resp = await self._http_client.post(
-                    f"{self._base}/{method}", data=data, files=files, **timeout_kwargs
+            except httpx.HTTPError as first:
+                if not self._should_retry(method, first):
+                    raise
+                # httpx drops the failed connection, so this goes out on a
+                # fresh one.
+                retry_chat_id, _ = _payload_target(request_payload)
+                logger.warning(
+                    "telegram.network_retry",
+                    method=method,
+                    error_type=first.__class__.__name__,
+                    chat_id=retry_chat_id,
+                )
+                resp = await self._post_once(
+                    method, json=json, data=data, files=files, **timeout_kwargs
                 )
         except httpx.HTTPError as exc:
             exc_url = getattr(exc.request, "url", None)
+            chat_id, message_id = _payload_target(request_payload)
             logger.error(
                 "telegram.network_error",
                 method=method,
                 url=_safe_url(exc_url) if exc_url is not None else None,
                 error=str(exc),
                 error_type=exc.__class__.__name__,
+                chat_id=chat_id,
+                message_id=message_id,
             )
             self._record_api_error(
                 method, request_payload, f"network error: {exc.__class__.__name__}"
@@ -403,10 +496,7 @@ class HttpBotClient:
                 )
                 raise TelegramRetryAfter(retry_after) from exc
             body = resp.text
-            chat_id = message_id = None
-            if isinstance(request_payload, dict):
-                chat_id = request_payload.get("chat_id")
-                message_id = request_payload.get("message_id")
+            chat_id, message_id = _payload_target(request_payload)
             description = _error_description(resp)
             benign = (
                 classify_benign_rejection(method, description, message_id)
@@ -435,7 +525,9 @@ class HttpBotClient:
                     url=_safe_url(resp.request.url),
                     error=str(exc),
                     body=body,
-                    # Which message a failed edit/delete targeted (diagnostic).
+                    # #823: which chat/message a failed request targeted
+                    # (message_ids are per chat, so both are needed).
+                    chat_id=chat_id,
                     message_id=message_id,
                 )
             # #746 D4: record the readable Telegram description when there is
@@ -506,7 +598,9 @@ class HttpBotClient:
         data: dict[str, Any],
         files: dict[str, Any],
     ) -> Any | None:
-        return await self._request(method, data=data, files=files)
+        return await self._request(
+            method, data=data, files=files, request_timeout=self._bulk_timeout_s
+        )
 
     async def get_updates(
         self,
@@ -537,17 +631,58 @@ class HttpBotClient:
         result = await self._post("getFile", {"file_id": file_id})
         return self._decode_result(method="getFile", payload=result, model=File)
 
-    async def download_file(self, file_path: str) -> bytes | None:
-        if self._local_mode and file_path.startswith("/"):
-            try:
-                return await anyio.to_thread.run_sync(Path(file_path).read_bytes)
-            except OSError as exc:
+    def set_max_download_bytes(self, max_download_bytes: int) -> None:
+        """Update the local-read ceiling when file settings hot-reload."""
+        if max_download_bytes < 1:
+            raise ValueError("max_download_bytes must be positive")
+        self._max_download_bytes = max_download_bytes
+
+    def _read_local_file(self, file_path: str, max_bytes: int) -> bytes | None:
+        """Resolve, confine and size-check a local cache file before reading."""
+        if self._bot_api_local_dir is None:
+            logger.error("telegram.file_path_rejected", reason="local_data_dir_unset")
+            return None
+        try:
+            root = self._bot_api_local_dir.resolve(strict=True)
+            target = Path(file_path).resolve(strict=True)
+            if not root.is_dir() or not target.is_relative_to(root):
                 logger.error(
-                    "telegram.local_file_read_error",
-                    error=str(exc),
-                    error_type=exc.__class__.__name__,
+                    "telegram.file_path_rejected", reason="outside_local_data_dir"
                 )
                 return None
+            info = target.stat()
+            if not stat.S_ISREG(info.st_mode):
+                logger.error("telegram.file_path_rejected", reason="not_regular_file")
+                return None
+            if info.st_size > max_bytes:
+                logger.error(
+                    "telegram.local_file_too_large",
+                    size=info.st_size,
+                    max_bytes=max_bytes,
+                )
+                return None
+            # A file growing after stat() must not turn this into an unbounded
+            # read. Refuse a changed file rather than returning truncated data.
+            with target.open("rb") as stream:
+                payload = stream.read(info.st_size + 1)
+            if len(payload) > info.st_size:
+                logger.error("telegram.file_path_rejected", reason="local_file_grew")
+                return None
+            return payload
+        except (OSError, ValueError, RuntimeError) as exc:
+            # Cache paths may contain the bot token; never log the path or
+            # exception text, which can embed it.
+            logger.error(
+                "telegram.local_file_read_error",
+                error_type=exc.__class__.__name__,
+            )
+            return None
+
+    async def download_file(self, file_path: str) -> bytes | None:
+        if self._local_mode and file_path.startswith("/"):
+            return await anyio.to_thread.run_sync(
+                self._read_local_file, file_path, self._max_download_bytes
+            )
         # #204: reject file_path values that could redirect the request away
         # from api.telegram.org.  Telegram's documented shape is a relative
         # path ("documents/file_123.txt") — any scheme marker or parent-dir
@@ -562,7 +697,7 @@ class HttpBotClient:
             return None
         url = f"{self._file_base}/{file_path}"
         try:
-            resp = await self._http_client.get(url)
+            resp = await self._http_client.get(url, timeout=self._bulk_timeout_s)
         except httpx.HTTPError as exc:
             request_url = getattr(exc.request, "url", None)
             logger.error(

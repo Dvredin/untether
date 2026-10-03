@@ -508,7 +508,11 @@ def wait_idle_or_eof(seconds: float) -> dict | None | str:
 
 def scenario_bg_bash_wake(first: dict) -> None:
     init()
-    tool_use("Bash", "toolu_bg", {"command": "sleep 20", "run_in_background": True})
+    bash_input: dict = {"command": "sleep 20", "run_in_background": True}
+    # #872: the budget Claude declares with run_in_background.
+    if os.environ.get("FAKE_CLAUDE_BASH_TIMEOUT_MS"):
+        bash_input["timeout"] = int(os.environ["FAKE_CLAUDE_BASH_TIMEOUT_MS"])
+    tool_use("Bash", "toolu_bg", bash_input)
     start_bg("b1", "toolu_bg")
     tool_result("toolu_bg", "Command running in background with ID: b1.")
     text("waiting")
@@ -517,7 +521,18 @@ def scenario_bg_bash_wake(first: dict) -> None:
     if got is None:
         shutdown()
     end_bg("b1")
+    wake_hook_s = float(os.environ.get("FAKE_CLAUDE_WAKE_HOOK_S", "0") or 0)
+    if wake_hook_s:
+        # #872 R17-01a: the task-notification prompt fires a global async
+        # UserPromptSubmit hook, and the wake turn opens a moment later.
+        spawn_hook("h-wake-ups", wake_hook_s)
+        hook_started("h-wake-ups", "UserPromptSubmit")
+        _withheld.append(("h-wake-ups", "UserPromptSubmit"))
+        delay = float(os.environ.get("FAKE_CLAUDE_WAKE_DELAY_S", "0.4"))
+        if wait_idle_or_eof(delay) is None:
+            shutdown()
     init()
+    flush_withheld()
     text("GOT: BG-FINISHED")
     result("GOT: BG-FINISHED")
     serve_followups()
@@ -901,6 +916,98 @@ def scenario_multi_agent_acks(first: dict) -> None:
     serve_followups()
 
 
+def scenario_two_tasks_one_wake_turn(first: dict) -> None:
+    """#825 (lba-1, rc14): two background tasks; the second ends while the
+    first one's wake turn is open, and the CLI folds its notification into
+    that turn. ``FAKE_CLAUDE_EXTRA_TURN=1``: the second notification lands
+    after the turn instead, and the CLI gives it its own (repeat) turn."""
+    extra = os.environ.get("FAKE_CLAUDE_EXTRA_TURN") == "1"
+    # R17-821: the second task ends after the turn's final message began
+    # (the model never saw it); the CLI then runs an empty turn and wakes
+    # Claude for it in a turn no task event names.
+    unseen = os.environ.get("FAKE_CLAUDE_LATE_UNSEEN") == "1"
+    init()
+    for task_id, tool_id in (("a1", "toolu_a1"), ("a2", "toolu_a2")):
+        tool_use("Bash", tool_id, {"command": "sleep", "run_in_background": True})
+        start_bg(task_id, tool_id)
+        tool_result(tool_id, f"Command running in background with ID: {task_id}.")
+    text("Two jobs running.")
+    result("Two jobs running.", turns=3)
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    end_bg("a1")
+    init()
+    text("Job one is done; checking the other.")
+    if unseen:
+        text("A is done; B is still running.")
+        _end_quietly("a2")
+        result("A is done; B is still running.", turns=2)
+        init()
+        result("", turns=0, delta=0.0)
+        init()
+        text("B printed its report.")
+        result("B printed its report.")
+        serve_followups()
+        return
+    _end_quietly("a2")
+    if not extra:
+        _notify("a2", "toolu_a2")
+    text("Both jobs finished: B printed its report.")
+    result("Both jobs finished: B printed its report.", turns=2)
+    if extra:
+        _notify("a2", "toolu_a2")
+        init()
+        text("a2 finished (again).")
+        result("a2 finished (again).")
+    serve_followups()
+
+
+def scenario_fg_task_backgrounded(first: dict) -> None:
+    """#825/#876 (nsd, rc16): the parent runs a FOREGROUND Bash; past its
+    timeout the CLI moves it to the background (``task_updated{patch:
+    {is_backgrounded: true}}``) and the turn ends. The task finishes later
+    and wakes the parent. ``FAKE_CLAUDE_BG_PATCH=0`` omits the patch (only
+    the idle notification shows the move)."""
+    init()
+    tool_use("Bash", "toolu_fg", {"command": "cp -r big dest", "timeout": 10000})
+    _live_tasks["f1"] = "toolu_fg"
+    emit(
+        {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "f1",
+            "tool_use_id": "toolu_fg",
+            "description": "copy attempt",
+            "is_backgrounded": False,
+            "task_type": "local_bash",
+        }
+    )
+    if os.environ.get("FAKE_CLAUDE_BG_PATCH", "1") != "0":
+        emit(
+            {
+                "type": "system",
+                "subtype": "task_updated",
+                "task_id": "f1",
+                "patch": {"is_backgrounded": True},
+            }
+        )
+    tool_result(
+        "toolu_fg",
+        "Command is still running after 10s. It was moved to the background as "
+        "task f1 and keeps running; you'll receive a notification with the "
+        "result when it completes.",
+    )
+    text("The copy is still running in the background.")
+    result("The copy is still running in the background.", turns=2)
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    end_bg("f1")
+    init()
+    text("COPY DONE")
+    result("COPY DONE")
+    serve_followups()
+
+
 def _read_ack(turn: int, task_id: str, answer: str) -> None:
     """#813: a wake turn that collects a finished task's result with one
     ``Read`` of its output file (CLI >= 2.1.277) and then acks it."""
@@ -1114,6 +1221,16 @@ def scenario_inherited_fd_after_exit(first: dict) -> None:
     # A grandchild inherits stdout and outlives us (#505): the reader must
     # not block on it forever.
     subprocess.Popen(["sleep", "30"], stdout=sys.stdout, stderr=subprocess.DEVNULL)
+    init()
+    text("done")
+    result("done")
+    sys.stdout.flush()
+    os._exit(0)
+
+
+def scenario_exit_after_result(first: dict) -> None:
+    # #820: the CLI ends on its own right after its result (no close by
+    # Untether, no grandchild holding stdout — unlike the scenario above).
     init()
     text("done")
     result("done")
@@ -1431,6 +1548,58 @@ def _rewake_turn(answer: str) -> None:
             "origin": {"kind": "task-notification", "producer": "session-task"},
         }
     )
+
+
+def _task_notification_result(answer: str) -> None:
+    """A result of a turn the CLI started itself (``origin`` =
+    ``task-notification``), as every background-task wake turn has."""
+    global _cost
+    _cost = round(_cost + 0.01, 6)
+    emit(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "duration_ms": 1000,
+            "duration_api_ms": 900,
+            "num_turns": 1,
+            "result": answer,
+            "total_cost_usd": _cost,
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "origin": {"kind": "task-notification", "producer": "session-task"},
+        }
+    )
+
+
+def scenario_bg_agent_pretooluse_denial(first: dict) -> None:
+    """#828 (channelo, rc14): while the parent idles, a background agent's
+    Bash call is denied by a sync ``PreToolUse`` hook (exit 2, started and
+    answered while idle). The agent then finishes and the CLI opens its wake
+    turn well inside the 10 s rewake TTL; the agent's end lands mid-turn."""
+    init()
+    tool_use("Agent", "toolu_ag", {"description": "builder", "prompt": "go"})
+    start_bg("a1", "toolu_ag", task_type="local_agent")
+    tool_result("toolu_ag", "Async agent launched successfully.")
+    text("Builder running in the background.")
+    result("Builder running in the background.", turns=2)
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    hook_started("h-pre", "PreToolUse", name="PreToolUse:Bash")
+    hook_response(
+        "h-pre",
+        "PreToolUse",
+        outcome="error",
+        exit_code=2,
+        stderr="blocked",
+        name="PreToolUse:Bash",
+    )
+    if wait_idle_or_eof(WAKE_S) is None:
+        shutdown()
+    init()
+    text("agent done")
+    _end_quietly("a1")
+    _task_notification_result("agent done")
+    serve_followups()
 
 
 def scenario_async_hook_success(first: dict) -> None:
@@ -2290,6 +2459,7 @@ _SCENARIOS = {
     "plan_approve_queued_wake": scenario_plan_approve_queued_wake,
     "plan_approve_monitor_ticks": scenario_plan_approve_monitor_ticks,
     "async_rewake_idle": scenario_async_rewake_idle,
+    "bg_agent_pretooluse_denial": scenario_bg_agent_pretooluse_denial,
     "async_hook_success": scenario_async_hook_success,
     "async_hook_post_result_response": scenario_async_hook_post_result_response,
     "async_hook_live_mix_rewake": scenario_async_hook_live_mix_rewake,
@@ -2321,12 +2491,15 @@ _SCENARIOS = {
     "followup_launches_bg": scenario_followup_launches_bg,
     "followup_blocks": scenario_followup_blocks,
     "multi_agent_acks": scenario_multi_agent_acks,
+    "two_tasks_one_wake_turn": scenario_two_tasks_one_wake_turn,
+    "fg_task_backgrounded": scenario_fg_task_backgrounded,
     "five_agent_interleaved": scenario_five_agent_interleaved,
     "quiet_batch_report": scenario_quiet_batch_report,
     "acks_only_batch": scenario_acks_only_batch,
     "report_then_noop": scenario_report_then_noop,
     "resume_after_killed_task": scenario_resume_after_killed_task,
     "inherited_fd_after_exit": scenario_inherited_fd_after_exit,
+    "exit_after_result": scenario_exit_after_result,
 }
 
 

@@ -459,3 +459,253 @@ def test_options_changed_notice_wording() -> None:
         "\N{GEAR}\N{VARIATION SELECTOR-16} Settings changed — stopping 1 "
         "background task: x. Your message starts with the new settings."
     )
+
+
+async def test_838_followup_injection_never_checks_guard(cleanup, monkeypatch) -> None:
+    """#838: a live follow-up writes into an existing process — no spawn, so
+    the pre-spawn guard is never consulted (even at the ceiling)."""
+    from untether.runner import JsonlSubprocessRunner
+
+    def _boom(self, resume):
+        raise AssertionError("pre-spawn guard consulted for a live follow-up")
+
+    monkeypatch.setattr(JsonlSubprocessRunner, "_check_prespawn_ram_guard", _boom)
+    _live, pipe = _install("sid-inj", idle=True)
+    assert await inject_live_followup(_job("sid-inj")) is True
+    assert len(pipe.sent) == 1
+
+
+async def test_835_human_followup_into_unattended_session_resumes_fresh(
+    cleanup,
+) -> None:
+    """#835: a human reply into a still-live cron process is not written into
+    it (its approvals would be denied); the options differ by the unattended
+    marker, so the session closes and the reply resumes attended."""
+    from untether.runners.run_options import EngineRunOptions
+
+    live, pipe = _install("sid-inj", idle=True)
+    live.state.spawn_run_options = EngineRunOptions(
+        permission_mode="default", unattended_trigger="cron:c1"
+    )
+    closed: list[bool] = []
+
+    async def aclose() -> None:
+        closed.append(True)
+
+    pipe.aclose = aclose  # type: ignore[method-assign]
+
+    async def human(job: ThreadJob) -> EngineRunOptions:
+        return EngineRunOptions(permission_mode="default")
+
+    assert await inject_live_followup(_job("sid-inj"), options_for=human) is False
+    assert pipe.sent == []
+    assert closed == [True]
+    assert live.state.live_close_reason == "options_changed"
+
+
+async def test_835_busy_steer_keeps_the_turn_unattended(cleanup) -> None:
+    """#835 (documented): a /steer into a *busy* cron turn is folded into the
+    unattended process — that turn's approvals stay denied (fail closed);
+    only an idle session is isolated (options_changed)."""
+    from untether.runners.claude import steer_into_session
+    from untether.runners.run_options import EngineRunOptions
+
+    live, pipe = _install("sid-inj", idle=False)
+    live.state.spawn_run_options = EngineRunOptions(unattended_trigger="cron:c1")
+    live.state.unattended_trigger = "cron:c1"
+    out = await steer_into_session(
+        "sid-inj", "also do X", command_uuid="u835", run_options=EngineRunOptions()
+    )
+    assert out == "steered"
+    assert len(pipe.sent) == 1
+    assert live.state.unattended_trigger == "cron:c1"
+
+    live.state.turn_open = False  # idle now → isolated
+    out = await steer_into_session(
+        "sid-inj", "again", command_uuid="u836", run_options=EngineRunOptions()
+    )
+    assert out == "options_changed"
+
+
+async def test_743_reply_to_cron_session_with_model_override_closes_options_changed(
+    cleanup,
+) -> None:
+    """#743 D2: a reply to a cron run uses the chat's model, so a live session
+    spawned with the cron's model closes (options_changed) and resumes."""
+    from untether.runners.run_options import EngineRunOptions
+
+    live, pipe = _install("sid-inj", idle=True)
+    live.state.spawn_run_options = EngineRunOptions(
+        model="haiku", permission_mode="plan-auto"
+    )
+    closed: list[bool] = []
+
+    async def aclose() -> None:
+        closed.append(True)
+
+    pipe.aclose = aclose  # type: ignore[method-assign]
+
+    async def chat(job: ThreadJob) -> EngineRunOptions:
+        return EngineRunOptions()
+
+    assert await inject_live_followup(_job("sid-inj"), options_for=chat) is False
+    assert closed == [True]
+    assert live.state.live_close_reason == "options_changed"
+
+
+async def test_743_cron_without_overrides_still_injects(cleanup) -> None:
+    from untether.runners.run_options import EngineRunOptions
+
+    live, pipe = _install("sid-inj", idle=True)
+    live.state.spawn_run_options = EngineRunOptions(model="opus")
+
+    async def chat(job: ThreadJob) -> EngineRunOptions:
+        return EngineRunOptions(model="opus")
+
+    assert await inject_live_followup(_job("sid-inj"), options_for=chat) is True
+    assert len(pipe.sent) == 1
+
+
+# ── #835: a human reply to a running cron turn resumes attended ──────────────
+
+
+def _cron_context():
+    from untether.context import RunContext
+
+    return RunContext(
+        project="proj",
+        branch="feat",
+        trigger_source="cron:nightly",
+        permission_mode="bypassPermissions",
+        model="claude-cron-model",
+        reasoning="high",
+    )
+
+
+async def _reply_to_running_cron_turn(running_task) -> ThreadJob:
+    """Drive ``send_with_resume`` (the ResumeResolver's reply-to-running-task
+    path) and return the ThreadJob it enqueues."""
+    from tests.telegram_fakes import FakeTransport, make_cfg
+    from untether.telegram.loop import send_with_resume
+
+    jobs: list[ThreadJob] = []
+
+    async def enqueue(
+        chat_id, user_msg_id, text, resume, context, thread_id, session_key, ref
+    ) -> None:
+        jobs.append(
+            ThreadJob(
+                chat_id=chat_id,
+                user_msg_id=user_msg_id,
+                text=text,
+                resume_token=resume,
+                context=context,
+                thread_id=thread_id,
+                session_key=session_key,
+                progress_ref=ref,
+            )
+        )
+
+    await send_with_resume(
+        make_cfg(FakeTransport()), enqueue, running_task, 123, 20, None, None, "hi"
+    )
+    assert len(jobs) == 1
+    return jobs[0]
+
+
+def _chat_options_for(job: ThreadJob):
+    """Mirror of loop.run_main_loop's ``_job_run_options``: the chat's own
+    options (here: plan mode) with the job context's trigger overrides."""
+    from untether.runners.run_options import EngineRunOptions
+    from untether.telegram.loop import _apply_trigger_overrides
+
+    async def options_for(j: ThreadJob):
+        return _apply_trigger_overrides(
+            EngineRunOptions(permission_mode="plan"),
+            j.context,
+            engine=j.resume_token.engine,
+            log=False,
+        )
+
+    return options_for
+
+
+async def test_835_reply_to_running_cron_turn_strips_trigger_context() -> None:
+    from untether.context import RunContext
+
+    running = rb.RunningTask(context=_cron_context())
+    running.resume = ResumeToken(engine="claude", value="sid-inj")
+    job = await _reply_to_running_cron_turn(running)
+    assert job.context == RunContext(project="proj", branch="feat")
+    options = await _chat_options_for(job)(job)
+    assert options is not None
+    assert options.unattended_trigger is None
+    # The cron's own overrides don't leak into the human's run.
+    assert options.permission_mode == "plan"
+    assert options.model is None
+    assert options.reasoning is None
+
+
+async def test_835_reply_to_running_cron_turn_closes_live_process(cleanup) -> None:
+    """A human reply never goes into the cron's unattended live process: the
+    options differ (``unattended_trigger`` + the cron overrides), so the
+    process is closed once idle and the reply resumes attended."""
+    from untether.runners.run_options import EngineRunOptions
+    from untether.telegram.loop import _apply_trigger_overrides
+
+    live, pipe = _install("sid-inj", idle=True)
+    live.state.spawn_run_options = _apply_trigger_overrides(
+        EngineRunOptions(permission_mode="plan"),
+        _cron_context(),
+        engine="claude",
+        log=False,
+    )
+    assert live.state.spawn_run_options.unattended_trigger == "cron:nightly"
+
+    async def aclose() -> None:
+        return None
+
+    pipe.aclose = aclose  # type: ignore[method-assign]
+    running = rb.RunningTask(context=_cron_context())
+    running.resume = ResumeToken(engine="claude", value="sid-inj")
+    job = await _reply_to_running_cron_turn(running)
+
+    injected = await inject_live_followup(job, options_for=_chat_options_for(job))
+    assert injected is False
+    assert pipe.sent == []
+    assert live.state.live_close_reason == "options_changed"
+
+
+async def test_835_raw_cron_context_would_inject_unattended(cleanup) -> None:
+    """Negative control (the bug): reusing the running task's raw context
+    makes the follow-up's options equal the cron process's spawn options, so
+    the human turn would be written into the unattended process."""
+    from untether.runners.run_options import EngineRunOptions
+    from untether.telegram.loop import _apply_trigger_overrides
+
+    live, pipe = _install("sid-inj", idle=True)
+    live.state.spawn_run_options = _apply_trigger_overrides(
+        EngineRunOptions(permission_mode="plan"),
+        _cron_context(),
+        engine="claude",
+        log=False,
+    )
+    raw = ThreadJob(
+        chat_id=123,
+        user_msg_id=20,
+        text="hi",
+        resume_token=ResumeToken(engine="claude", value="sid-inj"),
+        context=_cron_context(),
+    )
+    assert await inject_live_followup(raw, options_for=_chat_options_for(raw)) is True
+    assert len(pipe.sent) == 1
+
+
+async def test_835_reply_to_attended_run_keeps_context_identity() -> None:
+    from untether.context import RunContext
+
+    ctx = RunContext(project="proj", branch="feat")
+    running = rb.RunningTask(context=ctx)
+    running.resume = ResumeToken(engine="claude", value="sid-x")
+    job = await _reply_to_running_cron_turn(running)
+    assert job.context is ctx

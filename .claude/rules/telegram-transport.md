@@ -18,7 +18,7 @@ The outbox handles coalescing, priority scheduling, and rate limiting automatica
 ## Callback data
 
 - Max 64 bytes (Telegram enforced)
-- Format: `prefix:action:id` (e.g. `ctrl:approve:req_123`)
+- Format: `prefix:action:id` (e.g. `claude_control:approve:req_123`)
 - Must call `answerCallbackQuery` promptly to clear the button spinner
 
 ## Early callback answering
@@ -78,7 +78,7 @@ Agents write files to `.untether-outbox/` during a run. On completion, `outbox_d
 
 ## Markdown rendering (`telegram/render.py`)
 
-`render_markdown()` rewrites markdown-it `text` tokens only — never code spans or code blocks. A bare `<br>` / `<br/>` / `<br />` becomes a line break (a space in a table row); every other tag stays escaped text (#786, keeps #713's posture). Bare filenames ending `.md` / `.sh` / `.py` become inline code so neither linkify nor Telegram clients auto-link them as domains (#788); explicit link text and real URLs are left alone. A GFM pipe table (a `|` line followed by a `|---|` delimiter row) keeps one row per line: row breaks become hardbreaks, the delimiter row is dropped and the header row is bolded; `split_markdown_body()` repeats the header when a table is split across chunks (#797).
+`render_markdown()` rewrites markdown-it `text` tokens only — never code spans or code blocks. A bare `<br>` / `<br/>` / `<br />` becomes a line break (a space in a table row); every other tag stays escaped text (#786, keeps #713's posture). Bare filenames ending `.md` / `.sh` / `.py` become inline code so neither linkify nor Telegram clients auto-link them as domains (#788); explicit link text and real URLs are left alone. A GFM pipe table (a `|` line followed by a `|---|` delimiter row) keeps one row per line: row breaks become hardbreaks, the delimiter row is dropped and the header row is bolded; `split_markdown_body()` repeats the header when a table is split across chunks (#797). Single newlines in line-structured text are kept as line breaks while wrapped prose reflows (#870), and an ordered list keeps its own start number (#886, sulguk ignores `<ol start>`, so it goes on the first `<li value>`).
 
 ## Forward-coalesce command barrier (#807)
 
@@ -101,7 +101,7 @@ Plan outlines render as formatted Telegram text via `render_markdown()` + `split
 
 ## /new command
 
-`/new` cancels all running tasks for the chat via `_cancel_chat_tasks()` (in `commands/topics.py`) before clearing stored sessions. This prevents process leaks from orphaned Claude/engine subprocesses.
+`/new` cancels the running tasks (and pending `/loop` entries) of the message's thread in forum supergroups and private chats — chat-wide in non-forum groups — via `_cancel_chat_tasks(..., thread_filter=thread_filter_for(msg))` (in `commands/topics.py`; the predicate lives in `telegram/topics.py`, General = no thread = topic id 1) before clearing stored sessions ([#826](https://github.com/littlebearapps/untether/issues/826)). The `/cancel` no-reply fallback uses the same predicate for running tasks, queued jobs, `/at` delays and loops. Scope key = `RunningTask.thread_id` (the originating message's thread), never the echoed `ref.thread_id`. This prevents process leaks from orphaned Claude/engine subprocesses.
 
 ## After changes
 

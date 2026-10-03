@@ -41,7 +41,7 @@ Step-by-step release workflow for Untether. Covers the full lifecycle from issue
 fleet rollout  →  7. Tag & publish
 ```
 
-All seven (now-8) phases happen in a single branch (typically `master` for patches, `feature/*` for minors). The CI release pipeline triggers on `v*` tags pushed to `master`.
+Work happens on `feature/*` / `fix/*` branches → PR → `dev` (rc → TestPyPI) → PR `dev`→`master`. The PyPI release pipeline (`release.yml`) triggers on the `v*` tag that `auto-tag-on-master.yml` creates when Nathan merges a stable version to `master`.
 
 **Phase 5.5 (attestation)** is the gate that makes the fleet rollout safe.
 Without it, `scripts/fleet-rollout.sh` refuses to upgrade production hosts.
@@ -147,7 +147,7 @@ Run all checks before tagging:
 uv run pytest
 
 # Lint
-uv run ruff check src/
+uv run ruff check src/ tests/
 
 # Format check
 uv run ruff format --check src/ tests/
@@ -173,7 +173,7 @@ print(f'Version {v} matches changelog ✓')
 - [ ] All issues referenced in CHANGELOG.md with `[#N](...)`
 - [ ] `pyproject.toml` version matches changelog heading
 - [ ] Tests pass: `uv run pytest`
-- [ ] Lint clean: `uv run ruff check src/`
+- [ ] Lint clean: `uv run ruff check src/ tests/`
 - [ ] Format clean: `uv run ruff format --check src/ tests/`
 - [ ] Lockfile synced: `uv lock --check`
 - [ ] Release validation: `python3 scripts/validate_release.py`
@@ -199,13 +199,13 @@ journalctl --user -u untether-dev -f
 |---|---|---|
 | **Patch** | Tier 7 (command smoke) + Tier 1 (affected engine + Claude) + relevant Tier 6 (stress) | ~30 min |
 | **Minor** | Tier 7 + Tier 1 (all 4 supported engines) + Tier 2 (Claude interactive) + relevant Tier 3-4 + Tier 6 + upgrade path | ~75 min |
-| **Major** | ALL tiers (1-7), ALL engines, full upgrade path testing | ~120 min |
+| **Major** | ALL tiers (1-7), all supported engines, full upgrade path testing | ~120 min |
 
 ### What to focus on per change type
 
 | Changed area | Must-run integration tests |
 |---|---|
-| Runner code (`runners/*.py`) | U1-U4, U6, U7 (all engines) |
+| Runner code (`runners/*.py`) | U1-U4, U6, U7 (all supported engines) |
 | Telegram transport (`telegram/*.py`) | T1-T10, S7, S8 |
 | Control channel (`claude_control.py`) | C1-C6, T8, S9 |
 | Config/settings (`settings.py`) | O1-O9, S5, upgrade path |
@@ -215,7 +215,7 @@ journalctl --user -u untether-dev -f
 
 ### Automated testing via Telegram MCP
 
-All integration test tiers are fully automated by Claude Code via Telegram MCP tools and Bash. Claude Code sends test prompts to the 6 `ut-dev:` engine chats, reads back responses, verifies expected behaviour, checks logs, and creates GitHub issues for any bugs found.
+All integration test tiers are fully automated by Claude Code via Telegram MCP tools and Bash. Claude Code sends test prompts to the 4 supported `ut-dev:` engine chats (the gemini/amp chats are opt-in spot checks only), reads back responses, verifies expected behaviour, checks logs, and creates GitHub issues for any bugs found.
 
 **MCP tools used:** `send_message`, `get_history`, `get_messages`, `list_inline_buttons`, `press_inline_button`, `reply_to_message`
 
@@ -227,8 +227,8 @@ All integration test tiers are fully automated by Claude Code via Telegram MCP t
 | `ut-dev: codex` | 4929463515 |
 | `ut-dev: opencode` | 5200822877 |
 | `ut-dev: pi` | 5156256333 |
-| `ut-dev: gemini` | 5207762142 |
-| `ut-dev: amp` | 5230875989 |
+| `ut-dev: gemini` (deprecated) | 5207762142 |
+| `ut-dev: amp` (deprecated) | 5230875989 |
 
 **Workflow pattern:**
 
@@ -381,7 +381,7 @@ git tag vX.Y.Z
 git push origin vX.Y.Z   # triggers release.yml directly
 ```
 
-Both Claude Code and Nathan can do this. The release-guard hook blocks Claude Code from `git tag v*`, so this path is Nathan-only by design.
+This path is **Nathan-only**: Claude Code must never create `v*` tags (CLAUDE.md release guard; the release-guard hook also blocks `git tag v*`).
 
 ## Post-release verification
 
@@ -406,7 +406,7 @@ scripts/healthcheck.sh --dev --version X.Y.Z
 
 ## Rollback procedures
 
-### Failed CI (tag pushed, PyPI publish failed)
+### Failed CI (tag pushed, PyPI publish failed) — Nathan-only
 
 ```bash
 # Delete the tag locally and remotely
@@ -432,7 +432,7 @@ twine yank untether X.Y.Z
 
 **Never re-upload the same version to PyPI** — PyPI rejects duplicate version numbers even after yanking.
 
-### Revert commit on master
+### Revert commit on master — Nathan-only
 
 ```bash
 git revert <commit-sha>
@@ -449,7 +449,7 @@ git push origin master
 | `uv lock --check` fails | `pyproject.toml` changed without running `uv lock` | Run `uv lock` and commit `uv.lock` |
 | Changelog missing issue links | Issue not created before release | Create issue retroactively, amend changelog in next release |
 | PyPI publish fails with 403 | Trusted publisher not configured for this repo | Check PyPI project settings → Publishing → Trusted Publishers |
-| GitHub Release not created | Workflow `release.yml` missing `create_release` step | Check workflow file, ensure `gh release create` runs |
+| GitHub Release not created | The `softprops/action-gh-release` step in `release.yml` failed or was skipped | Check the `release.yml` run log for that step |
 
 ## Untether-specific considerations
 

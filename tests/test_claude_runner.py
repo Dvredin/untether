@@ -179,6 +179,230 @@ def test_prespawn_ram_guard_warn_only_does_not_block(
 
 
 # ---------------------------------------------------------------------------
+# #838 — ClaudeRunner.run_impl overrides the base method: the guard must run
+# ---------------------------------------------------------------------------
+
+
+def _838_settings(monkeypatch: pytest.MonkeyPatch, tmp_path, **watchdog_kw) -> None:
+    from untether import settings as settings_module
+    from untether.settings import WatchdogSettings
+
+    class _Fake:
+        watchdog = WatchdogSettings(**watchdog_kw)
+
+    monkeypatch.setattr(
+        settings_module,
+        "load_settings_if_exists",
+        lambda: (_Fake(), tmp_path / "untether.toml"),
+    )
+
+
+class _838Spawned(Exception):
+    """Raised by the patched manage_subprocess: the spawn was reached."""
+
+
+def _838_patch_spawn(monkeypatch: pytest.MonkeyPatch, *, allow: bool) -> dict:
+    seen = {"spawned": 0}
+
+    class _Mgr:
+        async def __aenter__(self) -> object:
+            seen["spawned"] += 1
+            raise _838Spawned()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def fake_manage_subprocess(*args: object, **kwargs: object) -> _Mgr:
+        _ = args, kwargs
+        if not allow:
+            raise AssertionError("manage_subprocess reached despite a guard block")
+        return _Mgr()
+
+    monkeypatch.setattr(claude_runner, "manage_subprocess", fake_manage_subprocess)
+    return seen
+
+
+async def _838_collect(runner: ClaudeRunner, resume: ResumeToken | None = None):
+    events: list = []
+    with contextlib.suppress(_838Spawned):
+        events.extend([evt async for evt in runner.run_impl("hi", resume)])
+    return events
+
+
+@pytest.mark.anyio
+async def test_838_run_impl_blocks_before_spawn_on_low_ram(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from structlog.testing import capture_logs
+
+    from untether.utils import proc_diag
+
+    _838_settings(monkeypatch, tmp_path)
+    monkeypatch.setattr(proc_diag, "mem_available_kb", lambda: 100 * 1024)
+    _838_patch_spawn(monkeypatch, allow=False)
+    runner = ClaudeRunner(claude_cmd="claude", permission_mode="acceptEdits")
+
+    with capture_logs() as logs:
+        events = await _838_collect(runner)
+
+    assert len(events) == 1
+    evt = events[0]
+    assert isinstance(evt, CompletedEvent)
+    assert evt.ok is False
+    assert "Insufficient RAM" in (evt.error or "")
+    assert evt.usage == {"prespawn_blocked": "ram"}
+    blocked = [r for r in logs if r["event"] == "subprocess.prespawn.ram_blocked"]
+    assert blocked and blocked[0]["engine"] == "claude"
+    assert not [r for r in logs if r["event"] == "runner.start"]
+
+
+@pytest.mark.anyio
+async def test_838_concurrency_blocked_for_claude(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from structlog.testing import capture_logs
+
+    from untether.utils import subprocess as sp
+
+    _838_settings(monkeypatch, tmp_path, max_concurrent_engine_runs=1)
+    _838_patch_spawn(monkeypatch, allow=False)
+    runner = ClaudeRunner(claude_cmd="claude", permission_mode="acceptEdits")
+    sp._incr_live_engine_subprocesses(1)
+    try:
+        with capture_logs() as logs:
+            events = await _838_collect(runner)
+    finally:
+        sp._incr_live_engine_subprocesses(-1)
+
+    assert len(events) == 1
+    assert isinstance(events[0], CompletedEvent)
+    assert "Too many engine runs in flight (1/1)" in (events[0].error or "")
+    assert events[0].usage == {"prespawn_blocked": "concurrency"}
+    blocked = [
+        r for r in logs if r["event"] == "subprocess.prespawn.concurrency_blocked"
+    ]
+    assert blocked
+    assert blocked[0]["engine"] == "claude"
+    assert blocked[0]["live_runs"] == 1
+    assert "idle_live_sessions" not in blocked[0]
+
+
+@pytest.mark.anyio
+async def test_838_blocked_resume_registers_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    import pty
+
+    from untether.utils import proc_diag
+
+    _838_settings(monkeypatch, tmp_path)
+    monkeypatch.setattr(proc_diag, "mem_available_kb", lambda: 100 * 1024)
+    _838_patch_spawn(monkeypatch, allow=False)
+
+    def _no_pty() -> tuple[int, int]:
+        raise AssertionError("PTY opened despite a guard block")
+
+    monkeypatch.setattr(pty, "openpty", _no_pty)
+    before_req = dict(claude_runner._REQUEST_TO_SESSION)
+    before_live = dict(claude_runner._LIVE_SESSIONS)
+    # Legacy (PTY) mode: no permission_mode.
+    runner = ClaudeRunner(claude_cmd="claude")
+    token = ResumeToken(engine="claude", value="sess-838")
+
+    events = await _838_collect(runner, token)
+
+    assert len(events) == 1
+    assert isinstance(events[0], CompletedEvent)
+    assert events[0].resume == token
+    assert "sess-838" not in claude_runner._ACTIVE_RUNNERS
+    assert before_req == claude_runner._REQUEST_TO_SESSION
+    assert before_live == claude_runner._LIVE_SESSIONS
+
+
+@pytest.mark.anyio
+async def test_838_warn_tier_still_spawns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from structlog.testing import capture_logs
+
+    from untether.utils import proc_diag
+
+    _838_settings(monkeypatch, tmp_path)
+    monkeypatch.setattr(proc_diag, "mem_available_kb", lambda: 1500 * 1024)
+    seen = _838_patch_spawn(monkeypatch, allow=True)
+    runner = ClaudeRunner(claude_cmd="claude", permission_mode="acceptEdits")
+
+    with capture_logs() as logs:
+        await _838_collect(runner)
+
+    assert seen["spawned"] == 1
+    warn = [r for r in logs if r["event"] == "subprocess.prespawn.ram_warning"]
+    assert warn and warn[0]["engine"] == "claude"
+
+
+@pytest.mark.anyio
+async def test_838_guard_disabled_spawns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from structlog.testing import capture_logs
+
+    _838_settings(
+        monkeypatch,
+        tmp_path,
+        prespawn_ram_warn_mb=0,
+        prespawn_ram_block_mb=0,
+        max_concurrent_engine_runs=0,
+    )
+    seen = _838_patch_spawn(monkeypatch, allow=True)
+    runner = ClaudeRunner(claude_cmd="claude", permission_mode="acceptEdits")
+
+    with capture_logs() as logs:
+        await _838_collect(runner)
+
+    assert seen["spawned"] == 1
+    assert not [r for r in logs if str(r["event"]).startswith("subprocess.prespawn")]
+
+
+def test_838_idle_live_sessions_in_log_and_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from structlog.testing import capture_logs
+
+    from untether.utils import subprocess as sp
+
+    _838_settings(monkeypatch, tmp_path, max_concurrent_engine_runs=1)
+    state = ClaudeStreamState()
+    state.completed_turns = 1
+    state.turn_open = False
+    session = claude_runner.LiveSession(session_id="idle-838", state=state, stdin=None)
+    assert session.idle
+    monkeypatch.setitem(claude_runner._LIVE_SESSIONS, "idle-838", session)
+    assert claude_runner.idle_live_session_count() == 1
+
+    # Any engine names them: the block below is a Codex spawn.
+    from untether.runners.codex import CodexRunner
+
+    codex = CodexRunner(codex_cmd="codex", extra_args=[])
+    sp._incr_live_engine_subprocesses(1)
+    try:
+        with capture_logs() as logs:
+            result = codex._check_prespawn_ram_guard(resume=None)
+    finally:
+        sp._incr_live_engine_subprocesses(-1)
+
+    assert result is not None
+    assert "1 idle Claude session(s)" in (result.error or "")
+    blocked = [
+        r for r in logs if r["event"] == "subprocess.prespawn.concurrency_blocked"
+    ]
+    assert blocked[0]["engine"] == "codex"
+    assert blocked[0]["idle_live_sessions"] == 1
+
+    session.closing = True
+    assert claude_runner.idle_live_session_count() == 0
+
+
+# ---------------------------------------------------------------------------
 # #478 / #205 — claude runner.start log must NOT carry prompt content at INFO
 # ---------------------------------------------------------------------------
 
@@ -2119,6 +2343,32 @@ def test_allowed_warning_notes_once_per_window_without_latch() -> None:
     assert _translate(state, payload) == []
 
 
+def test_868_rate_limit_warning_renders_without_tick() -> None:
+    """#868: the #790 allowed_warning note reads as a warning, not a done step."""
+    import time
+
+    from untether.markdown import MarkdownFormatter, assemble_markdown_parts
+    from untether.progress import ProgressTracker
+    from untether.telegram.render import render_markdown
+
+    state = ClaudeStreamState()
+    payload = _real_rate_limit_event(
+        status="allowed_warning",
+        resetsAt=int(time.time()) + 3600,
+        utilization=0.79,
+        overageDisabledReason=None,
+    )
+    tracker = ProgressTracker(engine="claude")
+    for evt in _translate(state, payload):
+        tracker.note_event(evt)
+    parts = MarkdownFormatter(max_actions=5).render_progress_parts(
+        tracker.snapshot(), elapsed_s=1.0
+    )
+    text, _entities = render_markdown(assemble_markdown_parts(parts))
+    assert any(line.startswith("⚠️ ") for line in text.splitlines())
+    assert "✓ ⚠️" not in text
+
+
 def test_allowed_warning_below_threshold_or_on_overage_is_silent() -> None:
     import time
 
@@ -2917,6 +3167,140 @@ def test_extract_error_with_result_text() -> None:
     result = _extract_error(event, resumed=False)
     assert result is not None
     assert result.startswith("Context window limit reached")
+
+
+def _live_result(
+    *, cost: float, api_ms: int, is_error: bool = False, text: str = "ok"
+) -> claude_schema.StreamResultMessage:
+    return claude_schema.StreamResultMessage(
+        subtype="success",
+        duration_ms=1100,
+        duration_api_ms=api_ms,
+        is_error=is_error,
+        num_turns=1,
+        session_id="681bd6d5-aaaa-bbbb",
+        result=text,
+        total_cost_usd=cost,
+    )
+
+
+def test_889_live_turn_error_shows_this_turns_cost_not_cumulative(
+    monkeypatch,
+) -> None:
+    """#889: a failed later turn of a live session must not print the CLI's
+    session-cumulative cost / API time or the spawn-time ``new`` flag."""
+    from untether.model import TurnEvent
+
+    # The limit text arms the module-level #692 reset latch — isolate it.
+    monkeypatch.setattr(claude_runner, "_RATE_LIMIT_RESET_LATCH", {})
+    monkeypatch.setattr(claude_runner, "_RATE_LIMIT_ACTION_LATCH", {})
+    state = ClaudeStreamState()
+    state.live_mode = True
+    state.factory.started(ResumeToken(engine="claude", value="681bd6d5-aaaa-bbbb"))
+    # The run's own result (turn 1) — fresh session, cumulative $45.20.
+    first = translate_claude_event(
+        _live_result(cost=45.20, api_ms=5_000_000),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert any(isinstance(e, CompletedEvent) for e in first)
+    # A wake turn hits the session limit: $0.05 more, 2 s more API time.
+    limit = "You've hit your session limit · resets 5:30pm (Australia/Melbourne)"
+    events = translate_claude_event(
+        _live_result(cost=45.25, api_ms=5_002_000, is_error=True, text=limit),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    done = [e for e in events if isinstance(e, TurnEvent) and e.phase == "completed"]
+    assert len(done) == 1
+    error = done[0].error
+    assert error is not None
+    head, diag = error.split("\n", 1)
+    assert head == limit
+    assert "new" not in diag.split(" · ")
+    assert f"live turn {state.turn}" in diag
+    assert "cost: $0.05" in diag
+    assert "session cost: $45.25" in diag
+    assert "cost: $45.25 ·" not in diag.replace("session cost: $45.25", "")
+    assert "api: 2000ms" in diag
+    assert "5002000" not in diag
+
+
+def test_889_live_turn_error_without_cost_delta_labels_session_cost() -> None:
+    """#889: no earlier cost in this process → the only figure available is
+    the session total, and it is labelled as such."""
+    from untether.runners.claude import _extract_error
+
+    event = _live_result(cost=12.38, api_ms=900, is_error=True, text="boom")
+    result = _extract_error(event, resumed=False, live_turn=3)
+    assert result is not None
+    diag = result.split("\n", 1)[1]
+    assert "live turn 3" in diag
+    assert "session cost: $12.38" in diag
+    assert " cost: $12.38" not in diag.replace("session cost: $12.38", "")
+    assert "api:" not in diag
+    assert "new" not in diag.split(" · ")
+
+
+@pytest.mark.parametrize(
+    ("text", "latched"),
+    [
+        ("You've hit your session limit · resets 5:30pm (Australia/Melbourne)", True),
+        (
+            "You've reached your Fable 5 limit. Run /usage-credits to continue "
+            "or switch models with /model.",
+            True,
+        ),
+        ("API Error: 500 internal server error", False),
+    ],
+)
+def test_890_usage_limit_error_marks_the_turn_usage(
+    monkeypatch, text: str, latched: bool
+) -> None:
+    """#890: a result error that (re-)arms a usage-limit latch says so on the
+    turn's usage, so the bridge can coalesce repeats from later wakes."""
+    from untether.model import TurnEvent
+
+    monkeypatch.setattr(claude_runner, "_RATE_LIMIT_RESET_LATCH", {})
+    monkeypatch.setattr(claude_runner, "_RATE_LIMIT_ACTION_LATCH", {})
+    state = ClaudeStreamState()
+    state.live_mode = True
+    state.factory.started(ResumeToken(engine="claude", value="681bd6d5-aaaa-bbbb"))
+    translate_claude_event(
+        _live_result(cost=1.0, api_ms=1000),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    events = translate_claude_event(
+        _live_result(cost=1.0, api_ms=1000, is_error=True, text=text),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    (done,) = [e for e in events if isinstance(e, TurnEvent) and e.phase == "completed"]
+    assert done.ok is False
+    assert (done.usage or {}).get("usage_limit_latched", False) is latched
+
+
+def test_889_first_turn_error_line_unchanged() -> None:
+    """#889: the run's own (first) result keeps the original diagnostic line
+    even in live mode."""
+    state = ClaudeStreamState()
+    state.live_mode = True
+    state.factory.started(ResumeToken(engine="claude", value="681bd6d5-aaaa-bbbb"))
+    events = translate_claude_event(
+        _live_result(cost=1.5, api_ms=3000, is_error=True, text="boom"),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    completed = next(e for e in events if isinstance(e, CompletedEvent))
+    assert completed.error == (
+        "boom\nsession: 681bd6d5 · new · turns: 1 · cost: $1.50 · api: 3000ms"
+    )
 
 
 # ===========================================================================
@@ -4804,6 +5188,78 @@ class TestLoopObservation:
         assert len(pending) == 1
         assert pending[0].kind == "wakeup"
         assert pending[0].delay_seconds == 3600.0
+
+    @pytest.fixture
+    def _set_thread(self):
+        """Push a run thread (forum topic) into the run-context contextvar."""
+        from untether.utils.paths import reset_run_thread_id, set_run_thread_id
+
+        token = set_run_thread_id(10)
+        try:
+            yield 10
+        finally:
+            reset_run_thread_id(token)
+
+    @pytest.mark.usefixtures(
+        "_enable_loop", "_set_chat", "_set_thread", "_installed_scheduler"
+    )
+    async def test_826_cron_registration_records_run_thread(self):
+        """#826: a CronCreate inside a run in topic 10 records thread 10, so a
+        /new in another topic leaves it alone and fires land back in topic 10."""
+        from untether import loop_scheduler
+
+        state = ClaudeStreamState()
+        _seed_state_for_loop_observation(state, session_id="sess-cron-t10")
+        translate_claude_event(
+            _decode_event(
+                _make_tool_use_event(
+                    "CronCreate",
+                    "toolu_T10",
+                    {"cron": "*/5 * * * *", "prompt": "poll", "recurring": True},
+                )
+            ),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        translate_claude_event(
+            _decode_event(
+                _make_tool_use_event(
+                    "ScheduleWakeup",
+                    "toolu_T10W",
+                    {"delaySeconds": 3600, "prompt": "check later"},
+                )
+            ),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        pending = loop_scheduler.pending_for_chat(7777)
+        assert {(e.kind, e.thread_id) for e in pending} == {
+            ("cron", 10),
+            ("wakeup", 10),
+        }
+
+    @pytest.mark.usefixtures("_enable_loop", "_set_chat", "_installed_scheduler")
+    async def test_826_registration_without_run_thread_is_general(self):
+        """No run thread (General / non-topic chat) → ``thread_id=None``."""
+        from untether import loop_scheduler
+
+        state = ClaudeStreamState()
+        _seed_state_for_loop_observation(state, session_id="sess-cron-gen")
+        translate_claude_event(
+            _decode_event(
+                _make_tool_use_event(
+                    "CronCreate",
+                    "toolu_GEN",
+                    {"cron": "*/5 * * * *", "prompt": "poll", "recurring": True},
+                )
+            ),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        assert [e.thread_id for e in loop_scheduler.pending_for_chat(7777)] == [None]
 
     @pytest.mark.usefixtures("_enable_loop", "_set_chat", "_installed_scheduler")
     async def test_schedule_wakeup_skipped_when_below_threshold(self):

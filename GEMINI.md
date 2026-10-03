@@ -37,13 +37,13 @@ Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner
 - Stub subprocess runners with fake CLI scripts
 - FakeTransport protocol doubles (not real Telegram clients)
 - Verify 3-event contract in runner tests
-- Run: uv run pytest, uv run ruff check src/
+- Run: uv run pytest, uv run ruff check src/ tests/
 
 ## Key files
 
 - runners/claude.py — Claude Code runner with interactive features
-- runners/gemini.py — Gemini CLI runner
-- runners/amp.py — AMP CLI runner (Sourcegraph)
+- runners/gemini.py — Gemini CLI runner (deprecated; removal in 0.36.0 — xfail/skip on sweeps, don't fix)
+- runners/amp.py — AMP CLI runner (deprecated; removal in 0.36.0 — xfail/skip on sweeps, don't fix)
 - runner_bridge.py — Runner-to-transport bridge
 - cost_tracker.py — Per-run/daily cost tracking
 - telegram/bridge.py — Telegram message rendering

@@ -925,10 +925,12 @@ def test_files_max_download_bytes_rejects_more_than_two_gibibytes() -> None:
 
 
 def test_bot_api_base_url_accepts_loopback_http() -> None:
+    from pydantic import SecretStr
+
     from untether.settings import TelegramTransportSettings
 
     cfg = TelegramTransportSettings(
-        bot_token="token",
+        bot_token=SecretStr("token"),
         bot_api_base_url="http://127.0.0.1:8081/",
         chat_id=1,
         allow_any_user=True,
@@ -937,13 +939,13 @@ def test_bot_api_base_url_accepts_loopback_http() -> None:
 
 
 def test_bot_api_base_url_rejects_remote_http() -> None:
-    from pydantic import ValidationError
+    from pydantic import SecretStr, ValidationError
 
     from untether.settings import TelegramTransportSettings
 
     with pytest.raises(ValidationError, match="loopback"):
         TelegramTransportSettings(
-            bot_token="token",
+            bot_token=SecretStr("token"),
             bot_api_base_url="http://example.com",
             chat_id=1,
             allow_any_user=True,

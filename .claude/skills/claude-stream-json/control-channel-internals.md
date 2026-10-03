@@ -27,10 +27,12 @@ _PLAN_EXIT_APPROVED: set[str]                          # #283 diff-preview skip 
 _PENDING_ASK_REQUESTS: dict[str, tuple[int, str]]       # request_id -> (channel_id, question)
 _HANDLED_REQUESTS: dict[str, HandledControl | None]    # #685: answered/cancelled/expired record (action, outcome, channel)
 _INFLIGHT_CONTROL_RESPONSES: dict[str, str]            # #685: request_id -> claim owner while a tap is being written
+_REQUEST_TO_CHANNEL: dict[str, int]                    # #388: request_id -> chat its buttons were posted in (bind after every _REQUEST_TO_SESSION[...] =)
 _CANCELLED_DURING_WRITE: set[str]                      # #684: CLI withdrew the request while a tap was mid-write
 ```
 
 - Register on first `system.init` event (when session_id is known)
+- Every `can_use_tool` request logs INFO `control_request.received` (`request_id`, `tool_name`, `session_id`, `permission_mode`) before any branch decides it (#822); housekeeping subtypes don't. Keyboard / write / tap logs carry `tool_name` too — never `tool_input`
 - Clean up all registries in the `finally` block of `run_impl` (including outline and approval state)
 - All control responses go through `write_control_response(session_id, request_id, approved, deny_message)`
 - Taps go through `respond_to_control_request()` (#685): `claim_control_request()` reserves the id before the dispatcher's first `await` (early-toast hook), and the result is three-way — sent / already handled (`Already answered`, silent `ℹ️` line) / not found or expired. `classify_control_request()` is channel-scoped. `send_claude_control_response()` is the bool wrapper. Never write a response without a claim
@@ -102,7 +104,7 @@ When Claude calls `AskUserQuestion`:
 2. Question extracted from `input.question` or `input.questions[0].question`
 3. Progress message shows `❓ <question text>` with Approve/Deny buttons
 4. User replies with text → `telegram/loop.py` intercepts via `get_pending_ask_request()`
-5. `answer_ask_question()` sends deny response with user's text as `denial_message`
+5. `answer_ask_question()` sends a deny response with the user's text as its `message` (`deny_message=` on `write_control_response`)
 6. Claude reads the denial message as the answer and continues
 
 ## Diff preview
@@ -147,17 +149,17 @@ After the outline-gate auto-deny, synthetic Approve/Deny/Let's discuss buttons (
 
 Request (from Claude on stdout):
 ```json
-{"type":"control_request","request_id":"req_1","tool_name":"Bash","tool_input":{...}}
+{"type":"control_request","request_id":"req_1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{...}}}
 ```
 
-Response (to Claude on stdin):
+Response (to Claude on stdin, built by `write_control_response`):
 ```json
-{"type":"control_response","request_id":"req_1","approved":true}
+{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{"behavior":"allow","updatedInput":{...}}}}
 ```
 
 Denial with message:
 ```json
-{"type":"control_response","request_id":"req_1","approved":false,"denial_message":"..."}
+{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{"behavior":"deny","message":"..."}}}
 ```
 
 ## Stdin writers and live sessions (#776)

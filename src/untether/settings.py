@@ -144,6 +144,7 @@ class TelegramTransportSettings(BaseModel):
         {
             "bot_token",
             "bot_api_base_url",
+            "bot_api_local_dir",
             "chat_id",
             "session_mode",
             "topics",
@@ -157,6 +158,7 @@ class TelegramTransportSettings(BaseModel):
     # additionally redacted from log URLs by _redact_event_dict (#190).
     bot_token: SecretStr
     bot_api_base_url: NonEmptyStr = "https://api.telegram.org"
+    bot_api_local_dir: Path | None = None
     chat_id: StrictInt
     allowed_user_ids: list[StrictInt] = Field(default_factory=list)
     # #377: opt-in escape hatch for demos/dev. When the allowlist is
@@ -219,6 +221,16 @@ class TelegramTransportSettings(BaseModel):
         if not token:
             raise ValueError("bot_token must not be empty")
         return SecretStr(token)
+
+    @field_validator("bot_api_local_dir", mode="after")
+    @classmethod
+    def _validate_bot_api_local_dir(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        path = value.expanduser()
+        if not path.is_absolute():
+            raise ValueError("bot_api_local_dir must be an absolute directory path")
+        return path
 
     @field_validator("bot_api_base_url", mode="after")
     @classmethod
@@ -675,6 +687,7 @@ class WatchdogSettings(BaseModel):
     #   before Untether closes it with a notice (`max_hold`). With
     #   `bg_hold_rearm_on_progress = false` it counts from the last turn only
     #   (the rc14 behaviour). `live_session_max_s` still caps the process.
+    #   A declared wait (#872, `bg_hold_declared_waits`) is never cut short.
     # - `live_sessions = false` (legacy, #647/#646): the liveness-aware
     #   extension of the post-result ceiling — when `post_result_idle_timeout`
     #   expires while background handles are live and the process tree is not
@@ -686,6 +699,12 @@ class WatchdogSettings(BaseModel):
     # (see `post_result_bg_max_hold`). False = the hold counts from the last
     # turn only (rc14). Read per spawn, so a change applies to the next run.
     bg_hold_rearm_on_progress: bool = True
+    # #872: a live session's background hold never closes before a declared
+    # wait ends — a background Bash's `timeout` (with `run_in_background`;
+    # the CLI enforces it, up to 2 h) or a pending ScheduleWakeup (up to 1 h)
+    # — plus a short grace, still capped by `live_session_max_s`. False = the
+    # rc16 quiet-time rule only. Read per spawn.
+    bg_hold_declared_waits: bool = True
 
     # #776: live-session model for Claude (control-channel mode). The process
     # stays live after its reply: background-task / scheduled-wakeup /
@@ -1071,7 +1090,7 @@ def load_settings_if_exists(
 #
 # One Claude message used to parse untether.toml at least 15 times (plus ~one
 # per tool call), each parse blocking the event loop for ~10-47 ms. The key is
-# the exact file bytes, not ``(mtime_ns, size)`` like ``config_watch`` uses:
+# the exact file bytes, not ``(mtime_ns, size)`` (``config_watch`` too, #839):
 # on kernels < 6.13 timestamps are coarse, so two same-size writes inside one
 # tick share a stat signature and a stat-keyed cache would serve stale config.
 

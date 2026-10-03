@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from ...commands import CommandBackend, CommandContext, CommandResult
+from ...commands import (
+    CommandAttachment,
+    CommandBackend,
+    CommandContext,
+    CommandResult,
+)
 from ...logging import get_logger
+from ...markdown import backtick_fence, inline_code
 from ...session_costs import token_counts
 from ...transport import ChannelId
 
@@ -94,6 +101,28 @@ def latest_session_for_chat(
     return best
 
 
+def _command_line(symbol: str, command: str) -> str:
+    """#871/#418: a command as Markdown that its own backticks can't break.
+
+    One line → a code span; a multi-line command (heredoc) → a fenced block
+    inside the list item, so the export keeps it verbatim."""
+    if "\n" not in command.strip():
+        return f"- {symbol} {inline_code(command)}"
+    fence = backtick_fence(command, minimum=3)
+    body = "\n".join(f"  {ln}" if ln else "" for ln in command.strip("\n").splitlines())
+    return f"- {symbol}\n\n  {fence}\n{body}\n  {fence}\n"
+
+
+# #418: headings for a live session's later turns (``TurnEvent.reason``).
+_TURN_REASON_LABELS: dict[str, str] = {
+    "followup": "follow-up",
+    "task_finished": "background task finished",
+    "scheduled_wakeup": "scheduled wake-up",
+    "monitor_event": "monitor event",
+    "hook_rewake": "hook wake-up",
+}
+
+
 def _format_export_markdown(
     session_id: str,
     events: list[dict],
@@ -127,6 +156,16 @@ def _format_export_markdown(
                 token_parts.append(f"{output_tokens} out")
             parts.append(" / ".join(token_parts) + " tokens")
         if parts:
+            # The transcript spans every run of the session but the recorded
+            # usage is the latest run's (rc15 integration finding), except
+            # for engines that report a running thread total (Codex).
+            from ...runner_bridge import _TOKEN_LEDGER_SCOPES
+
+            engine = _session_engine(events)
+            thread_total = _TOKEN_LEDGER_SCOPES.get(engine or "") == (
+                "thread_cumulative"
+            )
+            parts.append("thread total" if thread_total else "last run")
             lines.append(f"**Usage:** {' · '.join(parts)}\n")
 
     lines.append("---\n")
@@ -156,7 +195,7 @@ def _format_export_markdown(
             else:
                 symbol = "↻"
             if kind == "command":
-                lines.append(f"- {symbol} `{title}`")
+                lines.append(_command_line(symbol, title))
             elif kind == "file_change":
                 lines.append(f"- {symbol} 📝 {title}")
             elif kind == "tool":
@@ -168,6 +207,11 @@ def _format_export_markdown(
                 lines.append(f"- {symbol} ⚠️ {title}")
             else:
                 lines.append(f"- {symbol} {title}")
+        elif evt_type == "turn":
+            # #418: a later turn of a live session (follow-up / wake turn).
+            turn = evt.get("turn")
+            label = _TURN_REASON_LABELS.get(str(evt.get("reason")), "turn")
+            lines.append(f"\n## Turn {turn} ({label})")
         elif evt_type == "completed":
             ok = evt.get("ok", False)
             answer = evt.get("answer", "")
@@ -177,9 +221,7 @@ def _format_export_markdown(
             if error:
                 lines.append(f"Error: {error}\n")
             if answer:
-                # Truncate very long answers
-                if len(answer) > 2000:
-                    answer = answer[:2000] + "\n\n…(truncated)"
+                # #418: never truncated — the export file is the durable copy.
                 lines.append(f"\n{answer}")
 
     return "\n".join(lines)
@@ -198,6 +240,19 @@ def _format_export_json(
         "events": events,
     }
     return json.dumps(export, indent=2, default=str)
+
+
+# #418: the inline preview sent when the export file can't be attached.
+_FALLBACK_PREVIEW_CHARS = 3000
+_UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _export_filename(engine: str | None, session_id: str, fmt: str) -> str:
+    """``untether-export-<engine>-<sid>-<YYYYmmdd-HHMM>.<md|json>`` (UTC)."""
+    safe_engine = _UNSAFE_FILENAME_RE.sub("_", engine or "")[:24] or "session"
+    safe_sid = _UNSAFE_FILENAME_RE.sub("_", session_id)[:36] or "unknown"
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M")
+    return f"untether-export-{safe_engine}-{safe_sid}-{stamp}.{fmt}"
 
 
 class ExportCommand:
@@ -230,11 +285,27 @@ class ExportCommand:
         else:
             content = _format_export_markdown(session_id, events, usage)
 
-        # Send the formatted text (Telegram supports up to 4096 chars)
-        preview = content[:3000] if len(content) > 3000 else content
+        # #418: attach the full transcript as a document; the caption is a
+        # short summary and the inline preview is only the upload fallback.
+        engine = latest.engine
+        label = "JSON" if fmt == "json" else "Markdown"
+        caption = (
+            f"📄 Session export — {engine or 'unknown engine'} · "
+            f"{len(events)} events · {label}\nSession: {session_id}"
+        )
+        fallback = (
+            f"📄 Session export ({len(events)} events, {fmt}) — couldn't attach "
+            f"the file, showing the first {_FALLBACK_PREVIEW_CHARS:,} characters:"
+            f"\n\n{content[:_FALLBACK_PREVIEW_CHARS]}"
+        )
         return CommandResult(
-            text=f"📄 Session export ({len(events)} events, {fmt}):\n\n{preview}",
+            text=caption,
             notify=True,
+            attachment=CommandAttachment(
+                filename=_export_filename(engine, session_id, fmt),
+                content=content.encode("utf-8"),
+                fallback_text=fallback,
+            ),
         )
 
 

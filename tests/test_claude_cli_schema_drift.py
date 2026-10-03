@@ -30,7 +30,7 @@ from untether.schemas.claude import (
 )
 
 # Last CLI these constants were re-derived against.
-PROBED_CLI_VERSION = "2.1.285"
+PROBED_CLI_VERSION = "2.1.287"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("claude") is None, reason="claude CLI not installed"
@@ -385,11 +385,20 @@ def test_hook_started_precedes_a_detached_hook_spawn(cli_blob: mmap.mmap) -> Non
             f"re-derive the probe (last green on CLI {PROBED_CLI_VERSION})"
         )
     for detached, window in command_spawns:
-        assigned = re.search(rb"[,;]" + re.escape(detached) + rb"=!(\w+)[,;]", window)
+        # The flag is declared either inside a longer ``let`` list
+        # (``…,_n=!Qe,`` up to 2.1.286) or as the head of its own ``let``
+        # (``let Jn=!Ze,`` on 2.1.287, where a new hook-cwd early return —
+        # ``startsOutsideProject`` → ``spawnFailed`` — split the list).
+        assigned = re.search(
+            rb"(?:[,;]|let )" + re.escape(detached) + rb"=!([\w$]+)[,;]", window
+        )
         assert assigned is not None, (
             f"hook spawn detached:{detached.decode()} is no longer `!<windows>`"
         )
         windows = re.escape(assigned.group(1))
+        assert re.search(
+            rb"[,;\s]" + windows + rb'=[\w$]+\(\)==="windows"[,;]', window
+        ), "the hook spawn's detached flag is no longer `!(platform === windows)`"
         assert re.search(
             windows + rb"\?\w+\(\):null;if\(" + windows + rb"&&!\w+\)throw Error\("
             rb'`Hook "\$\{\w+\.command\}" requires bash but Git Bash',
@@ -883,4 +892,136 @@ def test_init_frame_carries_permission_mode(cli_blob: mmap.mmap) -> None:
     assert b"permissionMode:" in window, (
         "system/init no longer declares permissionMode "
         f"(last green on CLI {PROBED_CLI_VERSION})"
+    )
+
+
+# --- #872: declared background waits ------------------------------------------
+
+
+def test_872_background_bash_time_limit_present(cli_blob: mmap.mmap) -> None:
+    """#872 rests on the CLI enforcing a background command's ``timeout``
+    itself: 30 min default, 2 h maximum, then "stopped after reaching its
+    background time limit". If the defaults move, the hold's grace and the
+    docs (FAQ, troubleshooting) need re-checking."""
+    limits = re.search(
+        rb"var [\w$]{1,4}=(\d+);function [\w$]{1,4}\(\)\{return "
+        rb"Math\.min\(Math\.max\((\d+),",
+        cli_blob,
+    )
+    if limits is None:
+        pytest.skip(
+            "background Bash time-limit constants not found — re-derive the "
+            f"probe (last green on CLI {PROBED_CLI_VERSION})"
+        )
+    assert (limits.group(1), limits.group(2)) == (b"1800000", b"7200000"), (
+        "the CLI's background-command default / max time limit moved to "
+        f"{limits.group(1).decode()} / {limits.group(2).decode()} ms — review "
+        "#872's declared-wait docs"
+    )
+    if cli_blob.find(b"stopped after reaching its background time limit") < 0:
+        pytest.fail(
+            "the CLI no longer stops background commands at their time limit "
+            "(notice text gone) — a declared wait now ends only at Untether's "
+            f"grace or live_session_max_s (last green on CLI {PROBED_CLI_VERSION})"
+        )
+
+
+def test_872_schedule_wakeup_clamp_present(cli_blob: mmap.mmap) -> None:
+    """ScheduleWakeup stays within [60, 3600] s, so a wake-up the hold waits
+    for is bounded well inside ``live_session_max_s``."""
+    if cli_blob.find(b"outside [60, 3600]") < 0:
+        pytest.fail(
+            "ScheduleWakeup's [60, 3600] s clamp moved — a pending wake-up may "
+            "now hold a live session longer than an hour (#872; last green on "
+            f"CLI {PROBED_CLI_VERSION})"
+        )
+
+
+# --- #828: hook frames carry no async / subagent marker ------------------------
+
+_HOOK_MARKER_KEYS = (
+    b"agent_id:",
+    b"agent_type:",
+    b"parent_tool_use_id:",
+    b"async:",
+    b"asyncRewake",
+    b"rewake:",
+)
+
+
+def test_828_hook_frames_still_carry_no_async_or_agent_marker(
+    cli_blob: mmap.mmap,
+) -> None:
+    """#828 tells a background subagent's sync hook from an asyncRewake one
+    by *when it started* (it must outlive its turn), because neither frame
+    says which it is. If the CLI starts marking hook frames natively, switch
+    the heuristic to the marker (native first)."""
+    started = re.search(
+        rb'subtype:"hook_started",hook_id:[\w$]{1,4},hook_name:[\w$]{1,4},'
+        rb"hook_event:[\w$]{1,4}[^}]{0,200}\}",
+        cli_blob,
+    )
+    response = re.search(
+        rb'subtype:"hook_response",[^;]{0,600}?outcome:[\w$.]+\}\)', cli_blob
+    )
+    if started is None or response is None:
+        pytest.skip(
+            "hook_started / hook_response emitter literals not found — re-derive "
+            f"the probe (last green on CLI {PROBED_CLI_VERSION})"
+        )
+    for frame, literal in (
+        ("hook_started", started.group(0)),
+        ("hook_response", response.group(0)),
+    ):
+        for key in _HOOK_MARKER_KEYS:
+            assert key not in literal, (
+                f"{frame} now carries {key.decode()!r} — the CLI marks hook "
+                "frames natively; switch #828's outlived-turn heuristic to it "
+                f"(last green on CLI {PROBED_CLI_VERSION})"
+            )
+
+
+# --- #825 / #876: foreground -> background transitions -------------------------
+
+
+def test_825_task_updated_patch_reports_is_backgrounded(cli_blob: mmap.mmap) -> None:
+    """The ``task_updated`` patch differ emits ``is_backgrounded`` when the CLI
+    moves a running foreground task to the background — #876's primary
+    signal (the snapshot listing and the idle-notification fallback remain)."""
+    differ = re.search(
+        rb'"isBackgrounded"in [\w$]{1,4}\?[\w$]{1,4}\.isBackgrounded:void 0;'
+        rb"if\([\w$]{1,4}!==[\w$]{1,4}&&[\w$]{1,4}!==void 0\)"
+        rb"[\w$]{1,4}\.is_backgrounded=[\w$]{1,4}",
+        cli_blob,
+    )
+    if differ is None:
+        if re.search(rb"[\w$]\.is_backgrounded=[\w$]", cli_blob) is None:
+            pytest.fail(
+                "foreground→background transitions are no longer reported on "
+                "task_updated — #876's snapshot / idle-notification fallback is "
+                f"the only path (last green on CLI {PROBED_CLI_VERSION})"
+            )
+        pytest.skip(
+            "task_updated patch differ moved — re-derive the probe "
+            f"(last green on CLI {PROBED_CLI_VERSION})"
+        )
+
+
+_EFFORT_HELP_RE = re.compile(r"--effort <level>[^(]*\(([^)]*)\)", re.DOTALL)
+
+
+def test_743_effort_choices_match_untether_levels() -> None:
+    """#743: a cron's `reasoning` is validated against Untether's Claude
+    levels, which must match the CLI's `--effort` choices (#416 rule: every
+    allowed level has a /config button). Zero-token: `claude --help` only."""
+    from untether.telegram.engine_overrides import allowed_reasoning_levels
+
+    text = _claude_help()
+    match = _EFFORT_HELP_RE.search(text)
+    if match is None:
+        pytest.skip("`--effort` choices not found in `claude --help`")
+    choices = {c.strip() for c in match.group(1).replace("\n", " ").split(",")}
+    assert choices == set(allowed_reasoning_levels("claude")), (
+        "CLI effort levels changed — update `telegram/engine_overrides.py` and "
+        f"the /config reasoning buttons (#416 rule): CLI {sorted(choices)}"
     )

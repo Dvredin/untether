@@ -58,7 +58,7 @@ Webhooks accept HTTP POST requests and turn them into agent runs. Example: trigg
 
 ### Authentication
 
-Every webhook requires explicit auth. Choose one:
+`auth` defaults to `bearer`, and every mode except `none` needs a `secret`. Choose one:
 
 | Mode | Header | Use case |
 |------|--------|----------|
@@ -79,21 +79,26 @@ All webhook prompts are automatically prefixed with an untrusted-payload marker 
 
 ### Test a webhook locally
 
+The `github-push` webhook above uses HMAC and an `event_filter`, so a test request has to sign its body and send the event header (with no `X-GitHub-Event: push` header the server answers `200 filtered` and starts nothing):
+
 ```bash
+BODY='{"ref": "refs/heads/main", "pusher": {"name": "alice"}}'
+SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac 'whsec_your_github_secret' | sed 's/^.* //')"
 curl -X POST http://127.0.0.1:9876/hooks/github \
-  -H "Authorization: Bearer my-secret-token" \
+  -H "X-Hub-Signature-256: $SIG" \
+  -H "X-GitHub-Event: push" \
   -H "Content-Type: application/json" \
-  -d '{"ref": "refs/heads/main", "pusher": {"name": "alice"}}'
+  -d "$BODY"
 ```
 
-A `202 Accepted` response means the run was dispatched.
+For a `bearer` webhook, send `-H "Authorization: Bearer <secret>"` instead. A `202 Accepted` response means the run was dispatched.
 
 !!! untether "Untether"
-    🔔 **webhook** · github-push
-
-    Review push to refs/heads/main by alice
+    ⚡ Trigger: webhook:github-push
 
     working · claude · 4s · step 1
+
+Crons announce themselves the same way, as `⏰ Scheduled: cron:<id>`. The run's progress and final answer reply to that message. If Telegram can't be reached, the announcement is retried after 5 s and 30 s before the trigger is given up ([#758](https://github.com/littlebearapps/untether/issues/758)).
 
 ## Set up a cron schedule
 
@@ -180,12 +185,14 @@ Crons can pull data from external sources before rendering the prompt:
     [triggers.crons.fetch]
     type = "http_get"
     url = "https://api.github.com/repos/myorg/myapp/issues?state=open"
-    headers = { "Authorization" = "Bearer {{env.GITHUB_TOKEN}}" }
+    headers = { "Authorization" = "Bearer ghp_your_token_here" }  # literal value — no {{env.NAME}} lookup
     parse_as = "json"
     store_as = "issues"
 
     prompt_template = "Open issues:\n{{issues}}\n\nReview and propose labels."
     ```
+
+Header values are used literally — `{{…}}` placeholders in `url`, `headers` and `body` render as empty strings and there is no `{{env.NAME}}` lookup — so keep `untether.toml`'s permissions tight (`chmod 600`).
 
 The fetch step runs before prompt rendering. Fetched data is injected into `prompt_template` via the `store_as` variable name. If the fetch fails, the default behaviour (`on_failure = "abort"`) sends a failure notification to Telegram and skips the agent run.
 
@@ -219,7 +226,7 @@ Webhooks can perform lightweight actions without spawning an agent:
     message_template = "📈 {{ticker}} hit {{price}}"
     ```
 
-Action types: `agent_run` (default), `file_write`, `http_forward`, `notify_only`. See the
+Action types: `agent_run` (default), `file_write`, `http_forward`, `notify_only`. A `file_write` path, like a cron `file_read` fetch, is checked against `[transports.telegram.files] deny_globs` at any depth, so a templated path can't land in `.git/hooks` or `~/.ssh` ([#831](https://github.com/littlebearapps/untether/issues/831)). See the
 [triggers reference](../reference/triggers/triggers.md#non-agent-actions) for details.
 
 ## Chat routing
@@ -227,8 +234,9 @@ Action types: `agent_run` (default), `file_write`, `http_forward`, `notify_only`
 Each webhook and cron can specify where the Telegram notification appears:
 
 - Set `chat_id` to post in a specific chat
-- If omitted, uses the default chat from `[transports.telegram]`
+- If omitted, uses the default chat from `[transports.telegram]` — even when `project` is set. A project's bound chat is **not** used, so add `chat_id` to post in the project's chat. Untether logs `trigger.cron.chat_fallback` / `trigger.webhook.chat_fallback` once when a project-only trigger will post to a different chat than the project's ([#894](https://github.com/littlebearapps/untether/issues/894))
 - Set `project` to run in a specific project's working directory
+- Set `engine` to pick the engine. Without it, a trigger with a `project` runs on that project's `default_engine` (since v0.35.5 — it used to fall back to the global default, [#862](https://github.com/littlebearapps/untether/issues/862)), and one without a project uses the global `default_engine`
 
 ## Server configuration
 
@@ -291,11 +299,13 @@ prompt = "Check today's deployment status"
 run_once = true
 ```
 
-After the cron fires, the `triggers.cron.run_once_completed` log line confirms the removal. Fired state is persisted to `run_once_fired.json` (sibling of `untether.toml`), so the cron is skipped across config reloads and process restarts — the TOML entry is kept for history but won't refire. To re-enable a one-shot, change its `id` or remove both the TOML entry and its record in `run_once_fired.json`.
+After the cron fires, the `triggers.cron.run_once_completed` log line confirms the removal, and the startup message counts it separately from scheduled crons ([#809](https://github.com/littlebearapps/untether/issues/809)). Fired state is persisted to `run_once_fired.json` (sibling of `untether.toml`), so the cron is skipped across config reloads and process restarts — the TOML entry is kept for history but won't refire. To re-enable a one-shot, change its `id` or remove both the TOML entry and its record in `run_once_fired.json`.
+
+A one-shot only counts as fired once its run is dispatched. If the `⏰ Scheduled:` message can't be posted (a wrong `chat_id`, or a Telegram or network outage), nothing runs and the cron stays pending: Untether retries it once a minute for up to 15 minutes, then gives up and logs `triggers.cron.run_once_lost` at error level ([#893](https://github.com/littlebearapps/untether/issues/893)). The pending state is saved to `run_once_pending.json` next to `untether.toml`, so a restart during that window carries on retrying on the first minute after startup, and a restart after the window closed gives the cron up straight away. A pause during the window still gets one retry after you resume before the cron is given up.
 
 ## Autonomous crons in plan-mode chats (Claude)
 
-A cron normally inherits the chat's permission mode, which means a scheduled run fires into a plan-mode chat and stops for your approval — not useful for a cron that runs at 6 AM. Set `permission_mode = "auto"` on the cron to override:
+A cron normally inherits the chat's permission mode, then the engine default (`plan` unless `[engines.claude] permission_mode` says otherwise). Nobody can approve anything when a cron fires, so an unattended Claude run denies anything that would wait for a tap ([#835](https://github.com/littlebearapps/untether/issues/835)) — a cron that inherits `plan` ends with a plan instead of doing the work. **Give every Claude cron that should act unattended an explicit `permission_mode`.** Set `permission_mode = "auto"` on the cron to override:
 
 ```toml
 [[triggers.crons]]
@@ -308,12 +318,32 @@ permission_mode = "auto"
 ```
 
 !!! warning "`auto` changed meaning in v0.35.5"
-    Before v0.35.5, `permission_mode = "auto"` meant plan mode with the plan gate auto-approved. It now selects Claude Code's own classifier-gated auto mode, which has no plan phase. Existing crons keep running but behave differently — set `"plan-auto"` to restore the previous behaviour. Untether logs one warning at startup, and again if a config reload changes the list, naming every engine setting and cron that uses `"auto"`. It also warns at startup about crons set to `default`, `manual`, `acceptEdits` or `plan`, which wait for a tap nobody gives, and logs the same warning when a cron or webhook fires into a chat whose mode will ask for approval.
+    Before v0.35.5, `permission_mode = "auto"` meant plan mode with the plan gate auto-approved. It now selects Claude Code's own classifier-gated auto mode, which has no plan phase. Existing crons keep running but behave differently — set `"plan-auto"` to restore the previous behaviour. Untether logs one warning at startup, and again if a config reload changes the list, naming every engine setting and cron that uses `"auto"`.
 
-!!! warning "Prompting modes wait for a tap"
-    Since v0.35.5, `default`, `manual` and `acceptEdits` (what `/planmode off` sets) show Approve / Deny buttons for any tool call the mode doesn't cover ([#749](https://github.com/littlebearapps/untether/issues/749)). An unattended cron that inherits one of them will wait on that button. Set `permission_mode` on the cron to `plan-auto`, `auto`, `dontAsk` or `bypassPermissions` for hands-off runs.
+!!! warning "Unattended runs deny instead of waiting"
+    Cron and webhook runs never wait on an approval button nobody can tap ([#835](https://github.com/littlebearapps/untether/issues/835)). In `default` / `manual` / `acceptEdits` (what `/planmode off` sets) any tool the mode would ask about is denied; in `plan` the plan approval and the file-changing tools (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `Bash`) are denied; in `auto`, `dontAsk` and `bypassPermissions` only the requests the CLI still asks about (an `ask` rule, a hook's `ask`, a tool that needs a person, auto mode falling back after repeated blocks) are denied; with diff preview on, an edit awaiting its diff approval is denied. Questions are always denied. Claude is told to carry on without the denied action or stop and report; the final lists the denials (`🔒 unattended (cron:<id>) · denied …`) and each logs `permission.unattended_deny`. A reply to the run's message continues in an attended session with normal buttons. `/at` runs keep their buttons. For hands-off crons set `permission_mode` to `plan-auto`, `auto` or `bypassPermissions` (or pre-approve the tools). Startup logs `trigger.unattended_approval_risk` for crons set to an asking mode, and the startup message lists them.
 
-Precedence (Claude only): cron `permission_mode` > per-chat `/planmode` > engine config default. Every run that actually changes the resolved value logs `trigger.cron.permission_mode_override` for staging observability. Valid values: `default` (alias `manual`), `plan`, `plan-auto`, `auto`, `acceptEdits`, `dontAsk`, `bypassPermissions`. Other engines (Codex, Gemini, OpenCode, Pi, AMP) silently ignore this field — full coverage is tracked in [#332](https://github.com/littlebearapps/untether/issues/332). See [Schedule tasks — Autonomous crons](schedule-tasks.md#autonomous-crons) for the everyday framing.
+!!! note "Webhooks have no `permission_mode`"
+    A webhook run always uses its chat's `/planmode`, then the engine default — so a webhook into a `plan` (or `/planmode off`) chat has its approvals denied the same way. Set the chat's mode with `/planmode plan-auto` or `/planmode auto` if the webhook should act on its own; per-webhook overrides are tracked in [#332](https://github.com/littlebearapps/untether/issues/332). Webhooks aren't listed in the startup message.
+
+Precedence (Claude only): cron `permission_mode` > per-chat `/planmode` > engine config default. Every run that actually changes the resolved value logs `trigger.cron.permission_mode_override` for staging observability. Valid values: `default` (alias `manual`), `plan`, `plan-auto`, `auto`, `acceptEdits`, `dontAsk`, `bypassPermissions`. On a Codex cron, `permission_mode = "safe"` runs that cron in Codex's read-only sandbox; any other value logs `codex.permission_mode.unknown` once and runs full auto ([#830](https://github.com/littlebearapps/untether/issues/830)). Gemini (deprecated) passes it through as `--approval-mode`; OpenCode, Pi and AMP ignore the field — full coverage is tracked in [#332](https://github.com/littlebearapps/untether/issues/332). See [Schedule tasks — Autonomous crons](schedule-tasks.md#autonomous-crons) for the everyday framing.
+
+## Per-cron model and effort
+
+`model` and `reasoning` on a `[[triggers.crons]]` entry pick the model and effort (reasoning) for that scheduled run only, winning over the chat's `/model` and reasoning setting; unset inherits as before ([#743](https://github.com/littlebearapps/untether/issues/743)):
+
+```toml
+[[triggers.crons]]
+id = "nightly-triage"
+schedule = "0 6 * * *"
+engine = "claude"
+model = "sonnet"
+reasoning = "low"
+permission_mode = "auto"
+prompt = "Triage new issues."
+```
+
+Set `engine` alongside `model` so the name matches the engine. `reasoning` is checked against the engine's levels at config load when `engine` is set (Claude `low`…`max`, Codex `low`…`xhigh`; OpenCode/Pi don't take it) — a bad value fails the trigger config the way a bad `permission_mode` does (on reload the previous triggers stay active and `config.reload.triggers_failed` is logged). A reply to the cron's message runs on the chat's model. Logs: `trigger.cron.model_override`, `trigger.cron.reasoning_override`. Webhooks have neither field yet — per-webhook overrides are tracked in [#332](https://github.com/littlebearapps/untether/issues/332). See [Schedule tasks — Pick a model per cron](schedule-tasks.md#pick-a-model-per-cron).
 
 ## Delayed runs with `/at`
 

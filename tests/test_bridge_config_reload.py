@@ -199,6 +199,7 @@ class TestRestartRequiredFields:
                 {
                     "bot_token",
                     "bot_api_base_url",
+                    "bot_api_local_dir",
                     "chat_id",
                     "session_mode",
                     "topics",

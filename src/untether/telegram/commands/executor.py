@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -30,8 +31,10 @@ from ...transport_runtime import TransportRuntime
 from ...utils.paths import (
     reset_run_base_dir,
     reset_run_channel_id,
+    reset_run_thread_id,
     set_run_base_dir,
     set_run_channel_id,
+    set_run_thread_id,
 )
 from ..bridge import send_plain
 from ..engine_overrides import (
@@ -89,8 +92,11 @@ class _PreludeRunner:
     ) -> AsyncIterator[UntetherEvent]:
         for event in self.prelude_events:
             yield event
-        async for event in self.runner.run(prompt, resume):
-            yield event
+        # ``aclosing`` so closing this wrapper also closes the runner's
+        # generator in the same task (see ``BaseRunner.run_with_resume_lock``).
+        async with contextlib.aclosing(self.runner.run(prompt, resume)) as events:
+            async for event in events:
+                yield event
 
 
 def _reasoning_note(engine: str, message: str) -> ActionEvent:
@@ -125,7 +131,8 @@ def _resolve_reasoning_override(
         logger.info(
             "run.reasoning.unsupported_level_ignored",
             engine=engine,
-            level=level,
+            # Not ``level=``: structlog's add_log_level overwrites that key.
+            reasoning_level=level,
             allowed=list(allowed_reasoning_levels(engine)),
         )
         message = (
@@ -266,6 +273,8 @@ async def _run_engine(
         )
         run_base_token = set_run_base_dir(cwd)
         run_channel_token = set_run_channel_id(chat_id)
+        # #826: loop registrations record the run's topic.
+        run_thread_token = set_run_thread_id(thread_id)
         try:
             run_fields = {
                 "chat_id": chat_id,
@@ -304,6 +313,7 @@ async def _run_engine(
         finally:
             reset_run_base_dir(run_base_token)
             reset_run_channel_id(run_channel_token)
+            reset_run_thread_id(run_thread_token)
     except Exception as exc:
         logger.exception(
             "handle.worker_failed",

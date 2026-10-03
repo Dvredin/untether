@@ -70,7 +70,21 @@ def test_parse_envelope_ok() -> None:
 @pytest.mark.anyio
 async def test_client_methods_build_params_and_decode() -> None:
     payloads = {
-        "getUpdates": [{"update_id": 1}],
+        "getUpdates": [
+            {
+                "update_id": 1,
+                "message": {
+                    "message_id": 9,
+                    "chat": {"id": 1, "type": "private"},
+                    "text": "new",
+                    "quote": {"text": "selected"},
+                    "reply_to_message": {
+                        "message_id": 8,
+                        "caption": "caption",
+                    },
+                },
+            }
+        ],
         "getFile": {"file_path": "path"},
         "sendMessage": {"message_id": 1, "chat": {"id": 1, "type": "private"}},
         "sendDocument": {"message_id": 2, "chat": {"id": 1, "type": "private"}},
@@ -108,6 +122,11 @@ async def test_client_methods_build_params_and_decode() -> None:
 
     updates = await client.get_updates(offset=10, allowed_updates=["message"])
     assert updates and updates[0].update_id == 1
+    assert updates[0].message is not None
+    assert updates[0].message.quote is not None
+    assert updates[0].message.quote.text == "selected"
+    assert updates[0].message.reply_to_message is not None
+    assert updates[0].message.reply_to_message.caption == "caption"
 
     assert await client.get_file("file") is not None
 
@@ -284,6 +303,7 @@ async def test_download_file_reads_local_bot_api_absolute_path(tmp_path) -> None
     target.write_bytes(b"local payload")
     client = HttpBotClient(
         "token",
+        bot_api_local_dir=tmp_path,
         base_url="http://127.0.0.1:8081",
         http_client=httpx.AsyncClient(),
     )
@@ -532,6 +552,8 @@ async def test_746_http_400_non_benign_stays_error() -> None:
     assert errors[0]["log_level"] == "error"
     assert errors[0]["status"] == 400
     assert errors[0]["message_id"] == 916
+    # #823: the chat is logged too (message_ids are per chat)
+    assert errors[0]["chat_id"] == 123
     assert not _events(logs, "telegram.benign_rejection")
     # D4: the readable description is recorded for the #598 reason
     assert api.pop_last_api_error("editMessageText", 123, 916) == desc
@@ -579,6 +601,7 @@ async def test_746_non_400_status_stays_error(
     errors = _events(logs, "telegram.http_error")
     assert len(errors) == 1 and errors[0]["log_level"] == "error"
     assert errors[0]["status"] == status
+    assert errors[0]["chat_id"] == 123
     assert not _events(logs, "telegram.benign_rejection")
     assert api.pop_last_api_error("editMessageText", 123, 916) == reason
 
@@ -718,3 +741,154 @@ async def test_746_benign_burst_keys_are_independent() -> None:
     assert len(bursts) == 1
     assert bursts[0]["distinct_messages"] == 5
     assert bursts[0]["message_ids"] == [1000, 1001, 1002, 1003, 1004]
+
+
+# --- rc15 integration finding: dead connections and per-call timeouts --------
+
+
+def _flaky_client(error: Exception, *, fail_times: int = 1):
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path.rsplit("/", 1)[-1])
+        if len(calls) <= fail_times:
+            raise error
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return HttpBotClient("token", http_client=http), calls
+
+
+@pytest.mark.anyio
+async def test_edit_retries_once_after_read_timeout() -> None:
+    client, calls = _flaky_client(httpx.ReadTimeout("dead flow"))
+    result = await client._request(
+        "editMessageText", json={"chat_id": 1, "message_id": 2, "text": "x"}
+    )
+    assert result is True
+    assert calls == ["editMessageText", "editMessageText"]
+
+
+@pytest.mark.anyio
+async def test_send_is_not_repeated_after_read_timeout() -> None:
+    # It may have reached Telegram: a repeat could duplicate the message.
+    client, calls = _flaky_client(httpx.ReadTimeout("dead flow"))
+    result = await client._request("sendMessage", json={"chat_id": 1, "text": "x"})
+    assert result is None
+    assert calls == ["sendMessage"]
+
+
+@pytest.mark.anyio
+async def test_send_retries_when_the_request_never_left() -> None:
+    client, calls = _flaky_client(httpx.ConnectError("refused"))
+    result = await client._request("sendMessage", json={"chat_id": 1, "text": "x"})
+    assert result is True
+    assert calls == ["sendMessage", "sendMessage"]
+
+
+@pytest.mark.anyio
+async def test_retry_happens_only_once() -> None:
+    client, calls = _flaky_client(httpx.ConnectError("refused"), fail_times=5)
+    result = await client._request("sendMessage", json={"chat_id": 1, "text": "x"})
+    assert result is None
+    assert len(calls) == 2
+
+
+@pytest.mark.anyio
+async def test_get_updates_is_never_retried_here() -> None:
+    client, calls = _flaky_client(httpx.ConnectError("refused"))
+    assert await client._request("getUpdates", json={"timeout": 1}) is None
+    assert calls == ["getUpdates"]
+
+
+def test_owned_client_uses_short_message_timeouts() -> None:
+    client = HttpBotClient("token", timeout_s=120)
+    timeout = client._http_client.timeout
+    assert timeout.read == 30.0
+    assert timeout.connect == 10.0
+    assert client._bulk_timeout_s == 120
+
+
+# --- #823: chat_id on every unattributable error line ---
+
+
+@pytest.mark.anyio
+async def test_823_send_document_http_error_has_chat_id() -> None:
+    from structlog.testing import capture_logs
+
+    api, http = _api_400("Bad Request: file is too big")
+    try:
+        with capture_logs() as logs:
+            result = await api.send_document(chat_id=456, filename="x.md", content=b"x")
+    finally:
+        await http.aclose()
+    assert result is None
+    errors = _events(logs, "telegram.http_error")
+    assert len(errors) == 1
+    # multipart (data=) payloads carry the chat too
+    assert errors[0]["chat_id"] == 456
+    assert errors[0]["message_id"] is None
+
+
+@pytest.mark.anyio
+async def test_823_network_error_has_chat_id() -> None:
+    from structlog.testing import capture_logs
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    api = HttpBotClient("123:abcDEF_ghij", http_client=http)
+    try:
+        with capture_logs() as logs:
+            result = await api.edit_message_text(chat_id=123, message_id=9, text="x")
+    finally:
+        await http.aclose()
+    assert result is None
+    errors = _events(logs, "telegram.network_error")
+    assert len(errors) == 1
+    assert errors[0]["chat_id"] == 123
+    assert errors[0]["message_id"] == 9
+    for retry in _events(logs, "telegram.network_retry"):
+        assert retry["chat_id"] == 123
+    assert "abcDEF" not in str(logs)
+
+
+@pytest.mark.anyio
+async def test_823_envelope_api_error_has_chat_id() -> None:
+    from structlog.testing import capture_logs
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"ok": False, "error_code": 400, "description": "x"},
+            request=request,
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    api = HttpBotClient("123:abcDEF_ghij", http_client=http)
+    try:
+        with capture_logs() as logs:
+            result = await api.edit_message_text(chat_id=123, message_id=9, text="x")
+    finally:
+        await http.aclose()
+    assert result is None
+    errors = _events(logs, "telegram.api_error")
+    assert len(errors) == 1
+    assert errors[0]["chat_id"] == 123
+    assert errors[0]["message_id"] == 9
+    assert api.pop_last_api_error("editMessageText", 123, 9) == "x"
+
+
+@pytest.mark.parametrize("payload", [None, "x", [1, 2], 5])
+def test_823_payload_target_non_dict(payload: object) -> None:
+    from untether.telegram.client_api import _payload_target
+
+    assert _payload_target(payload) == (None, None)
+
+
+def test_823_payload_target_dict() -> None:
+    from untether.telegram.client_api import _payload_target
+
+    assert _payload_target({"chat_id": 1, "message_id": 2}) == (1, 2)
+    assert _payload_target({"offset": 3}) == (None, None)

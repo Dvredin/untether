@@ -50,6 +50,18 @@ def _tool_use(name: str, tool_id: str, raw_input: dict) -> dict:
     }
 
 
+def _text(message_id: str, text: str) -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "id": message_id,
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [{"type": "text", "text": text}],
+        },
+    }
+
+
 def _snapshot(*tasks: tuple[str, str, str]) -> dict:
     return {
         "type": "system",
@@ -779,6 +791,70 @@ def test_829_revival_stamps_activity() -> None:
     assert state.tasks["a1"].last_progress_at > 0.0
 
 
+def test_892_revived_task_counts_every_leg_but_not_the_idle_gap() -> None:
+    """#892: a continued agent's elapsed time is its total active time — the
+    first leg (~10 min) plus the second (50 s), not the idle gap between them
+    and not just the last leg (the mac ``P4 · 50s · 267k tok`` row)."""
+    from untether.background_status import format_done_row, task_elapsed
+
+    state = ClaudeStreamState()
+    _feed(state, _started_agent("a1", "toolu_a"))
+    task = state.tasks["a1"]
+    task.started_at -= 600.0  # first leg: 10 min
+    _feed(state, _updated("a1", "completed"))
+    assert task.ended_at is not None
+    task.started_at -= 120.0  # …then idle for 2 min before the resume
+    task.ended_at -= 120.0
+    _feed(state, _started_agent("a1", "toolu_a"))  # SendMessage resumes it
+    assert task.revived_count == 1
+    task.started_at -= 50.0  # second leg: 50 s
+    now = time.monotonic()
+    assert 649.0 <= task_elapsed(task, now) < 652.0  # live row: both legs
+    _feed(state, _updated("a1", "completed"))
+    now = time.monotonic()
+    assert 649.0 <= task_elapsed(task, now) < 651.0
+    assert format_done_row(task, now) == "✅ Research the thing · 10m50s"
+    # The current leg's own bounds are unchanged (bash timeouts, #801 grace).
+    assert task.ended_at - task.started_at < 52.0
+
+
+def test_892_continued_task_finish_is_labelled_continued() -> None:
+    """#892: the re-announced finish of a revived agent says it continued,
+    so the second ``🔔 Background task finished`` doesn't read as a repeat —
+    via its notification (idle parent) and via retro-attribution (it ended
+    inside an ``unknown`` wake turn). Its first finish is unmarked."""
+    state = ClaudeStreamState()
+    state.live_mode = True
+    _feed(state, _started_agent("a1", "toolu_a"))
+    _feed(state, _result("agent started"))
+    _feed(state, _snapshot())
+    _feed(state, _updated("a1", "completed"))
+    _feed(state, _notification("a1", "toolu_a", "completed"))
+    events = _feed(state, _init())  # wake turn for the first finish
+    started = [e for e in events if getattr(e, "phase", None) == "started"]
+    assert started[0].detail["tasks"] == ["Research the thing"]
+    _feed(state, _started_agent("a1", "toolu_a"))  # sent back in this turn
+    _feed(state, _result("running again"))
+    _feed(state, _snapshot())
+    _feed(state, _updated("a1", "completed"))
+    _feed(state, _notification("a1", "toolu_a", "completed"))
+    events = _feed(state, _init())
+    started = [e for e in events if getattr(e, "phase", None) == "started"]
+    assert started[0].reason == "task_finished"
+    assert started[0].detail["tasks"] == ["Research the thing (continued)"]
+    # Resumed again; this time it ends inside a turn that opened unnamed.
+    _feed(state, _started_agent("a1", "toolu_a"))
+    _feed(state, _result("once more"))
+    _feed(state, _init())
+    assert state.turn_reason == "unknown"
+    _feed(state, _snapshot())
+    _feed(state, _updated("a1", "completed"))
+    events = _feed(state, _result("it's back"))
+    completed = [e for e in events if getattr(e, "phase", None) == "completed"]
+    assert completed[0].detail.get("retro_attributed") is True
+    assert completed[0].detail["tasks"] == ["Research the thing (continued)"]
+
+
 def test_829_progress_for_an_ended_task_is_not_activity() -> None:
     """A straggler frame for an ended id: no stamp, no re-arm, no revival."""
     state = ClaudeStreamState()
@@ -889,3 +965,366 @@ async def test_829_bash_output_activity_reads_mtime_and_skips_monitors(
     # A Monitor's growing output never counts; a missing file is no activity.
     out_b.unlink()
     assert await _bash_output_activity(state) is None
+
+
+# ── #872: declared waits (background Bash timeout, pending wake-up) ─────────
+
+
+def test_872_background_bash_timeout_is_recorded() -> None:
+    state = ClaudeStreamState()
+    _feed(
+        state,
+        _tool_use(
+            "Bash",
+            "toolu_x",
+            {"command": "sleep 7000", "run_in_background": True, "timeout": 7200000},
+        ),
+    )
+    assert state.bg_bash_timeouts == {"toolu_x": 7200.0}
+
+
+@pytest.mark.parametrize(
+    "raw_input",
+    [
+        {"command": "make", "timeout": 600000},  # foreground: not a budget
+        {"command": "x", "run_in_background": True, "timeout": True},
+        {"command": "x", "run_in_background": True, "timeout": "600000"},
+        {"command": "x", "run_in_background": True, "timeout": 0},
+        {"command": "x", "run_in_background": True, "timeout": -5},
+        {"command": "x", "run_in_background": True, "timeout": None},
+        {"command": "x", "run_in_background": True},
+    ],
+)
+def test_872_foreground_or_invalid_timeouts_are_ignored(raw_input: dict) -> None:
+    state = ClaudeStreamState()
+    _feed(state, _tool_use("Bash", "toolu_x", raw_input))
+    assert state.bg_bash_timeouts == {}
+
+
+def test_872_declared_wait_until_bash() -> None:
+    from untether.runners.claude import declared_wait_until
+
+    state = ClaudeStreamState()
+    _feed(state, _started_bash("b1", "toolu_b"))
+    state.bg_bash_timeouts["toolu_b"] = 10.0
+    t0 = state.tasks["b1"].started_at
+    wait = declared_wait_until(state, grace_s=1.0, now=t0 + 2)
+    assert wait is not None
+    assert wait.until == pytest.approx(t0 + 11)
+    assert wait.source == "bash_timeout" and wait.task_id == "b1"
+    assert wait.declared_s == 10.0 and wait.remaining_s == pytest.approx(9.0)
+    assert declared_wait_until(state, grace_s=1.0, now=t0 + 11.5) is None
+    _feed(state, _updated("b1", "completed"))
+    assert declared_wait_until(state, grace_s=1.0, now=t0 + 2) is None
+
+
+def test_872_declared_wait_ignores_monitors_and_includes_subagent_bash() -> None:
+    from untether.runners.claude import declared_wait_until
+
+    state = ClaudeStreamState()
+    _feed(state, _tool_use("Monitor", "toolu_m", {"command": "tail -f x"}))
+    _feed(state, _started_bash("m1", "toolu_m", desc="monitor"))
+    state.bg_bash_timeouts["toolu_m"] = 600.0
+    now = time.monotonic()
+    assert declared_wait_until(state, grace_s=0, now=now) is None
+    # #801: a subagent's own backgrounded Bash holds the session — its
+    # declared budget counts too.
+    _feed(state, _started_subagent_bg("bz1"))
+    state.bg_bash_timeouts["toolu_sub"] = 300.0
+    wait = declared_wait_until(state, grace_s=0, now=now)
+    assert wait is not None and wait.task_id == "bz1"
+
+
+def test_872_declared_wait_until_wakeup() -> None:
+    from untether.runners.claude import declared_wait_until
+
+    state = ClaudeStreamState()
+    now = time.monotonic()
+    state.pending_wakeup_until = now + 90
+    state.pending_wakeup_delay_s = 30.0
+    wait = declared_wait_until(state, grace_s=0, now=now)
+    assert wait is not None and wait.source == "scheduled_wakeup"
+    assert wait.task_id is None and wait.declared_s == 30.0
+    state.pending_wakeup_until = now - 1
+    assert declared_wait_until(state, grace_s=0, now=now) is None
+    # Bash 30 s and wake-up 90 s together: the later one wins.
+    state.pending_wakeup_until = time.monotonic() + 90
+    _feed(state, _started_bash("b1", "toolu_b"))
+    state.bg_bash_timeouts["toolu_b"] = 30.0
+    wait = declared_wait_until(state, grace_s=0)
+    assert wait is not None and wait.source == "scheduled_wakeup"
+
+
+# ── #825: late task ends during a wake turn ─────────────────────────────────
+
+
+def _live_two_bash(state: ClaudeStreamState) -> None:
+    state.live_mode = True
+    _feed(state, _started_bash("b1", "toolu_b1", desc="job A"))
+    _feed(state, _started_bash("b2", "toolu_b2", desc="job B"))
+    _feed(state, _result("two jobs running"))
+    assert state.completed_turns == 1
+
+
+def test_825_late_end_in_task_finished_turn_is_collected() -> None:
+    state = ClaudeStreamState()
+    _live_two_bash(state)
+    _feed(state, _updated("b1", "completed"))
+    _feed(state, _notification("b1", "toolu_b1", "completed"))
+    _feed(state, _init())
+    assert state.turn_reason == "task_finished"
+    # The opening task re-reporting its end mid-turn is never "late".
+    _feed(state, _notification("b1", "toolu_b1", "completed"))
+    _feed(state, _updated("b2", "completed"))
+    assert state.turn_ended_tasks == [("b2", "job B")]
+    # The model's next request (it sees B's notification) — R17-821.
+    _feed(state, _text("msg_after_b2", "both done"))
+    events = _feed(state, _result("both done"))
+    completed = [e for e in events if getattr(e, "phase", None) == "completed"]
+    assert completed[0].detail["tasks"] == ["job A", "job B"]
+    assert completed[0].detail["late_tasks"] == ["job B"]
+    assert "b2" in state.announced_task_ids
+
+
+def test_825_late_end_after_last_request_is_deferred_not_named() -> None:
+    """R17-821: B ends after the turn's last model request began — the model
+    never saw it, so A's turn keeps its own header and B waits for its own
+    wake turn (not announced)."""
+    state = ClaudeStreamState()
+    _live_two_bash(state)
+    _feed(state, _updated("b1", "completed"))
+    _feed(state, _notification("b1", "toolu_b1", "completed"))
+    _feed(state, _init())
+    _feed(state, _text("msg_final", "A done;"))
+    _feed(state, _updated("b2", "completed"))
+    _feed(state, _text("msg_final", " B is still running"))  # same request
+    events = _feed(state, _result("A done; B is still running"))
+    completed = [e for e in events if getattr(e, "phase", None) == "completed"]
+    assert completed[0].detail["tasks"] == ["job A"]
+    assert "late_tasks" not in completed[0].detail
+    assert "b2" not in state.announced_task_ids
+    assert [t[:2] for t in state.pending_late_tasks] == [("b2", "job B")]
+    # Same message id streamed in more blocks is the same request.
+    assert state.turn_model_requests == 1
+
+
+def _tool_result(tool_id: str) -> dict:
+    return {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}
+            ],
+        },
+    }
+
+
+def _wake_turn_with_check(state: ClaudeStreamState, *, b_ends: str) -> list:
+    """A's wake turn: the model runs one check (a tool call), the CLI sends
+    the next request with its result, and the final message streams back.
+    ``b_ends`` = when job B ends: ``"before_result"`` or ``"mid_generation"``
+    (after that request was sent, before its first block arrived)."""
+    _live_two_bash(state)
+    _feed(state, _updated("b1", "completed"))
+    _feed(state, _notification("b1", "toolu_b1", "completed"))
+    _feed(state, _init())
+    _feed(state, _tool_use("Bash", "toolu_check", {"command": "ps"}))
+    if b_ends == "before_result":
+        _feed(state, _updated("b2", "completed"))
+    _feed(state, _tool_result("toolu_check"))
+    if b_ends == "mid_generation":
+        _feed(state, _updated("b2", "completed"))
+    _feed(state, _text("msg_final", "A done; B ..."))
+    return _feed(state, _result("A done; B ..."))
+
+
+def test_825_late_end_during_slow_first_block_is_deferred() -> None:
+    """R17RT (live re-test): B ended while the turn's last request was still
+    thinking — after the tool result that sent it, ~19 s before its first
+    block arrived. The model never saw B, so it is deferred, not named."""
+    state = ClaudeStreamState()
+    events = _wake_turn_with_check(state, b_ends="mid_generation")
+    completed = [e for e in events if getattr(e, "phase", None) == "completed"]
+    assert completed[0].detail["tasks"] == ["job A"]
+    assert "late_tasks" not in completed[0].detail
+    assert [t[:2] for t in state.pending_late_tasks] == [("b2", "job B")]
+    # The request sent with the tool result isn't counted again on arrival.
+    assert state.turn_model_requests == 2
+
+
+def test_825_late_end_before_tool_result_is_seen() -> None:
+    """B ended before the tool result that sent the next request: its
+    notification went with that request, so the turn names B."""
+    state = ClaudeStreamState()
+    events = _wake_turn_with_check(state, b_ends="before_result")
+    completed = [e for e in events if getattr(e, "phase", None) == "completed"]
+    assert completed[0].detail["tasks"] == ["job A", "job B"]
+    assert completed[0].detail["late_tasks"] == ["job B"]
+    assert state.pending_late_tasks == []
+
+
+def test_825_late_end_in_followup_turn_is_not_attributed() -> None:
+    """A follow-up turn is the user's own reply — a task ending during it
+    leaves its detail alone (negative)."""
+    state = ClaudeStreamState()
+    _live_two_bash(state)
+    state.injected_commands["cmd-1"] = time.monotonic()
+    state.pending_command_uuid = "cmd-1"
+    _feed(state, _init())
+    assert state.turn_reason == "followup"
+    _feed(state, _updated("b2", "completed"))
+    assert state.turn_ended_tasks == []
+    events = _feed(state, _result("answered"))
+    completed = [e for e in events if getattr(e, "phase", None) == "completed"]
+    assert completed[0].reason == "followup"
+    assert "tasks" not in completed[0].detail
+    assert "late_tasks" not in completed[0].detail
+
+
+# ── #825/#876: foreground → background transitions ──────────────────────────
+
+
+def _started_fg_bash(task_id: str, tool_use_id: str, *, owned: bool = False) -> dict:
+    payload = {
+        **_started_bash(task_id, tool_use_id, desc="copy attempt"),
+        "is_backgrounded": False,
+    }
+    if owned:
+        payload["owned_by_subagent"] = True
+    return payload
+
+
+def _bg_patch(task_id: str, value: bool = True) -> dict:
+    return {
+        "type": "system",
+        "subtype": "task_updated",
+        "task_id": task_id,
+        "patch": {"is_backgrounded": value},
+    }
+
+
+def test_task_updated_is_backgrounded_patch_promotes_foreground_task() -> None:
+    state = ClaudeStreamState()
+    _feed(state, _started_fg_bash("f1", "toolu_f"))
+    assert has_live_background_work(state) is False
+    with capture_logs() as logs:
+        _feed(state, _bg_patch("f1"))
+    task = state.tasks["f1"]
+    assert task.is_backgrounded is True and task.status == "running"
+    assert has_live_background_work(state) is True
+    assert state.background_observed is True
+    (moved,) = [e for e in logs if e["event"] == "claude.task.backgrounded"]
+    assert moved["source"] == "task_updated" and moved["log_level"] == "info"
+
+
+def test_snapshot_listing_promotes_known_parent_foreground_task() -> None:
+    state = ClaudeStreamState()
+    _feed(state, _started_fg_bash("f1", "toolu_f"))
+    with capture_logs() as logs:
+        _feed(state, _snapshot(("f1", "local_bash", "copy attempt")))
+    assert state.tasks["f1"].is_backgrounded is True
+    assert has_live_background_work(state) is True
+    (moved,) = [e for e in logs if e["event"] == "claude.task.backgrounded"]
+    assert moved["source"] == "snapshot"
+
+
+def test_snapshot_never_promotes_subagent_owned_task() -> None:
+    state = ClaudeStreamState()
+    _feed(state, _started_fg_bash("s1", "toolu_s", owned=True))
+    _feed(state, _snapshot(("s1", "local_bash", "copy attempt")))
+    assert state.tasks["s1"].is_backgrounded is False
+    assert has_live_background_work(state) is False
+
+
+def test_is_backgrounded_patch_ignored_for_unknown_task_id() -> None:
+    state = ClaudeStreamState()
+    with capture_logs() as logs:
+        _feed(state, _bg_patch("nope"))
+    assert state.tasks == {}
+    assert not any(e["event"] == "claude.task.backgrounded" for e in logs)
+
+
+def test_promoted_subagent_task_holds_but_never_labels_a_wake_turn() -> None:
+    """#825 review: the patch also promotes a subagent's moved command — it
+    then holds the session (#801) but its finish is not the parent's news."""
+    state = ClaudeStreamState()
+    state.live_mode = True
+    _feed(state, _started_fg_bash("s1", "toolu_s", owned=True))
+    _feed(state, _bg_patch("s1"))
+    assert state.tasks["s1"].holds_session is True
+    assert has_live_background_work(state) is True
+    _feed(state, _result("working"))
+    _feed(state, _updated("s1", "completed"))
+    with capture_logs() as logs:
+        _feed(state, _notification("s1", "toolu_s", "completed"))
+    assert state.turn_notifications == []
+    assert any(e["event"] == "claude.turn.notification_ignored" for e in logs)
+    events = _feed(state, _init())
+    started = [e for e in events if getattr(e, "phase", None) == "started"]
+    assert started[0].reason == "unknown"
+
+
+# ── #821: background agents active since the previous result ────────────────
+
+
+def test_background_usage_counts_agents_active_since_previous_result() -> None:
+    from untether.runners.claude import _background_usage
+
+    state = ClaudeStreamState()
+    _feed(state, _started_agent("a_old", "toolu_old"))
+    _feed(state, _updated("a_old", "completed"))
+    _feed(state, _started_agent("a_live", "toolu_live"))
+    _feed(state, _started_bash("b1", "toolu_b"))
+    now = time.monotonic()
+    state.tasks["a_old"].ended_at = now - 50
+    state.tasks["a_old"].last_progress_at = now - 60
+    state.prev_result_at = now - 10
+    usage = _background_usage(state, now)
+    assert usage == {
+        "agents": 1,
+        "agents_live": 1,
+        "agents_ended": 0,
+        "task_ids": ["a_live"],
+        "since_s": 10.0,
+    }
+
+
+def test_background_usage_counts_agent_that_ended_in_window_and_nested_agents() -> None:
+    from untether.runners.claude import _background_usage
+
+    state = ClaudeStreamState()
+    state.prev_result_at = time.monotonic()
+    _feed(state, _started_agent("a1", "toolu_a"))
+    _feed(state, _updated("a1", "completed"))  # ended after the previous result
+    nested = {
+        **_started_agent("n1", "toolu_n"),
+        "owned_by_subagent": True,
+    }
+    _feed(state, nested)
+    usage = _background_usage(state)
+    assert usage is not None
+    assert usage["agents"] == 2
+    assert usage["agents_live"] == 1 and usage["agents_ended"] == 1
+    assert sorted(usage["task_ids"]) == ["a1", "n1"]
+
+
+def test_background_usage_none_without_agents() -> None:
+    from untether.runners.claude import _background_usage
+
+    state = ClaudeStreamState()
+    _feed(state, _started_bash("b1", "toolu_b"))
+    _feed(state, _tool_use("Monitor", "toolu_m", {"command": "tail -f x"}))
+    _feed(state, _started_bash("m1", "toolu_m", desc="monitor"))
+    assert _background_usage(state) is None
+
+
+def test_background_usage_first_result_has_no_since() -> None:
+    from untether.runners.claude import _background_usage
+
+    state = ClaudeStreamState()
+    _feed(state, _started_agent("a1", "toolu_a"))
+    _feed(state, _updated("a1", "completed"))
+    usage = _background_usage(state)
+    assert usage is not None
+    assert usage["since_s"] is None and usage["agents_ended"] == 1

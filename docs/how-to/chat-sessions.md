@@ -3,7 +3,7 @@
 Chat sessions store one resume token per engine per chat (per sender in group chats), so new messages can auto-resume without replying. Reply-to-continue still works and updates the stored session for that engine.
 
 !!! tip "Assistant and workspace workflows"
-    If you chose **assistant** or **workspace** during [onboarding](../tutorials/install.md), chat sessions are already enabled. This guide covers how they work and how to customize them.
+    If you chose **assistant** or **workspace** during [onboarding](../tutorials/install.md), chat sessions are already enabled. This guide covers how they work and how to customise them.
 
 ## Enable chat sessions
 
@@ -71,6 +71,20 @@ If you prefer a cleaner chat, hide resume lines:
 ## How it behaves in groups
 
 In group chats, Untether stores a session per sender, so different people can work independently in the same chat.
+
+## Topics in a private chat
+
+If you use Telegram's topics in a private chat with the bot, each topic keeps its own session, separate from the main thread ([#734](https://github.com/littlebearapps/untether/issues/734)). Before v0.35.5 every follow-up in a private-chat topic quietly started a fresh session.
+
+## While Claude is still working
+
+With Claude Code, a session usually stays open after its answer while background tasks run (see [Troubleshooting → Messages arrive after the run finished](troubleshooting.md#messages-arrive-after-the-run-finished)). A message you send then goes straight into that same session once the current turn ends, rather than waiting for the background work. To have a message read *during* the current turn instead, use [steer](steer-follow-ups.md).
+
+## Sending several messages quickly
+
+Messages you send within about a second of each other (`forward_coalesce_s`, default 1 s) are merged, in order, into one prompt, so a thought split across a few quick messages runs once ([#794](https://github.com/littlebearapps/untether/issues/794)). Messages that can't share a run — a reply to a different message, a voice note next to text, a directive, or a context change — run separately.
+
+Commands act as a barrier. `/cancel`, `/new` and `/continue` drop anything still waiting in that window and say so (`🗑️ Dropped 2 messages sent just before /new — send them again if you still need them.`), so a message meant for the old session never lands in the new one. Any other command lets the waiting messages run first ([#807](https://github.com/littlebearapps/untether/issues/807)).
 
 ## How session persistence works
 

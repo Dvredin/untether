@@ -75,7 +75,7 @@ restart.
 | top-level `transport` | changing transport id | — |
 | `progress` | `group_chat_rps` (read once when the Telegram client starts) | everything else (re-read per run) |
 | engine tables, `projects`, `default_engine`, `default_project`, `plugins` | — | rebuilt on reload (a reload that breaks the **default** engine's config fails and the previous runtime keeps running) |
-| `triggers` | turning `enabled` **on** (the cron scheduler and webhook server only start at startup); everything under `[triggers.server]` (`host`, `port`, `rate_limit`, `max_body_bytes` are read when the server binds) | cron add/remove/edit, webhook add/remove/edit, `default_timezone`, `allow_unauthenticated_webhooks`, per-cron `timezone`/`run_once`/`permission_mode`/`model`/`reasoning`; turning `enabled` **off** clears every cron and webhook route (the server stays bound until restart) |
+| `triggers` | turning `enabled` **on** (the cron scheduler and webhook server only start at startup; the reload logs `config.reload.restart_required key=triggers.enabled` and the Telegram reload notice flags it, [#894](https://github.com/littlebearapps/untether/issues/894)); everything under `[triggers.server]` (`host`, `port`, `rate_limit`, `max_body_bytes` are read when the server binds) | cron add/remove/edit, webhook add/remove/edit, `default_timezone`, `allow_unauthenticated_webhooks`, per-cron `timezone`/`run_once`/`permission_mode`/`model`/`reasoning`; turning `enabled` **off** clears every cron and webhook route (the server stays bound until restart) |
 
 To restart:
 
@@ -312,7 +312,7 @@ Per-chat override: `/verbose on` and `/verbose off` override the config default 
 | `max_cost_per_run` | float\|null (≥ 0) | `null` | Per-run cost limit (USD). |
 | `max_cost_per_day` | float\|null (≥ 0) | `null` | Daily cost limit (USD). |
 | `warn_at_pct` | int (0–100) | `70` | Warning threshold, as a percentage of the limit. |
-| `auto_cancel` | bool | `false` | Auto-cancel runs that exceed the per-run limit. |
+| `auto_cancel` | bool | `false` | Accepted but not enforced yet: budgets are checked after a run finishes, so they alert rather than cancel ([#896](https://github.com/littlebearapps/untether/issues/896)). |
 | `warn_run_above_usd` | float\|null (≥ 0) | `null` (→ `20.00`) | Per-run spend alert that fires **without** `enabled = true`. `0` disables it. For Claude, when background agents were active since the previous reply the alert adds `— includes spend by N background agents since the previous reply` ([#821](https://github.com/littlebearapps/untether/issues/821)). |
 | `notify_run_outlier` | bool | `true` | Show the outlier as a chat line. The `cost.run_outlier` log event fires either way. |
 
@@ -754,7 +754,7 @@ routing details.
 | `path` | string | (required) | URL path (e.g. `/hooks/github`). Must start with `/`, contain only letters, digits, `/`, `_`, `.`, `-`, and not be `/health`. |
 | `project` | string\|null | `null` | Project alias for working directory. |
 | `engine` | string\|null | `null` | Engine override. If unset: the `project`'s `default_engine` when a project is set, otherwise the global `default_engine` ([#862](https://github.com/littlebearapps/untether/issues/862)). |
-| `chat_id` | int\|null | `null` | Telegram chat. Falls back to transport default. |
+| `chat_id` | int\|null | `null` | Telegram chat. Falls back to the transport default `chat_id`, even when `project` is set (the project's bound chat is not used; a warning is logged when they differ). |
 | `auth` | string | `"bearer"` | `"bearer"`, `"hmac-sha256"`, `"hmac-sha1"`, or `"none"`. |
 | `secret` | string\|null | `null` | Auth secret. Required when `auth` is not `"none"`. |
 | `action` | `"agent_run"`\|`"file_write"`\|`"http_forward"`\|`"notify_only"` | `"agent_run"` | What the webhook does. Non-agent actions use `file_path` + `on_conflict`, `forward_url` + `forward_headers` + `forward_method`, or `message_template`, plus `notify_on_success` / `notify_on_failure` — see the [Triggers reference](triggers/triggers.md). |
@@ -771,7 +771,7 @@ routing details.
 | `schedule` | string | (required) | 5-field cron expression. |
 | `project` | string\|null | `null` | Project alias for working directory. |
 | `engine` | string\|null | `null` | Engine override. If unset: the `project`'s `default_engine` when a project is set, otherwise the global `default_engine` ([#862](https://github.com/littlebearapps/untether/issues/862)). |
-| `chat_id` | int\|null | `null` | Telegram chat. Falls back to transport default. |
+| `chat_id` | int\|null | `null` | Telegram chat. Falls back to the transport default `chat_id`, even when `project` is set (the project's bound chat is not used; a warning is logged when they differ). |
 | `prompt` | string\|null | (required if no `prompt_template`) | Prompt sent to the engine. |
 | `prompt_template` | string\|null | `null` | Prompt with `{{field}}` substitutions, used with `fetch`. |
 | `fetch` | table\|null | `null` | Pre-fetch step (`type = "http_get"`, `"http_post"` or `"file_read"`) whose result is available to `prompt_template` — see the [Triggers reference](triggers/triggers.md). |

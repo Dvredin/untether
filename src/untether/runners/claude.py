@@ -34,7 +34,7 @@ import anyio
 import msgspec
 
 from ..backends import EngineBackend, EngineConfig
-from ..background_status import format_tokens
+from ..background_status import CONTINUED_SUFFIX, format_tokens
 from ..config import ConfigError
 from ..events import EventFactory
 from ..logging import get_logger
@@ -1469,6 +1469,10 @@ class ClaudeTask:
     # the latest revival, so ``started_at``/``ended_at`` describe the current
     # run only.
     revived_count: int = 0
+    # #892: the active time of the runs before the latest revival (each
+    # ``ended_at - started_at``; the idle gaps between them excluded), so the
+    # status panel shows the task's total time beside its lifetime tokens.
+    prior_active_s: float = 0.0
     # #777: the agent's current step from ``task_progress.description``
     # ("Running <step>") — kept apart from ``description`` (the task's label).
     last_step: str | None = None
@@ -1982,6 +1986,11 @@ class ClaudeStreamState:
     # ``result_received_at`` never cleared at a turn open, so each result can
     # tell which background agents were active since the one before it.
     prev_result_at: float | None = None
+    # #889: the previous result's session-cumulative ``total_cost_usd`` /
+    # ``duration_api_ms`` in this process — a live turn's error line shows
+    # its own share, like the #778/#821 footer delta.
+    prev_result_cost_usd: float | None = None
+    prev_result_api_ms: int | None = None
 
     # #470: cross-layer signals from _post_result_idle_watchdog → bridge.
     # The watchdog stamps ``post_result_closed_at`` (monotonic) and
@@ -2341,14 +2350,14 @@ def _parse_rate_limit_reset_clause(text: str | None) -> tuple[float, str] | None
 
 def _maybe_latch_rate_limit_reset(
     result_text: str | None, *, state: ClaudeStreamState
-) -> None:
+) -> bool:
     """#692: harvest the reset clause from a result error and latch it for
     subsequent `rejected` rate_limit_events that carry no `resetsAt` of
     their own (#790; this run and the next ones in the
-    same process/auth namespace)."""
+    same process/auth namespace). True when the latch was (re-)armed."""
     parsed = _parse_rate_limit_reset_clause(result_text)
     if parsed is None:
-        return
+        return False
     wait_s, display = parsed
     deadline = time.monotonic() + wait_s
     _RATE_LIMIT_RESET_LATCH[_rate_limit_latch_key()] = (deadline, display)
@@ -2361,6 +2370,7 @@ def _maybe_latch_rate_limit_reset(
         resets_display=display,
         source="result_error",
     )
+    return True
 
 
 def _latched_rate_limit_reset() -> tuple[float, str] | None:
@@ -2393,13 +2403,13 @@ def _parse_action_required_cap(text: str | None) -> str | None:
     return m.group("model").strip()
 
 
-def _maybe_latch_action_required(result_text: str | None) -> None:
+def _maybe_latch_action_required(result_text: str | None) -> bool:
     """#701: arm the action-required latch from a result error so subsequent
     `rejected` rate_limit_events without a `resetsAt` render the remedy
-    instead of a countdown (#790)."""
+    instead of a countdown (#790). True when the latch was armed."""
     model = _parse_action_required_cap(result_text)
     if model is None:
-        return
+        return False
     _RATE_LIMIT_ACTION_LATCH[_rate_limit_latch_key()] = (
         time.monotonic() + ACTION_REQUIRED_LATCH_TTL_S,
         model,
@@ -2410,6 +2420,7 @@ def _maybe_latch_action_required(result_text: str | None) -> None:
         ttl_s=ACTION_REQUIRED_LATCH_TTL_S,
         source="result_error",
     )
+    return True
 
 
 def _latched_action_required() -> str | None:
@@ -5543,6 +5554,14 @@ def _task_label(task: ClaudeTask) -> str:
     return task.description or task.task_type or "background task"
 
 
+def _finish_label(task: ClaudeTask, label: str | None = None) -> str:
+    """#892: the label a wake turn's header names a finish by — marked
+    ``(continued)`` once the task was revived (#801), so its re-announced
+    finish doesn't read as the same one twice."""
+    label = label or _task_label(task)
+    return f"{label}{CONTINUED_SUFFIX}" if task.revived_count else label
+
+
 def _note_task_end(state: ClaudeStreamState, task: ClaudeTask) -> None:
     """#785: attribute a top-level background task's end to the wake turn it
     belongs to — the open ``unknown`` turn (retro-attributed at completion)
@@ -5560,7 +5579,7 @@ def _note_task_end(state: ClaudeStreamState, task: ClaudeTask) -> None:
             and task.task_id not in state.turn_detail.get("task_ids", [])
             and all(task.task_id != tid for tid, _ in state.turn_ended_tasks)
         ):
-            state.turn_ended_tasks.append((task.task_id, _task_label(task)))
+            state.turn_ended_tasks.append((task.task_id, _finish_label(task)))
             state.turn_ended_at_request[task.task_id] = state.turn_model_requests
         return
     at = state.unattributed_turn_completed_at
@@ -5703,6 +5722,9 @@ def _revive_task(
     the live session closes under the resumed agent."""
     prior_status = task.status
     ended_at = task.ended_at
+    if ended_at is not None:
+        # #892: bank the run that just ended before the clock restarts.
+        task.prior_active_s += max(0.0, ended_at - task.started_at)
     task.status = status
     task.ended_at = None
     task.started_at = time.monotonic()
@@ -6122,7 +6144,18 @@ def _extract_error(
     event: claude_schema.StreamResultMessage,
     *,
     resumed: bool = False,
+    live_turn: int | None = None,
+    prev_cost_usd: float | None = None,
+    prev_api_ms: int | None = None,
 ) -> str | None:
+    """The error text: the CLI's message, then a diagnostic line.
+
+    #889: ``live_turn`` marks a later turn of a live session (#776). The
+    CLI's ``total_cost_usd`` / ``duration_api_ms`` are session-cumulative, so
+    such a turn shows its own share (since ``prev_cost_usd`` /
+    ``prev_api_ms``, the previous result in this process) plus a labelled
+    ``session cost:``, and ``live turn N`` instead of the spawn-time
+    ``new`` / ``resumed``. The run's own result keeps the original line."""
     if not event.is_error:
         return None
     # First line: error summary
@@ -6143,13 +6176,25 @@ def _extract_error(
     sid = event.session_id[:8] if event.session_id else None
     if sid:
         parts.append(f"session: {sid}")
-    parts.append("resumed" if resumed else "new")
+    if live_turn is not None:
+        parts.append(f"live turn {live_turn}")
+    else:
+        parts.append("resumed" if resumed else "new")
     parts.append(f"turns: {event.num_turns}")
     cost = event.total_cost_usd
-    if cost is not None:
-        parts.append(f"cost: ${cost:.2f}")
-    if event.duration_api_ms:
-        parts.append(f"api: {event.duration_api_ms}ms")
+    if live_turn is not None:
+        if cost is not None:
+            if prev_cost_usd is not None:
+                parts.append(f"cost: ${max(0.0, cost - prev_cost_usd):.2f}")
+            parts.append(f"session cost: ${cost:.2f}")
+        api_ms = event.duration_api_ms
+        if api_ms and prev_api_ms is not None and api_ms > prev_api_ms:
+            parts.append(f"api: {api_ms - prev_api_ms}ms")
+    else:
+        if cost is not None:
+            parts.append(f"cost: ${cost:.2f}")
+        if event.duration_api_ms:
+            parts.append(f"api: {event.duration_api_ms}ms")
 
     diagnostics = " · ".join(parts)
     if classification is not None:
@@ -7161,7 +7206,10 @@ def translate_claude_event(
                     if task is not None and task.description:
                         # Prefer the registered top-level description (#785).
                         label = task.description
-                    state.turn_notifications.append(label or "background task")
+                    label = label or "background task"
+                    if task is not None:
+                        label = _finish_label(task, label)
+                    state.turn_notifications.append(label)
                     if task is not None:
                         state.turn_notification_ids.append(task.task_id)
                 else:
@@ -7684,16 +7732,41 @@ def _translate_claude_event_base(
                 )
 
             resume = ResumeToken(engine=ENGINE, value=event.session_id)
-            error = None if ok else _extract_error(event, resumed=state.resumed)
+            # #889: a later turn of a live session (the live branch of
+            # translate_claude_event bumps completed_turns after this call).
+            live_turn = (
+                state.turn if state.live_mode and state.completed_turns > 0 else None
+            )
+            error = (
+                None
+                if ok
+                else _extract_error(
+                    event,
+                    resumed=state.resumed,
+                    live_turn=live_turn,
+                    prev_cost_usd=state.prev_result_cost_usd,
+                    prev_api_ms=state.prev_result_api_ms,
+                )
+            )
+            if event.total_cost_usd is not None:
+                state.prev_result_cost_usd = event.total_cost_usd
+            if event.duration_api_ms is not None:
+                state.prev_result_api_ms = event.duration_api_ms
+            usage_limit_latched = False
             if not ok:
                 # #692: the subscription-cap reset time lives only in the
                 # raw result-error text — harvest it for this run's stall
                 # context and for subsequent runs' reset-less rejections.
-                _maybe_latch_rate_limit_reset(event.result, state=state)
                 # #701: the other cap class — no time to harvest, but a
-                # remedy to name.
-                _maybe_latch_action_required(event.result)
+                # remedy to name. (Both always run: no short-circuit.)
+                reset_latched = _maybe_latch_rate_limit_reset(event.result, state=state)
+                action_latched = _maybe_latch_action_required(event.result)
+                usage_limit_latched = reset_latched or action_latched
             usage = _usage_payload(event)
+            if usage_limit_latched:
+                # #890: a usage-limit error — the bridge coalesces repeats of
+                # it from later background wakes into one message.
+                usage["usage_limit_latched"] = True
             # #814: rides on usage (not StartedEvent meta) so it reaches both
             # CompletedEvent and a live turn's TurnEvent — D-12.
             if (safeguard := _finalize_safeguard_turn(state, factory)) is not None:

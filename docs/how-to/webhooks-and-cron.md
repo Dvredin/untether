@@ -58,7 +58,7 @@ Webhooks accept HTTP POST requests and turn them into agent runs. Example: trigg
 
 ### Authentication
 
-Every webhook requires explicit auth. Choose one:
+`auth` defaults to `bearer`, and every mode except `none` needs a `secret`. Choose one:
 
 | Mode | Header | Use case |
 |------|--------|----------|
@@ -79,14 +79,19 @@ All webhook prompts are automatically prefixed with an untrusted-payload marker 
 
 ### Test a webhook locally
 
+The `github-push` webhook above uses HMAC and an `event_filter`, so a test request has to sign its body and send the event header (with no `X-GitHub-Event: push` header the server answers `200 filtered` and starts nothing):
+
 ```bash
+BODY='{"ref": "refs/heads/main", "pusher": {"name": "alice"}}'
+SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac 'whsec_your_github_secret' | sed 's/^.* //')"
 curl -X POST http://127.0.0.1:9876/hooks/github \
-  -H "Authorization: Bearer my-secret-token" \
+  -H "X-Hub-Signature-256: $SIG" \
+  -H "X-GitHub-Event: push" \
   -H "Content-Type: application/json" \
-  -d '{"ref": "refs/heads/main", "pusher": {"name": "alice"}}'
+  -d "$BODY"
 ```
 
-A `202 Accepted` response means the run was dispatched.
+For a `bearer` webhook, send `-H "Authorization: Bearer <secret>"` instead. A `202 Accepted` response means the run was dispatched.
 
 !!! untether "Untether"
     ⚡ Trigger: webhook:github-push
@@ -229,7 +234,7 @@ Action types: `agent_run` (default), `file_write`, `http_forward`, `notify_only`
 Each webhook and cron can specify where the Telegram notification appears:
 
 - Set `chat_id` to post in a specific chat
-- If omitted, uses the default chat from `[transports.telegram]`
+- If omitted, uses the default chat from `[transports.telegram]` — even when `project` is set. A project's bound chat is **not** used, so add `chat_id` to post in the project's chat. Untether logs `trigger.cron.chat_fallback` / `trigger.webhook.chat_fallback` once when a project-only trigger will post to a different chat than the project's ([#894](https://github.com/littlebearapps/untether/issues/894))
 - Set `project` to run in a specific project's working directory
 - Set `engine` to pick the engine. Without it, a trigger with a `project` runs on that project's `default_engine` (since v0.35.5 — it used to fall back to the global default, [#862](https://github.com/littlebearapps/untether/issues/862)), and one without a project uses the global `default_engine`
 
@@ -295,6 +300,8 @@ run_once = true
 ```
 
 After the cron fires, the `triggers.cron.run_once_completed` log line confirms the removal, and the startup message counts it separately from scheduled crons ([#809](https://github.com/littlebearapps/untether/issues/809)). Fired state is persisted to `run_once_fired.json` (sibling of `untether.toml`), so the cron is skipped across config reloads and process restarts — the TOML entry is kept for history but won't refire. To re-enable a one-shot, change its `id` or remove both the TOML entry and its record in `run_once_fired.json`.
+
+A one-shot only counts as fired once its run is dispatched. If the `⏰ Scheduled:` message can't be posted (a wrong `chat_id`, or a Telegram or network outage), nothing runs and the cron stays pending: Untether retries it once a minute for up to 15 minutes, then gives up and logs `triggers.cron.run_once_lost` at error level ([#893](https://github.com/littlebearapps/untether/issues/893)). The pending state is saved to `run_once_pending.json` next to `untether.toml`, so a restart during that window carries on retrying on the first minute after startup, and a restart after the window closed gives the cron up straight away. A pause during the window still gets one retry after you resume before the cron is given up.
 
 ## Autonomous crons in plan-mode chats (Claude)
 

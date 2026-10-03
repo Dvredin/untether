@@ -42,6 +42,9 @@ DONE_MARK = "\N{WHITE HEAVY CHECK MARK}"
 FAIL_MARK = "\N{CROSS MARK}"
 STOP_MARK = "\N{BLACK SQUARE FOR STOP}\N{VARIATION SELECTOR-16}"
 NOTE_MARK = "\N{SPEECH BALLOON}"
+# #892: appended to a continued (revived, #801) task's label when its next
+# finish is announced, so the second "🔔 … finished" isn't read as a repeat.
+CONTINUED_SUFFIX = " (continued)"
 
 LIVE_STATUSES = frozenset({"running", "pending"})
 _DONE_STATUSES = frozenset({"completed", "ended", "done", "success"})
@@ -150,6 +153,19 @@ def _one_line(text: str) -> str:
     return " ".join(str(text).split())
 
 
+def _ack_plain(text: str) -> str:
+    """#891: a folded ack is the model's markdown, but the status message is
+    plain text — show what the rendered answer would read, not ``**`` and
+    backticks. Best-effort: on any renderer failure the raw text is kept."""
+    from .telegram.render import markdown_to_plain
+
+    try:
+        return markdown_to_plain(text)
+    except Exception:  # noqa: BLE001 — never lose an ack to the renderer
+        logger.warning("background_status.ack_plain_failed", exc_info=True)
+        return text
+
+
 def task_label(task: Any, width: int = DESC_WIDTH) -> str:
     raw = (
         getattr(task, "description", None)
@@ -160,12 +176,18 @@ def task_label(task: Any, width: int = DESC_WIDTH) -> str:
 
 
 def task_elapsed(task: Any, now: float) -> float:
+    """The task's total active time: its current run plus, for a continued
+    (revived, #801) agent, the runs before it (``prior_active_s``, #892) —
+    never the last leg alone beside lifetime tokens."""
     started = getattr(task, "started_at", None)
     if not isinstance(started, (int, float)):
         return 0.0
     ended = getattr(task, "ended_at", None)
     end = ended if isinstance(ended, (int, float)) else now
-    return max(0.0, end - started)
+    prior = getattr(task, "prior_active_s", 0.0)
+    if isinstance(prior, bool) or not isinstance(prior, (int, float)):
+        prior = 0.0
+    return max(0.0, end - started) + max(0.0, prior)
 
 
 def _usage(task: Any, key: str) -> int | None:
@@ -542,7 +564,7 @@ class BackgroundStatusPanel:
             list(self.notes),
             dict(self._note_turns),
         )
-        ack = _one_line(text)
+        ack = _one_line(_ack_plain(text))
         target = next((tid for tid in task_ids if tid in self.tasks), None)
         if target is not None and already_announced:
             self._claim_turn_notes(target, announced_turns)

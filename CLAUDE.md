@@ -37,14 +37,15 @@ Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencod
 - **TelegramPresenter** (`src/untether/telegram/bridge.py`) — progress, inline keyboards, answers
 - **Commands** (`src/untether/telegram/commands/`) — command/callback handlers
 - **Schemas** (`src/untether/schemas/`) — msgspec structs for JSONL; **Triggers** (`src/untether/triggers/`) — cron/webhooks
-- Config: `untether.toml` (most sections hot-reload; `bot_token`, `chat_id`, `session_mode`, `topics`, `message_overflow` need a restart)
+- Config: `untether.toml` (with `watch_config = true` most sections hot-reload — off by default; `bot_token`, `chat_id`, `session_mode`, `topics`, `message_overflow` need a restart)
 
 ## Deprecated engines (Gemini CLI, AMP)
 
 Both still load but are unsupported and **removed in 0.36.0** (Gemini: upstream EOL for individual accounts, hangs under
 Untether until the watchdog cancels; AMP: remote `426` refusal). **When a cross-engine sweep breaks either runner,
 `xfail`/`skip` the test — do NOT fix the runner.** Security and doc-accuracy fixes still apply. Both are excluded from
-every integration-test tier. Antigravity CLI (#558) is a new engine and must not reuse the `gemini` id.
+every integration-test tier. Antigravity CLI (#558, planned for v0.35.6) is a new engine and must not reuse the
+`gemini` id.
 
 ## Commands
 

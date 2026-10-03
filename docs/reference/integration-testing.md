@@ -114,7 +114,7 @@ not required at any tier.
 | U3 | **Long response** | `write a detailed explanation of how TCP/IP works, at least 2000 words` | Message splits correctly across multiple Telegram messages, no truncation, footer only on last chunk | #65 (footer repeat), #59 (entity overflow), message splitting |
 | U4 | **Resume session** | After U1 completes, reply to the resume line: `now rename hello.txt to greetings.txt` | Resume token works, session continues, new progress + final answer | Resume token parsing per engine |
 | U5 | **Model override** | `/model set <name>` (the `/config` → Engine & model page points there; it has no picker), then send a prompt; `/model clear` afterwards | Footer shows overridden model name | #77 (AMP model flag), build_args correctness |
-| U6 | **Cancel mid-run** | Send a long prompt, then `/cancel` before it finishes | Run stops, completion message appears, no orphan process | Graceful cancellation, process cleanup |
+| U6 | **Cancel mid-run** | Send a long prompt (not a bare `sleep N` — Claude Code may block a standalone foreground sleep (`Blocked: standalone sleep 90` seen on rc18); use e.g. a `for i in $(seq 1 90); do sleep 1; done` loop), then `/cancel` before it finishes | Run stops, completion message appears, no orphan process | Graceful cancellation, process cleanup |
 | U7 | **Error handling** | Send a prompt that will fail (e.g. `read /nonexistent/file/path`) | Error renders in Telegram, no crash, session ends cleanly | Stderr sanitisation (#85), error formatting |
 | U8 | **/usage** | `/usage` after a completed run | Claude: subscription info; Codex/OpenCode/Pi: last-session token totals (`📊 <engine> · last session in this chat`, #417) | #89 (429 handling), cost tracking |
 | U9 | **/export** | `/export` after a completed run | A reply with an attached `untether-export-<engine>-<sid>-<stamp>.md` document captioned `📄 Session export — <engine> · N events · Markdown` / `Session: <id>` (`/export json` attaches a `.json`). The file has the session header, `**Usage:** … · last run` (`· thread total` for Codex), every action and the full, untruncated answers; it doesn't include the user prompts. Log: `command.attachment_sent command=export` | #63 (missing usage in export), #418 (file attachment) |
@@ -213,7 +213,7 @@ Run quickly to verify all commands respond.
 | Q5 | `/browse` | File browser | 1s |
 | Q6 | `/verbose` | Toggle confirmation | 1s |
 | Q7 | `/cancel` | "Nothing running" or cancels | 1s |
-| Q8 | `/planmode` (Claude chat) | Mode toggle | 1s |
+| Q8 | `/planmode show` (Claude chat) | Current permission mode, unchanged (bare `/planmode` toggles the mode, so a smoke test must not send it) | 1s |
 | Q9 | `/stats` | Session statistics or empty | 1s |
 | Q10 | `/ctx` | Current context or "none set" | 1s |
 | Q11 | `/agent` | Current engine override or default | 1s |
@@ -226,6 +226,9 @@ Run quickly to verify all commands respond.
 ---
 
 ## rc4 scenarios (v0.35.1rc4)
+
+> Release-specific sections: rc4, rc7, B-LIVE and rc12–rc14 follow here; **rc15 and rc17 are at the end of this
+> file**, after "Known Limitations and Gotchas" (rc16 shipped the rc15 run's fixes and added no section of its own).
 
 Run these in addition to the standard tiers for rc4.
 
@@ -458,15 +461,15 @@ Integration tests are run by Claude Code via Telegram MCP tools (see "Automated 
 | Release type | Required tiers | Focus areas | Time |
 |-------------|---------------|-------------|------|
 | **Patch** (bug fix) | Tier 7 + Tier 1 (affected engine + Claude) + relevant Tier 6 | The specific bug area + regression check | ~30 min |
-| **Minor** (new feature) | Tier 7 + Tier 1 (all) + Tier 2 + Tier 3 (relevant) + Tier 4 (relevant) + Tier 6 + upgrade path | New feature + all engine regression + config compat | ~75 min |
-| **Major** (breaking) | All tiers, all engines, full upgrade path | Everything — no shortcuts | ~120 min |
+| **Minor** (new feature) | Tier 7 + Tier 1 (all 4 supported engines) + Tier 2 + Tier 3 (relevant) + Tier 4 (relevant) + Tier 6 + upgrade path | New feature + all engine regression + config compat | ~75 min |
+| **Major** (breaking) | All tiers, all supported engines, full upgrade path | Everything — no shortcuts | ~120 min |
 
 ### What to focus on per change type
 
 | Changed area | Must-run tests |
 |---|---|
-| Runner code (`runners/*.py`) | U1-U4 (all engines), U6, U7 |
-| Per-run stream binding (`runner.py` `RunStreamHandle` / `publish_run_stream`, `runner_bridge.py` stall monitor) | RC12-1, S1, S2, U1-U4 (all engines), B-LIVE-1 |
+| Runner code (`runners/*.py`) | U1-U4 (all supported engines), U6, U7 |
+| Per-run stream binding (`runner.py` `RunStreamHandle` / `publish_run_stream`, `runner_bridge.py` stall monitor) | RC12-1, S1, S2, U1-U4 (all supported engines), B-LIVE-1 |
 | Claude stream schema / rate-limit / API-retry handling (`schemas/claude.py`, `runners/claude.py`) | `uv run pytest tests/test_claude_cli_schema_drift.py`, RC12-2, RC12-3, S1 |
 | Runner bridge / auto-continue / no-op resume recovery (`runner_bridge.py`, `runners/claude.py`) | B-RESUME, U1-U4 (Claude), U6, U7 |
 | Live sessions / follow-up injection / scheduler (`runners/claude.py`, `runner_bridge.py`, `live_followup.py`, `scheduler.py`) | B-LIVE-1…7, RC12-4…7, C1-C6, S7, U1-U4 (Claude), R15-6 |
@@ -1195,3 +1198,20 @@ Tier: T1 (voice) + the R15-10 shape. **Key-leak preflight:** `cp ~/.untether-dev
 | R17-19c | Restore: `cp ~/.untether-dev/untether.toml.bak-r17-19 ~/.untether-dev/untether.toml && rm ~/.untether-dev/untether.toml.bak-r17-19`, then re-run T1 | T1 transcribes normally |
 
 **Required for rc17:** Tier 7 + Tier 1 (Claude, Codex, OpenCode) + Tier 2 C1–C6 + B-LIVE-1…7 + R17-* (every row above, plus the regressions each subsection names). R17-13a is gated (Telethon; if it can't run, record it *not exercised* — the unit tests are the gate). R17-20g needs Nathan's OK before it runs.
+
+## rc18 scenarios (0.35.5rc18)
+
+Dev bot only (`@untether_dev_bot`, `ut-dev: Claude Code` `-5284581592`), driven from an lba-1 terminal session. Back up `~/.untether-dev/untether.toml` before R18-893/894 and restore it afterwards. Logs: `journalctl --user -u untether-dev -o cat --since "15 min ago" | grep -E "<pattern>"`.
+
+No live scenario: [#889](https://github.com/littlebearapps/untether/issues/889) and [#890](https://github.com/littlebearapps/untether/issues/890) need a real latched usage limit. Unit tests are the gate, plus a passive `/monitor` check on nsd (it hits the 5 h cap most days): one `live_turn.fold_decision decision=error`, then `live_turn.capped_repeat_folded repeats=N`, no `live_turn.capped_repeat_edit_failed`, and error lines reading `live turn N · … · session cost:`.
+
+| ID | Steps | Expected Telegram | Log signatures |
+|---|---|---|---|
+| R18-895a | Short prompt → wait for the final → `/new` within ~20 s | `🧹 closed the idle session and cleared stored sessions for you in this chat.` and no `cancelled ·` card | `new.cancel_scope … idle=1`, `handle.cancelled_after_delivery` |
+| R18-895b | Prompt that runs `sleep 60` in the foreground → `/new` mid-run | `🧹 cancelled run and cleared …` plus a `cancelled ·` card | `new.cancel_scope … idle=0` |
+| R18-894a | With triggers off and the service running, hot-edit `[triggers] enabled = true` plus a `run_once` cron with `project = "claude-test"` and no `chat_id` | `⚠️ Restart required … Restart-only keys touched: triggers.enabled` | `config.reload.restart_required key=triggers.enabled`, `trigger.cron.chat_fallback cron_id=… default_chat_id=123` |
+| R18-893a | Restart `untether-dev` (from the terminal), then let the cron fire to the placeholder default chat | nothing | `triggers.dispatch.send_failed chat_id=123` → `triggers.cron.run_once_pending retry_window_s=900`; no `run_once_completed`; the id is absent from `run_once_fired.json` |
+| R18-893b | Within the window, hot-add `chat_id = -5284581592` to the cron | `⏰ Scheduled: cron:<id>` then the run | `triggers.cron.run_once_retry` → `triggers.dispatch.starting` → `run_once_completed` |
+| R18-893c | As R18-893a, then restart `untether-dev` inside the 15 min window, then hot-add `chat_id` | `⏰ Scheduled: cron:<id>` then the run | `run_once_pending.json` lists the id after the failure; after the restart the first tick logs `triggers.cron.run_once_retry pending_since=…`; then `run_once_completed`, and `run_once_pending.json` is `{"pending": {}}` |
+| R18-891 | Two background Bash commands (`sleep 8`, `sleep 45`); when the first finishes, Claude replies with one short markdown sentence (`**A: 29/40 (Good)** – see \`notes_v2.md\``) | the panel note reads `↳ A: 29/40 (Good) – see notes_v2.md`, with no `**` or backticks | `background_status.folded`, `live_turn.fold_decision decision=fold`, no `background_status.ack_plain_failed` |
+| R18-892 | A background agent `P4` (`sleep 40`); when it finishes, Claude SendMessages the same agent for another leg | the second header reads `🔔 Background task finished — P4: … (continued)`, and the panel's done row shows the sum of both legs | `claude.task.ended` → `claude.task.revived` → `claude.task.ended` (same task) |

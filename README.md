@@ -4,6 +4,8 @@ This fork publishes a pinned **0.35.5rc15** snapshot with Telegram reply/quote c
 
 **Run it on a laptop; use the same private bot from a phone or Telegram Desktop.** The laptop performs the work and must remain powered on, online and awake. No phone-side agent installation or inbound port forwarding is needed.
 
+The installation handoff reuses an existing **Sub2API-connected Codex CLI**, including its provider/profile and API key. It does not require another broker key, a new ChatGPT login or a special protected-input tool. The service must receive the same Codex configuration and credential environment as the working terminal setup.
+
 - [Pinned wheel release](https://github.com/Dvredin/untether/releases/tag/dvredin-v0.35.5rc15-1)
 - [Installation handoff for your local agent](docs/install-agent.md)
 - [Snapshot verification and limitations](docs/fork-release.md)

@@ -36,6 +36,8 @@ Earlier deployments of this source observed upstream Claude live-session cancell
 
 ## Boundaries
 
+The installation handoff was revised after the initial snapshot publication to explicitly reuse the user's existing Sub2API-backed Codex setup and key, including its profile, `CODEX_HOME` and service environment. A special protected-input tool is not required. This documentation-only revision does not rebuild the wheel, change runtime sources or move the immutable snapshot tag; the release notes link to the revised handoff.
+
 No installation on another user's laptop or phone-originated Telegram round trip was performed as part of publishing this artifact. Those are required acceptance steps in [the local-agent installation handoff](install-agent.md), including a real phone request, conversation continuation and a service-environment recheck. A package install and an active service alone are not completion.
 
 No credentials, bot tokens, personal configurations or conversation state are bundled. No model/provider route, running bridge or existing user configuration is changed by publication. Voice transcription and local Bot API hosting remain separately configured optional features.

@@ -52,24 +52,34 @@ untether --version
 
 Expected version: `0.35.5rc15`. The wheel hash and installation origin distinguish this fork snapshot from a different package with the same version. Keep the downloaded wheel and its checksum for reproducibility.
 
-## 3. Connect the user's Codex, not somebody else's account
+## 3. Reuse the user's existing Sub2API-connected Codex
 
-Reuse the user's **working native Codex installation and approved provider route**. If it is missing, install the official CLI using its maintained instructions at <https://github.com/openai/codex>, then complete the user's own authentication. Do not upgrade a working Codex solely because this handoff exists.
+**The intended path is the user's already working Codex CLI through Sub2API.** Reuse that installation, provider configuration and existing API key. Do not create another Sub2API client/key, require a new ChatGPT login or ask the user to repeat a completed broker setup. If the CLI is genuinely missing, install the official CLI using <https://github.com/openai/codex>; otherwise do not upgrade it just for this handoff.
 
-If the user's agent uses an API broker but native Codex is not configured, that is a separate prerequisite. Ask for the approved endpoint/model and a dedicated client credential through protected input; never infer them from another person's config, reuse another bot's key or put a key into chat/history. Do not change the existing agent's provider configuration.
+Untether launches native Codex. It does not automatically inherit another agent's provider settings, and it does not invoke a shell alias/function called `codex`. Discover the actual executable, `CODEX_HOME`, active config/profile and any wrapper or one-off `-c` overrides used by the working CLI. Make the same effective route available to the process Untether actually starts.
 
-If Codex already uses a named profile, select that supported profile in `~/.untether/untether.toml`:
+Prefer the existing Codex config unchanged. Confirm its effective Sub2API base URL, current `model_provider` identifier, model/effort, Responses transport and credential alias. An identifier such as `codex_lb` can still point at Sub2API: preserve the identifier rather than renaming it for appearance. The existing broker key is sufficient; a special protected-input tool is **not** an installation prerequisite. Use the available local configuration/input workflow only if a value is actually missing. Do not publish or repeat key values in the installation report.
+
+If the already working route is in a named profile, select **that same profile** in `~/.untether/untether.toml`:
 
 ```toml
 [codex]
 profile = "YOUR_EXISTING_CODEX_PROFILE"
 ```
 
-Replace the placeholder with the verified profile name, or omit the table if Codex already works with its default config. Preserve the model, provider URL, authentication method and native sandbox policy. Test a small harmless Codex request from the intended working directory using the user's approved route before starting the bridge.
+Replace the placeholder with the verified existing name. If the working route is in the default Codex config, omit this table: no new profile is needed. Match the installed CLI's profile format. In current Codex 0.134.0+, `--profile NAME` overlays `CODEX_HOME/NAME.config.toml` using top-level keys, not a `[profiles.NAME]` table.
+
+Only if native Codex itself is not yet connected, merge the user's existing Sub2API connection into its real user-level config. Use the existing endpoint and client credential on that laptop, `wire_api = "responses"`, `env_key` naming the existing credential variable and `requires_openai_auth = false` (or absent). `requires_openai_auth = true` ignores `env_key`. Preserve provider identity, model/effort and the existing native sandbox. Do not replace the whole config or change the other agent's provider settings. Public documentation deliberately does not include a personal endpoint or key.
+
+**The service environment matters:** an exported key or `CODEX_HOME` available in the interactive terminal may be absent under systemd. Preserve the existing key alias and arrange for it and the actual `CODEX_HOME` to reach the Untether service and then the Codex child, using an existing local environment file/credential loader or the platform's supported equivalent. A wrapper/alias is not a substitute for checking the child process's actual route. Do not transfer a Telegram bot token as the model API key.
+
+Before starting Telegram polling, test one small synthetic Codex request from the intended workspace using this actual executable/profile/environment. Verify the effective endpoint/provider/model, not merely the text of the answer. Recheck one request **under the service** in step 6. Keep existing conversations and auth; no logout or reset is needed.
+
+Configuration reference: [Codex advanced configuration](https://learn.chatgpt.com/docs/config-file/config-advanced) and [provider authentication](https://learn.chatgpt.com/docs/auth).
 
 ## 4. Create a separate private Telegram bot
 
-Ask the user to create a bot with <https://t.me/BotFather> (`/newbot`) and supply its token using protected/local input. Do not reuse the token of Hermes, another family member or any running bot. The phone needs only Telegram, not Python or Codex.
+Use the user's dedicated Untether bot if already prepared; otherwise help them create one with <https://t.me/BotFather> (`/newbot`). Enter its token using the local onboarding wizard or the available local configuration workflow. A special protected-input tool is not required. Do not reuse another running agent's bot token: only one polling process can serve the same bot. The phone needs only Telegram, not Python or Codex.
 
 Choose a dedicated working directory, for example `~/untether-workspace`, rather than running the agent in the entire home directory. Run onboarding interactively from that directory:
 
@@ -113,7 +123,7 @@ Use a **user** systemd service. Preserve any existing unit and choose a differen
 - `HOME` and `PATH`: the correct user home and paths containing both Untether and the actual Codex executable, including an nvm/other managed install if applicable.
 - The template's `EnvironmentFile=%h/.untether/.env` is mandatory unless adapted. **Omit it when no environment file is required**; if one is required for the approved Codex credential, create it privately with mode 0600. Do not dump the interactive shell's whole environment into it.
 - Keep the Telegram token in the private configuration, not in `ExecStart`, command history or a public unit.
-- Preserve the existing approved provider environment; do not import unrelated credentials.
+- Preserve the existing Sub2API credential alias and the working CLI's `CODEX_HOME`, model/provider/profile and executable path in the service environment. Do not assume shell exports, aliases or nvm paths are automatically inherited.
 
 Stop/drain the foreground bridge first, so the unit is the only polling process. For a newly created `untether.service`:
 

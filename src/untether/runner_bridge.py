@@ -5407,6 +5407,10 @@ async def handle_message(
             and run_ok is False
             and resume_token is not None
             and on_resume_failed is not None
+            # Codex has no num_turns field; missing usage is not evidence of
+            # a broken thread. Preserve its binding on every failed turn and
+            # leave destructive reset to an explicit /new from the user.
+            and runner.engine != "codex"
         ):
             _num_turns = 0
             if completed.usage:
@@ -5425,6 +5429,27 @@ async def handle_message(
         if run_ok is False and run_error:
             raw_error = str(run_error)
             hint = _get_error_hint(raw_error)
+            if runner.engine == "codex" and resume_token is not None:
+                # Do not recommend /new for a recoverable provider failure or
+                # imply the failed command was automatically replayed.
+                if "cooling down after repeated upstream timeouts" in raw_error:
+                    hint = (
+                        "The model server is temporarily cooling down. Your "
+                        "conversation link is retained. Wait at least a minute, "
+                        "then send a follow-up to continue the same conversation. "
+                        "The failed request was not automatically replayed."
+                    )
+                else:
+                    hint = (
+                        "Your conversation link is retained. Once the error is "
+                        "resolved, send a follow-up to continue the same conversation. "
+                        "The failed request was not automatically replayed."
+                    )
+                logger.info(
+                    "session.resume_preserved",
+                    engine=runner.engine,
+                    resume=resume_token.value,
+                )
             if final_answer.strip():
                 # Deduplicate: if the answer already starts with the error's
                 # first line (common when runner sets both answer and error

@@ -12,6 +12,7 @@ from untether.telegram.api_models import (
     MessageReply,
     PhotoSize,
     Sticker,
+    TextQuote,
     Update,
     User,
     Video,
@@ -32,6 +33,7 @@ def test_parse_incoming_update_maps_fields() -> None:
                 text="prev",
                 from_=User(id=77, is_bot=True, username="ReplyBot"),
             ),
+            quote=TextQuote(text="selected words"),
         ),
     )
 
@@ -44,6 +46,7 @@ def test_parse_incoming_update_maps_fields() -> None:
     assert msg.text == "hello"
     assert msg.reply_to_message_id == 5
     assert msg.reply_to_text == "prev"
+    assert msg.reply_quote_text == "selected words"
     assert msg.reply_to_is_bot is True
     assert msg.reply_to_username == "ReplyBot"
     assert msg.sender_id == 99
@@ -56,6 +59,29 @@ def test_parse_incoming_update_maps_fields() -> None:
     assert msg.raw
     assert msg.raw["message_id"] == 10
     assert msg.update_id == 1
+
+
+def test_parse_incoming_update_uses_reply_caption_fallback() -> None:
+    update = Update(
+        update_id=2,
+        message=Message(
+            message_id=11,
+            text="what about this?",
+            chat=Chat(id=123, type="private"),
+            reply_to_message=MessageReply(
+                message_id=6,
+                caption="photo caption",
+                from_=User(id=77, is_bot=False),
+            ),
+        ),
+    )
+
+    msg = parse_incoming_update(update, chat_id=123)
+
+    assert isinstance(msg, TelegramIncomingMessage)
+    assert msg.reply_to_text is None
+    assert msg.reply_reference_text == "photo caption"
+    assert msg.reply_quote_text is None
 
 
 def test_parse_incoming_update_ignores_implicit_topic_reply() -> None:
@@ -82,6 +108,7 @@ def test_parse_incoming_update_ignores_implicit_topic_reply() -> None:
     assert msg.is_topic_message is True
     assert msg.reply_to_message_id is None
     assert msg.reply_to_text is None
+    assert msg.reply_quote_text is None
     assert msg.reply_to_is_bot is None
     assert msg.reply_to_username is None
     assert msg.update_id == 1
@@ -163,6 +190,30 @@ def test_parse_incoming_update_document_message() -> None:
     assert msg.document.file_name == "doc.txt"
     assert msg.document.mime_type == "text/plain"
     assert msg.document.file_size == 4321
+    assert msg.document.is_image is False
+
+
+def test_parse_incoming_update_image_document() -> None:
+    update = Update(
+        update_id=1,
+        message=Message(
+            message_id=10,
+            caption="inspect this",
+            chat=Chat(id=123, type="private"),
+            document=Document(
+                file_id="image-id",
+                file_name="diagram.png",
+                mime_type="image/png",
+                file_size=4321,
+            ),
+        ),
+    )
+
+    msg = parse_incoming_update(update, chat_id=123)
+
+    assert isinstance(msg, TelegramIncomingMessage)
+    assert msg.document is not None
+    assert msg.document.is_image is True
 
 
 def test_parse_incoming_update_photo_message() -> None:
@@ -196,7 +247,9 @@ def test_parse_incoming_update_photo_message() -> None:
     assert msg.document is not None
     assert msg.document.file_id == "large"
     assert msg.document.file_name is None
+    assert msg.document.mime_type == "image/jpeg"
     assert msg.document.file_size == 1000
+    assert msg.document.is_image is True
 
 
 def test_parse_incoming_update_media_group_id() -> None:
@@ -248,6 +301,7 @@ def test_parse_incoming_update_video_message() -> None:
     assert msg.document.file_name == "video.mp4"
     assert msg.document.mime_type == "video/mp4"
     assert msg.document.file_size == 4242
+    assert msg.document.is_image is False
 
 
 def test_parse_incoming_update_sticker_message() -> None:

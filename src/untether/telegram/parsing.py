@@ -106,6 +106,10 @@ def _parse_incoming_message(
     reply = msg.reply_to_message
     reply_to_message_id = reply.message_id if reply is not None else None
     reply_to_text = reply.text if reply is not None else None
+    reply_reference_text = reply_to_text
+    if reply_reference_text is None and reply is not None:
+        reply_reference_text = reply.caption
+    reply_quote_text = msg.quote.text if msg.quote is not None else None
     reply_to_is_bot = (
         reply.from_.is_bot if reply is not None and reply.from_ is not None else None
     )
@@ -119,6 +123,8 @@ def _parse_incoming_message(
     if thread_id is not None and reply_to_message_id == thread_id:
         reply_to_message_id = None
         reply_to_text = None
+        reply_reference_text = None
+        reply_quote_text = None
         reply_to_is_bot = None
         reply_to_username = None
     return TelegramIncomingMessage(
@@ -128,6 +134,8 @@ def _parse_incoming_message(
         text=text,
         reply_to_message_id=reply_to_message_id,
         reply_to_text=reply_to_text,
+        reply_reference_text=reply_reference_text,
+        reply_quote_text=reply_quote_text,
         reply_to_is_bot=reply_to_is_bot,
         reply_to_username=reply_to_username,
         sender_id=sender_id,
@@ -192,12 +200,18 @@ def _best_photo(photos: list[PhotoSize] | None) -> PhotoSize | None:
 
 
 def _document_from_media(media: Document | Video) -> TelegramDocument:
+    is_image = (
+        isinstance(media, Document)
+        and media.mime_type is not None
+        and media.mime_type.lower().startswith("image/")
+    )
     return TelegramDocument(
         file_id=media.file_id,
         file_name=media.file_name,
         mime_type=media.mime_type,
         file_size=media.file_size,
         raw=msgspec.to_builtins(media),
+        is_image=is_image,
     )
 
 
@@ -205,9 +219,10 @@ def _document_from_photo(photo: PhotoSize) -> TelegramDocument:
     return TelegramDocument(
         file_id=photo.file_id,
         file_name=None,
-        mime_type=None,
+        mime_type="image/jpeg",
         file_size=photo.file_size,
         raw=msgspec.to_builtins(photo),
+        is_image=True,
     )
 
 

@@ -249,3 +249,26 @@ def test_prompts_with_different_overrides_are_not_merged(
     assert (reason is None) is merged
     if not merged:
         assert reason == "followup_mode"
+
+
+@pytest.mark.parametrize("steered", [True, False])
+async def test_steer_preserves_selected_reply_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, steered: bool
+) -> None:
+    from dataclasses import replace
+
+    msg = replace(
+        _msg("/steer explain this"),
+        reply_to_message_id=4,
+        reply_to_text="Full message should not replace the selected quote",
+        reply_quote_text="Selected reference",
+    )
+    calls, runner, _ = await _loop(tmp_path, monkeypatch, [msg], steer_result=steered)
+    (call,) = calls
+    assert "Selected reference" in call["prompt_text"]
+    assert "Full message should not replace" not in call["prompt_text"]
+    if steered:
+        assert runner.calls == []
+    else:
+        assert len(runner.calls) == 1
+        assert runner.calls[0][0].count("Selected reference") == 1

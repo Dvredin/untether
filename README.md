@@ -1,3 +1,17 @@
+# Dvredin's Untether build
+
+This fork publishes a pinned **0.35.5rc15** snapshot with Telegram reply/quote context, native Codex photo input (including continuation), optional local Bot API file handling, and Codex session-binding preservation after provider failures.
+
+**Run it on a laptop; use the same private bot from a phone or Telegram Desktop.** The laptop performs the work and must remain powered on, online and awake. No phone-side agent installation or inbound port forwarding is needed.
+
+- [Pinned wheel release](https://github.com/Dvredin/untether/releases/tag/dvredin-v0.35.5rc15-1)
+- [Installation handoff for your local agent](docs/install-agent.md)
+- [Snapshot verification and limitations](docs/fork-release.md)
+
+Use the release wheel and its checksum, not PyPI or the default branch. This is a **prerelease snapshot**, not an upstream stable release. Existing bot tokens, provider credentials and personal configuration are not distributed. Preserve the original MIT licence and upstream attribution below.
+
+---
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/littlebearapps/untether/master/docs/assets/untether-logo-full.svg" height="200" alt="Untether" />
 </p>

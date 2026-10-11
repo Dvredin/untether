@@ -1281,8 +1281,8 @@ async def test_progress_edits_survives_transport_error() -> None:
 
 
 @pytest.mark.anyio
-async def test_on_resume_failed_called_for_zero_turn_error() -> None:
-    """Callback fires when a resumed run fails with 0 turns."""
+async def test_on_resume_failed_preserves_codex_zero_turn_error() -> None:
+    """A failed Codex turn is not proof that its saved thread is broken."""
     transport = FakeTransport()
     runner = ScriptRunner(
         [ErrorReturn(error="error_during_execution", usage={"num_turns": 0})],
@@ -1308,8 +1308,7 @@ async def test_on_resume_failed_called_for_zero_turn_error() -> None:
         on_resume_failed=on_resume_failed,
     )
 
-    assert len(cleared_tokens) == 1
-    assert cleared_tokens[0] == resume
+    assert cleared_tokens == []
 
 
 @pytest.mark.anyio

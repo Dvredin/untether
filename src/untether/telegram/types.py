@@ -20,6 +20,7 @@ class TelegramDocument:
     mime_type: str | None
     file_size: int | None
     raw: dict[str, Any]
+    is_image: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +32,8 @@ class TelegramIncomingMessage:
     reply_to_message_id: int | None
     reply_to_text: str | None
     sender_id: int | None
+    reply_reference_text: str | None = None
+    reply_quote_text: str | None = None
     reply_to_is_bot: bool | None = None
     reply_to_username: str | None = None
     media_group_id: str | None = None
